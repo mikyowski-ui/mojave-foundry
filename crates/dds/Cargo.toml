@@ -1,0 +1,14 @@
+[package]
+name = "dds"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "DDS decoder: BC1, BC2, BC3, BC5 and uncompressed surfaces to RGBA."
+
+[dependencies]
+thiserror.workspace = true
+
+[lints]
+workspace = true

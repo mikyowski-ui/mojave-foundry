@@ -1,0 +1,15 @@
+[package]
+name = "quantize"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Quantizes RGBA renders to the Fallout 2 palette with reserved-index protection."
+
+[dependencies]
+vault-formats.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

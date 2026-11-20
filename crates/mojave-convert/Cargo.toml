@@ -1,0 +1,35 @@
+[package]
+name = "mojave-convert"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "The mojave-convert command line: extract, sprites, map, gallery, all."
+
+[dependencies]
+clap.workspace = true
+dds.workspace = true
+emit.workspace = true
+fnv-bsa.workspace = true
+fnv-esm.workspace = true
+foundry-gallery.workspace = true
+foundry-render.workspace = true
+map-builder.workspace = true
+map-slicer.workspace = true
+map-terrain.workspace = true
+mir.workspace = true
+nif.workspace = true
+quantize.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+vault-formats.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,27 @@
+[package]
+name = "mir"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "The intermediate representation directory: records.sqlite, meshes, textures, cells, report."
+
+[dependencies]
+fnv-bsa.workspace = true
+fnv-esm.workspace = true
+nif.workspace = true
+dds.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+png.workspace = true
+thiserror.workspace = true
+# `fixture::mini_town` writes a synthetic install; always compiled so that
+# later milestones can run the whole pipeline on it.
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

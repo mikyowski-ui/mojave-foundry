@@ -1,0 +1,21 @@
+[package]
+name = "map-builder"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Walkability, interactive objects, exits and MAP v20 assembly."
+
+[dependencies]
+emit.workspace = true
+foundry-render.workspace = true
+mir.workspace = true
+thiserror.workspace = true
+vault-formats.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

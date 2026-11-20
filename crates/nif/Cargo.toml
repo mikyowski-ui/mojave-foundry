@@ -1,0 +1,21 @@
+[package]
+name = "nif"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Hand-written parser for static NIF meshes and glTF 2.0 binary export."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# Only for `examples/calibrate.rs`, which reads a real archive named by an
+# environment variable. No test uses it.
+fnv-bsa.workspace = true
+
+[lints]
+workspace = true

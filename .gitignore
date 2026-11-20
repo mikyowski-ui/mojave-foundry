@@ -1,0 +1,38 @@
+# Build output and the local cargo cache.
+/target/
+# Local source replacement for the pinned vault-engine dependency.
+/.cargo/config.toml
+
+# Game data, extracted files and converted output never enter git.
+# See AGENTS.md, "Asset hygiene".
+*.bsa
+*.esm
+*.esp
+*.dat
+*.frm
+*.fr[0-5]
+*.map
+*.nif
+*.kf
+*.dds
+*.pal
+*.pro
+*.acm
+*.int
+*.egm
+*.egt
+*.tri
+*.bik
+*.ogg
+*.wav
+*.sqlite
+*.glb
+
+# Pipeline output directories, at the root and wherever --out points
+# inside the tree. crates/mir is source and is not matched by /mir/.
+/mir/
+/mods/
+/output/
+/out/
+**/mods/mojave/
+report.md

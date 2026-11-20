@@ -1,0 +1,22 @@
+[package]
+name = "map-terrain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Ground rendering, floor-tile slicing and tile-library deduplication."
+
+[dependencies]
+foundry-render.workspace = true
+mir.workspace = true
+quantize.workspace = true
+thiserror.workspace = true
+vault-formats.workspace = true
+
+[dev-dependencies]
+foundry-gallery.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
