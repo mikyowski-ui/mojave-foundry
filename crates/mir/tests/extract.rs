@@ -198,7 +198,8 @@ fn records_sqlite_has_the_typed_rows() {
     assert_eq!(count("CREA"), 1);
     assert_eq!(count("ACHR"), 2);
     assert_eq!(count("ACRE"), 1);
-    assert_eq!(count("REFR"), 14);
+    assert_eq!(count("REFR"), 15); // 14, and the trigger volume
+    assert_eq!(count("ACTI"), 1);
     assert_eq!(count("SCPT"), 1);
     assert_eq!(count("QUST"), 1);
     assert_eq!(count("DIAL"), 1);
@@ -439,6 +440,48 @@ fn cell_documents_have_land_references_teleports_and_navmeshes() {
     ));
     assert_eq!(mir.interior("mthouseinterior").unwrap(), Some(inside));
     assert!(mir.interior("nowhere").unwrap().is_none());
+}
+
+/// The activator with a primitive is a trigger volume with its stand-in
+/// model and mesh kept; no other reference is, and the flag stays out of
+/// the JSON of every other reference.
+#[test]
+fn a_primitive_on_an_activator_is_a_trigger_volume() {
+    let r = run(2);
+    let mir = Mir::open(&r.out).unwrap();
+    let doc = cell(&mir, -1, 1);
+    let trigger = doc.reference(&r.town.trigger_volume).unwrap();
+    assert!(trigger.trigger_volume);
+    assert_eq!(trigger.base, r.town.trigger_base);
+    assert_eq!(trigger.base_kind.as_deref(), Some("ACTI"));
+    assert_eq!(
+        trigger.model.as_deref(),
+        Some(mir::fixture::TRIGGER_STAND_IN)
+    );
+    assert!(trigger.mesh.is_some());
+
+    let mut flagged = Vec::new();
+    for key in mir.cells() {
+        for reference in &cell(&mir, key.x, key.y).references {
+            if reference.trigger_volume {
+                flagged.push(reference.form.clone());
+            }
+        }
+    }
+    let inside = mir.interior(INTERIOR).unwrap().unwrap();
+    assert!(inside.references.iter().all(|r| !r.trigger_volume));
+    assert_eq!(flagged, std::slice::from_ref(&r.town.trigger_volume));
+
+    let compact = |text: String| text.split_whitespace().collect::<String>();
+    let json = compact(fs::read_to_string(r.out.join("cells/minitownworld/-1_1.json")).unwrap());
+    assert_eq!(json.matches("\"trigger_volume\":true").count(), 1);
+    for (x, y) in [(0, 0), (1, 0)] {
+        let other =
+            fs::read_to_string(r.out.join(format!("cells/minitownworld/{x}_{y}.json"))).unwrap();
+        assert!(!other.contains("trigger_volume"));
+    }
+    let report = fs::read_to_string(r.out.join("report.md")).unwrap();
+    assert!(report.contains("- trigger volumes: 1 (1 with a stand-in model, not drawn)"));
 }
 
 #[test]

@@ -13,7 +13,7 @@ use foundry_render::Projection;
 use mir::{CellDoc, GroundSampler, MapWindow};
 use vault_formats::HexGrid;
 
-use crate::{BuildError, BuildOptions};
+use crate::{BuildError, BuildOptions, INTERIOR_BAND_ABOVE, INTERIOR_BAND_BELOW, InteriorBuild};
 
 /// Hexes on a map.
 pub const HEXES: usize = 40_000;
@@ -214,6 +214,9 @@ pub struct WalkStats {
     pub triangles_rasterized: usize,
     pub triangles_too_high: usize,
     pub triangles_unreadable: usize,
+    /// Interior builds: triangles skipped as outside the floor level's
+    /// band (an upper storey, a cellar). Always 0 on an exterior build.
+    pub triangles_off_level: usize,
     /// Hexes some triangle covers.
     pub covered: usize,
     /// Hexes in a cell without a navmesh, judged by slope alone.
@@ -299,7 +302,57 @@ pub fn walkability(
     (walkable, stats)
 }
 
-/// [`walkability`] with the reason for every hex.
+/// Hex centres in tile space, binned by floor square, for rasterizing
+/// triangles.
+struct Raster {
+    centres: Vec<[f64; 2]>,
+    buckets: Vec<Vec<u32>>,
+}
+
+impl Raster {
+    fn new(frame: &Frame) -> Self {
+        let centres: Vec<[f64; 2]> = (0..HEXES as i32)
+            .map(|hex| frame.hex_centre_tile(hex).unwrap_or([f64::NAN; 2]))
+            .collect();
+        let mut buckets = vec![Vec::<u32>::new(); BUCKETS * BUCKETS];
+        for (hex, c) in centres.iter().enumerate() {
+            if c[0].is_finite() && c[1].is_finite() {
+                buckets[bucket(c[1]) * BUCKETS + bucket(c[0])].push(hex as u32);
+            }
+        }
+        Self { centres, buckets }
+    }
+
+    /// Mark every hex whose centre the tile-space triangle `tri` covers
+    /// (within `tolerance` tiles).
+    fn fill(&self, tri: [[f64; 2]; 3], tolerance: f64, covered: &mut [bool]) {
+        let lo = [0, 1]
+            .map(|axis| tri.iter().map(|p| p[axis]).fold(f64::INFINITY, f64::min) - tolerance);
+        let hi = [0, 1].map(|axis| {
+            tri.iter()
+                .map(|p| p[axis])
+                .fold(f64::NEG_INFINITY, f64::max)
+                + tolerance
+        });
+        if hi[0] < 0.0 || hi[1] < 0.0 || lo[0] >= BUCKETS as f64 || lo[1] >= BUCKETS as f64 {
+            return;
+        }
+        for by in bucket(lo[1])..=bucket(hi[1]) {
+            for bx in bucket(lo[0])..=bucket(hi[0]) {
+                for &hex in &self.buckets[by * BUCKETS + bx] {
+                    let hex = hex as usize;
+                    if !covered[hex] && covers(self.centres[hex], tri, tolerance) {
+                        covered[hex] = true;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// [`walkability`] with the reason for every hex. With
+/// [`BuildOptions::interior`] set this is [`interior_verdicts`], and
+/// `sampler` is not read.
 pub fn verdicts(
     frame: &Frame,
     sampler: &GroundSampler,
@@ -307,16 +360,12 @@ pub fn verdicts(
     blocked: &[bool],
     options: &BuildOptions,
 ) -> (Vec<Verdict>, WalkStats) {
-    let mut stats = WalkStats::default();
-    let centres: Vec<[f64; 2]> = (0..HEXES as i32)
-        .map(|hex| frame.hex_centre_tile(hex).unwrap_or([f64::NAN; 2]))
-        .collect();
-    let mut buckets = vec![Vec::<u32>::new(); BUCKETS * BUCKETS];
-    for (hex, c) in centres.iter().enumerate() {
-        if c[0].is_finite() && c[1].is_finite() {
-            buckets[bucket(c[1]) * BUCKETS + bucket(c[0])].push(hex as u32);
-        }
+    if let Some(interior) = &options.interior {
+        return interior_verdicts(frame, cells, blocked, options, interior);
     }
+    let mut stats = WalkStats::default();
+    let raster = Raster::new(frame);
+    let centres = &raster.centres;
     let tolerance = f64::from(options.navmesh_tolerance.max(0.0)) / frame.tile_units();
     let max_height = f64::from(options.navmesh_max_height);
     let mut covered = vec![false; HEXES];
@@ -350,29 +399,7 @@ pub fn verdicts(
                 }
                 stats.triangles_rasterized += 1;
                 let tri = corners.map(|v| frame.tile_of_source(f64::from(v[0]), f64::from(v[1])));
-                let lo = [0, 1].map(|axis| {
-                    tri.iter().map(|p| p[axis]).fold(f64::INFINITY, f64::min) - tolerance
-                });
-                let hi = [0, 1].map(|axis| {
-                    tri.iter()
-                        .map(|p| p[axis])
-                        .fold(f64::NEG_INFINITY, f64::max)
-                        + tolerance
-                });
-                if hi[0] < 0.0 || hi[1] < 0.0 || lo[0] >= BUCKETS as f64 || lo[1] >= BUCKETS as f64
-                {
-                    continue;
-                }
-                for by in bucket(lo[1])..=bucket(hi[1]) {
-                    for bx in bucket(lo[0])..=bucket(hi[0]) {
-                        for &hex in &buckets[by * BUCKETS + bx] {
-                            let hex = hex as usize;
-                            if !covered[hex] && covers(centres[hex], tri, tolerance) {
-                                covered[hex] = true;
-                            }
-                        }
-                    }
-                }
+                raster.fill(tri, tolerance, &mut covered);
             }
         }
     }
@@ -422,10 +449,181 @@ pub fn verdicts(
     (verdicts, stats)
 }
 
+/// What an interior cell's navmesh triangle is to the floor level.
+enum Level {
+    /// A vertex index out of range, or a coordinate that is not finite.
+    Unreadable,
+    /// Some corner outside the band.
+    Off,
+    /// Every corner in the band.
+    On([[f32; 3]; 3]),
+}
+
+/// A triangle's area seen from above, source units squared.
+fn plan_area(c: &[[f32; 3]; 3]) -> f64 {
+    let p = c.map(|v| [f64::from(v[0]), f64::from(v[1])]);
+    0.5 * ((p[1][0] - p[0][0]) * (p[2][1] - p[0][1]) - (p[1][1] - p[0][1]) * (p[2][0] - p[0][0]))
+        .abs()
+}
+
+/// Every navmesh triangle of the interior cells among `cells`, judged
+/// against the band.
+fn interior_triangles<'a>(
+    cells: &'a [CellDoc],
+    interior: &'a InteriorBuild,
+) -> impl Iterator<Item = Level> + 'a {
+    cells
+        .iter()
+        .filter(|cell| cell.is_interior())
+        .flat_map(|cell| cell.navmeshes.iter())
+        .flat_map(move |navmesh| {
+            (0..navmesh.triangles.len()).map(move |index| match navmesh.corners(index) {
+                None => Level::Unreadable,
+                Some(corners) if corners.iter().flatten().any(|v| !v.is_finite()) => {
+                    Level::Unreadable
+                }
+                Some(corners) if corners.iter().all(|v| interior.in_band(v[2])) => {
+                    Level::On(corners)
+                }
+                Some(_) => Level::Off,
+            })
+        })
+}
+
+/// Walkability of an interior demo (crate notes, "Interior demo"): a hex
+/// is [`Verdict::Walkable`] when a navmesh triangle of an interior cell
+/// whose every corner lies in [`InteriorBuild::band`] covers its centre
+/// (within [`BuildOptions::navmesh_tolerance`]) and `blocked` does not hold
+/// it; [`Verdict::OffNavmesh`] when no such triangle covers it (exterior
+/// cells, slope and terrain play no part); [`Verdict::Blocked`] when one
+/// does but it is blocked. [`WalkStats::triangles_off_level`] counts the
+/// triangles outside the band; `slope_only`, `rejected_slope`,
+/// `rejected_no_ground` and `triangles_too_high` stay 0.
+pub fn interior_verdicts(
+    frame: &Frame,
+    cells: &[CellDoc],
+    blocked: &[bool],
+    options: &BuildOptions,
+    interior: &InteriorBuild,
+) -> (Vec<Verdict>, WalkStats) {
+    let mut stats = WalkStats::default();
+    let raster = Raster::new(frame);
+    let tolerance = f64::from(options.navmesh_tolerance.max(0.0)) / frame.tile_units();
+    let mut covered = vec![false; HEXES];
+    for level in interior_triangles(cells, interior) {
+        stats.triangles += 1;
+        match level {
+            Level::Unreadable => stats.triangles_unreadable += 1,
+            Level::Off => stats.triangles_off_level += 1,
+            Level::On(corners) => {
+                stats.triangles_rasterized += 1;
+                let tri = corners.map(|v| frame.tile_of_source(f64::from(v[0]), f64::from(v[1])));
+                raster.fill(tri, tolerance, &mut covered);
+            }
+        }
+    }
+    let mut verdicts = vec![Verdict::OffGrid; HEXES];
+    for hex in 0..HEXES {
+        if !raster.centres[hex][0].is_finite() {
+            continue;
+        }
+        if !covered[hex] {
+            stats.rejected_navmesh += 1;
+            verdicts[hex] = Verdict::OffNavmesh;
+            continue;
+        }
+        stats.covered += 1;
+        if blocked.get(hex).copied().unwrap_or(false) {
+            stats.rejected_blocked += 1;
+            verdicts[hex] = Verdict::Blocked;
+            continue;
+        }
+        verdicts[hex] = Verdict::Walkable;
+        stats.walkable += 1;
+    }
+    (verdicts, stats)
+}
+
+/// The floor level of an interior: the height around which the interior
+/// cells' navmesh has the most ground area. Triangles are binned by their
+/// mean corner height in steps of 16 units, weighted by their area seen
+/// from above; the heaviest run of bins within [`INTERIOR_BAND_BELOW`] +
+/// [`INTERIOR_BAND_ABOVE`] wins (ties to the lower), and the result is the
+/// area-weighted mean height of its triangles. `None` without a readable
+/// triangle of positive area.
+pub fn dominant_floor_z(cells: &[CellDoc]) -> Option<f32> {
+    const BIN: f64 = 16.0;
+    let mut triangles: Vec<(f64, f64)> = Vec::new();
+    let everything = InteriorBuild {
+        below: f32::INFINITY,
+        above: f32::INFINITY,
+        ..InteriorBuild::default()
+    };
+    for level in interior_triangles(cells, &everything) {
+        if let Level::On(c) = level {
+            let area = plan_area(&c);
+            let z = c.iter().map(|v| f64::from(v[2])).sum::<f64>() / 3.0;
+            if area > 0.0 && area.is_finite() && z.is_finite() {
+                triangles.push((z, area));
+            }
+        }
+    }
+    if triangles.is_empty() {
+        return None;
+    }
+    let mut bins: std::collections::BTreeMap<i64, f64> = std::collections::BTreeMap::new();
+    for (z, area) in &triangles {
+        *bins.entry((z / BIN).floor() as i64).or_default() += area;
+    }
+    let span = (f64::from(INTERIOR_BAND_BELOW + INTERIOR_BAND_ABOVE) / BIN).floor() as i64;
+    let mut best: Option<(f64, i64)> = None;
+    for &start in bins.keys() {
+        let weight: f64 = bins.range(start..=start + span).map(|(_, a)| a).sum();
+        if best.is_none_or(|(w, _)| weight > w) {
+            best = Some((weight, start));
+        }
+    }
+    let (_, start) = best?;
+    let low = start as f64 * BIN;
+    let high = (start + span + 1) as f64 * BIN;
+    let (sum, weight) = triangles
+        .iter()
+        .filter(|(z, _)| *z >= low && *z < high)
+        .fold((0.0, 0.0), |(s, w), (z, a)| (s + z * a, w + a));
+    (weight > 0.0).then(|| (sum / weight) as f32)
+}
+
+/// The area-weighted centre `(x, y)` of the interior cells' navmesh
+/// triangles in `interior`'s band, seen from above: the default entrance
+/// target, and a good window centre. `None` when the band holds no
+/// triangle of positive area.
+pub fn navmesh_centre(cells: &[CellDoc], interior: &InteriorBuild) -> Option<[f32; 2]> {
+    let mut sum = [0.0f64; 2];
+    let mut weight = 0.0f64;
+    for level in interior_triangles(cells, interior) {
+        if let Level::On(c) = level {
+            let p = c.map(|v| [f64::from(v[0]), f64::from(v[1])]);
+            let area = plan_area(&c);
+            if !area.is_finite() || area <= 0.0 {
+                continue;
+            }
+            for axis in 0..2 {
+                sum[axis] += area * (p[0][axis] + p[1][axis] + p[2][axis]) / 3.0;
+            }
+            weight += area;
+        }
+    }
+    (weight > 0.0).then(|| [(sum[0] / weight) as f32, (sum[1] / weight) as f32])
+}
+
 /// The hexes the source game's own navigation data lets an actor stand
 /// on: in a cell with a navmesh, under a triangle of it, and no steeper
 /// than the slope limit. Sorted. A slicer that blocks a building by its
 /// bounding footprint should leave these open (a porch, a canopy).
+///
+/// With [`BuildOptions::interior`]: the hexes the floor level's navmesh
+/// covers ([`interior_verdicts`] with nothing blocked); `sampler` is not
+/// read.
 pub fn standable_hexes(
     frame: &Frame,
     sampler: &GroundSampler,
@@ -433,6 +631,11 @@ pub fn standable_hexes(
     options: &BuildOptions,
 ) -> Vec<i32> {
     let (cover, _) = verdicts(frame, sampler, cells, &[], options);
+    if options.interior.is_some() {
+        return (0..HEXES as i32)
+            .filter(|&hex| cover[hex as usize] == Verdict::Walkable)
+            .collect();
+    }
     let nav_cells: BTreeSet<(i32, i32)> = cells
         .iter()
         .filter(|cell| cell.navmeshes.iter().any(|n| !n.triangles.is_empty()))

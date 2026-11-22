@@ -492,6 +492,35 @@ fn populated() -> Scene {
 }
 
 #[test]
+fn a_standalone_build_keeps_extending_the_critter_list() {
+    let mut scene = populated();
+    let shared = build_map(&scene.input()).unwrap();
+    scene.options.standalone = true;
+    let built = build_map(&scene.input()).unwrap();
+    for path in [
+        "art/critters/critters.lst",
+        "proto/critters/critters.lst",
+        "text/english/game/pro_crit.msg",
+    ] {
+        assert_eq!(
+            built.layer.files()[path],
+            shared.layer.files()[path],
+            "{path}"
+        );
+    }
+    let critters = built.report.art_lists["critters"];
+    assert!(!critters.replaced && critters.shipped);
+    assert_eq!(
+        (critters.base_entries, critters.kept, critters.added),
+        (2, 2, 2)
+    );
+    assert_eq!(critters.free_after, emit::FID_INDEX_CAP - 4);
+    assert_eq!(built.report.verify.critters, 4);
+    assert_eq!(built.report.verify.critter_rows, 2);
+    assert_eq!(built.report.verify.replaced_art_lists, ["walls", "tiles"]);
+}
+
+#[test]
 fn the_layer_verifies_and_the_map_parses_back_with_critter_objects() {
     let scene = populated();
     let built = build_map(&scene.input()).unwrap();

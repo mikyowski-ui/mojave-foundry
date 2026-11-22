@@ -35,6 +35,7 @@ pub fn fixture() -> Fixture {
         y: [*town.slice.y.start(), *town.slice.y.end()],
         interior_depth: town.slice.interior_depth,
         map_center: None,
+        ..SliceSpec::default()
     };
     Fixture {
         fnv: town.data_dir.clone(),

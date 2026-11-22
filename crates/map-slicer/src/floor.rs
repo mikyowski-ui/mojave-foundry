@@ -57,28 +57,8 @@ pub(crate) fn floor_mesh(
             .collect();
         let mut indices = Vec::new();
         for triangle in primitive.indices.as_chunks::<3>().0 {
-            let [a, b, c] = triangle.map(|i| placed[i as usize]);
-            let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-            let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
-            let n = [
-                u[1] * v[2] - u[2] * v[1],
-                u[2] * v[0] - u[0] * v[2],
-                u[0] * v[1] - u[1] * v[0],
-            ];
-            let length = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
-            if !(length.is_finite() && length > 0.0) {
-                continue;
-            }
-            let up = if primitive.material.two_sided {
-                (n[2] / length).abs()
-            } else {
-                n[2] / length
-            };
-            let in_band = [a, b, c].iter().all(|p| {
-                let height = p[2] + lift;
-                height >= band[0] && height <= band[1]
-            });
-            if up >= min_up && in_band {
+            let corners = triangle.map(|i| placed[i as usize]);
+            if is_floor(corners, primitive.material.two_sided, lift, band, min_up) {
                 indices.extend_from_slice(triangle);
             }
         }
@@ -94,6 +74,42 @@ pub(crate) fn floor_mesh(
         collision: None,
         skipped_blocks: BTreeMap::new(),
     })
+}
+
+/// The upward component of a placed triangle's unit normal (its winding's
+/// front face); `None` for a degenerate or non-finite triangle.
+pub(crate) fn normal_up([a, b, c]: [[f32; 3]; 3]) -> Option<f32> {
+    let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+    let n = [
+        u[1] * v[2] - u[2] * v[1],
+        u[2] * v[0] - u[0] * v[2],
+        u[0] * v[1] - u[1] * v[0],
+    ];
+    let length = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+    (length.is_finite() && length > 0.0).then(|| n[2] / length)
+}
+
+/// Whether a placed triangle (a rotation and scale applied, no translation)
+/// is a floor: facing up at least `min_up` (either face, when two-sided),
+/// every corner within `band` above the ground, where `lift` is the height
+/// of the mesh origin above the ground.
+pub(crate) fn is_floor(
+    corners: [[f32; 3]; 3],
+    two_sided: bool,
+    lift: f32,
+    band: [f32; 2],
+    min_up: f32,
+) -> bool {
+    let Some(up) = normal_up(corners) else {
+        return false;
+    };
+    let up = if two_sided { up.abs() } else { up };
+    let in_band = corners.iter().all(|p| {
+        let height = p[2] + lift;
+        height >= band[0] && height <= band[1]
+    });
+    up >= min_up && in_band
 }
 
 /// The hexes within `reach` steps of a hex in `open`.

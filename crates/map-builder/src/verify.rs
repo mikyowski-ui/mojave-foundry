@@ -51,6 +51,12 @@ pub struct VerifyReport {
     pub critter_prototypes: usize,
     /// Critter objects checked on the maps.
     pub critters: usize,
+    /// Art lists of the layer that do not start from the whole base list
+    /// (standalone walls and tiles), by art directory in category order.
+    pub replaced_art_lists: Vec<String>,
+    /// Prototype art identifiers of the layer's prototypes resolved to a
+    /// file.
+    pub prototype_fids: usize,
 }
 
 /// `art/critters/critters.lst`.
@@ -85,17 +91,27 @@ fn tree(
 ///    layer registers exactly those numbers and files.
 /// 2. Every `.frm`: `FrmArchive::parse`, with frame 0 of direction 0.
 /// 3. Every `.lst`: `LstTable::parse` with the kind its path selects
-///    (`LstKind::for_path`); an art list holds at most 4,096 entries.
+///    (`LstKind::for_path`); an art list holds at most 4,096 entries. An
+///    art list whose base list is supplied either starts with every base
+///    entry (same name and alias at each position), or is a standalone
+///    walls or tiles list that starts with the base entries
+///    `emit::standalone_reserved` names (it is then listed in
+///    `replaced_art_lists`); any other art list that drops base entries is
+///    refused.
 /// 4. Every `.msg`: `MsgCatalog::parse_strict`.
 /// 5. Every `.pro`: `Prototype::parse_for` (Fallout 2) round-trips to the
 ///    same bytes, and `LocalPrototypeCatalog` (Fallout 2, over the mounted
-///    layer) resolves its PID to it through its list position.
+///    layer) resolves its PID to it through its list position; its art FID
+///    resolves as the map objects' do (in 6).
 /// 6. Every `.map`: `MapFile::parse_for` (Fallout 2) through that catalog,
 ///    version 20, no diagnostics; the header name is the file name in
 ///    capitals and the header number its registered number; every object
-///    art FID and every floor tile other than the blank 1 resolves through
-///    `ArtCatalog::load` (the mounted art lists) to a list entry, and an
-///    entry this layer added to a file the layer holds; every exit grid
+///    art FID, every floor tile (the blank 1 included, since a floor of 1
+///    is drawn) and every roof tile other than 1 (never drawn) resolves
+///    through `ArtCatalog::load` (the mounted art lists) to a list entry;
+///    an entry past the base entries the mounted list kept at their
+///    positions (all of the base list, or the reserved entries of a
+///    standalone one) must name a file the layer holds; every exit grid
 ///    leads to a registered map, onto a hex of the grid, at elevation 0
 ///    to 2.
 /// 7. `data/maps.txt`, when present: `MapsTable::parse`, and every
@@ -179,20 +195,54 @@ pub fn verify_layer(
         ));
     }
 
-    // Base list lengths: entries below them are the install's art.
+    // Per art list, how many leading entries are the install's art: the
+    // base entries the mounted list kept at their positions.
     let mut base_len: BTreeMap<u8, usize> = BTreeMap::new();
     for (category, directory) in ART_DIRECTORIES.iter().enumerate() {
         let path = format!("art/{directory}/{directory}.lst");
-        if let Some(bytes) = base_files.get(&path) {
-            let table =
-                LstTable::parse(bytes, LstKind::Art).map_err(|e| BuildError::verify(&path, e))?;
-            base_len.insert(category as u8, table.entries().len());
+        let Some(bytes) = base_files.get(&path) else {
+            continue;
+        };
+        let base =
+            LstTable::parse(bytes, LstKind::Art).map_err(|e| BuildError::verify(&path, e))?;
+        let Some(ours) = layer.files().get(&path) else {
+            base_len.insert(category as u8, base.entries().len());
+            continue;
+        };
+        let ours = LstTable::parse(ours, LstKind::Art).map_err(|e| BuildError::verify(&path, e))?;
+        let kept = ours
+            .entries()
+            .iter()
+            .zip(base.entries())
+            .take_while(|(a, b)| a.name == b.name && a.alias == b.alias)
+            .count();
+        if kept < base.entries().len() {
+            let Some(reserved) = emit::standalone_reserved(category as u8) else {
+                return Err(BuildError::verify(
+                    &path,
+                    format!(
+                        "keeps {kept} of the base list's {} entries; only a standalone walls or \
+                         tiles list may drop base entries",
+                        base.entries().len()
+                    ),
+                ));
+            };
+            let needed = reserved.min(base.entries().len());
+            if kept < needed {
+                return Err(BuildError::verify(
+                    &path,
+                    format!("a standalone list must keep the base list's first {needed} entries"),
+                ));
+            }
+            report.replaced_art_lists.push((*directory).to_owned());
         }
+        base_len.insert(category as u8, kept);
     }
 
     // 2-5, 7, 8: file by file.
     let catalog = LocalPrototypeCatalog::for_game(&vfs, GameProfile::Fallout2);
     let mut map_paths = Vec::new();
+    let mut prototype_fids: Vec<(String, Fid)> = Vec::new();
     for (path, bytes) in layer.files() {
         let vfs_path = VfsPath::new(path).map_err(|e| BuildError::verify(path, e))?;
         match vfs_path.extension() {
@@ -247,6 +297,7 @@ pub fn verify_layer(
                     check_critter_prototype(&vfs, path, &prototype, info.kind)?;
                     report.critter_prototypes += 1;
                 }
+                prototype_fids.push((path.clone(), Fid(prototype.art_id)));
                 report.prototypes += 1;
             }
             Some("map") => map_paths.push(path.clone()),
@@ -316,6 +367,10 @@ pub fn verify_layer(
         }
         Ok(())
     };
+    for (path, fid) in &prototype_fids {
+        resolve(*fid, path)?;
+        report.prototype_fids += 1;
+    }
     for path in &map_paths {
         let bytes = &layer.files()[path];
         let map = MapFile::parse_for(bytes, &catalog, GameProfile::Fallout2)
@@ -442,8 +497,10 @@ pub fn verify_layer(
         for tiles in map.tiles.iter().flatten() {
             let mut seen = BTreeSet::new();
             for tile in tiles {
-                for index in [tile.floor(), tile.roof()] {
-                    if index != 1 && seen.insert(index) {
+                // Roof index 1 is never drawn; floor index 1 is.
+                let roof = (tile.roof() != 1).then_some(tile.roof());
+                for index in std::iter::once(tile.floor()).chain(roof) {
+                    if seen.insert(index) {
                         resolve(Fid::new(4, index, 0, 0, 0), path)?;
                         report.fids_resolved += 1;
                     }

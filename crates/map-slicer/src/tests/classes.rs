@@ -140,3 +140,189 @@ fn a_rotated_footprint_keeps_its_area() {
     assert!((turned.area - straight.area).abs() < 1.0);
     assert!((straight.hexes(140.0) - 96.0).abs() < 1e-6);
 }
+
+#[test]
+fn trigger_volumes_skip() {
+    let mut r = make("ACTI", "meshes\\test\\house.nif", "house");
+    r.trigger_volume = true;
+    assert_eq!(
+        class_of(&r, "house"),
+        Class::Skip(SkipReason::TriggerVolume)
+    );
+    assert_eq!(SkipReason::TriggerVolume.label(), "trigger volume");
+}
+
+#[test]
+fn huge_meshes_that_are_not_terrain_are_landmarks() {
+    let tower = make("STAT", "meshes\\test\\casinotower.nif", "huge");
+    assert_eq!(class_of(&tower, "huge"), Class::Landmark);
+    // Terrain by its path stays relief, at any size.
+    let hill = make("STAT", "meshes\\landscape\\test\\bigslope.nif", "huge");
+    assert_eq!(class_of(&hill, "huge"), Class::GroundRelief);
+    // Off, a huge mesh is relief as in the first pass.
+    let off = SlicerConfig {
+        landmarks: false,
+        ..SlicerConfig::default()
+    };
+    assert_eq!(
+        classify(&tower, Some(&facts("huge")), 140.0, &off),
+        Class::GroundRelief
+    );
+    // Below the threshold nothing changes.
+    let house = make("STAT", "meshes\\test\\casinotower.nif", "house");
+    assert_eq!(class_of(&house, "house"), Class::Sliced);
+}
+
+#[test]
+fn patterns_match_segments_and_word_starts_not_substrings() {
+    // What the substring rule got wrong: rockets and a town named for
+    // boulders are buildings.
+    for model in [
+        "meshes\\test\\rocketcrane01.nif",
+        "meshes\\test\\rocket\\launchtower.nif",
+        "meshes\\dungeons\\bouldercity\\bcruinhouse01.nif",
+        "meshes\\architecture\\bouldercity\\bcstorefront02.nif",
+        "meshes\\test\\shamrocksign.nif",
+    ] {
+        let r = make("STAT", model, "house");
+        assert_eq!(class_of(&r, "house"), Class::Sliced, "{model}");
+    }
+    // The shapes of the paths the defaults were tuned on keep their class.
+    for model in [
+        "meshes\\landscape\\test_rocks\\tst_rockcanyon06.nif",
+        "meshes\\landscape\\test_rocks\\tst_cliffcanyonl01.nif",
+        "meshes\\landscape\\test_rocks\\tst_rockcanyonrubblepile03.nif",
+        "meshes\\landscape\\rocks\\cliffs\\cliffverti_t1.nif",
+        "meshes\\landscape\\rocks\\cliffs\\canyontestentrance01.nif",
+        "meshes\\architecture\\suburban\\rubblepiles\\testrubblepile01.nif",
+        "meshes\\test\\boulder01.nif",
+        "meshes\\test\\nvboulderpile.nif",
+        "meshes\\dungeons\\bouldercity\\boulder02.nif",
+        "meshes\\test\\rocket\\rockpile01.nif",
+    ] {
+        let r = make("STAT", model, "house");
+        assert_eq!(class_of(&r, "house"), Class::GroundRelief, "{model}");
+    }
+    for model in [
+        "meshes\\landscape\\roads\\testroadcurve01.nif",
+        "meshes\\scol\\scolroadstraight01b.nif",
+        "meshes\\scol\\scolparkinglottest01.nif",
+        "meshes\\architecture\\test\\parkinglot\\testbarricade09.nif",
+    ] {
+        let r = make("STAT", model, "slab");
+        assert_eq!(class_of(&r, "slab"), Class::GroundFlat, "{model}");
+    }
+    for model in [
+        "meshes\\landscape\\trees\\testjoshua01.nif",
+        "meshes\\landscape\\plants\\testgourd.nif",
+        "meshes\\test\\shrubs\\creosotebushxl.nif",
+        "meshes\\test\\wastelandshrub02.nif",
+        "meshes\\test\\nv_barrelcactus09.nif",
+    ] {
+        let r = make("STAT", model, "house");
+        assert_eq!(
+            class_of(&r, "house"),
+            Class::Sprite(Role::Scenery),
+            "{model}"
+        );
+    }
+    for (model, pattern) in [
+        ("meshes\\test\\testwallmarker.nif", "marker"),
+        ("meshes\\markertestheading.nif", "marker"),
+        ("meshes\\effects\\ambient\\fxtest01.nif", "effects\\"),
+        ("meshes\\test\\fx\\glow.nif", "fx\\"),
+        ("meshes\\test\\fxglow.nif", "\\fx"),
+    ] {
+        let r = make("STAT", model, "house");
+        assert_eq!(
+            class_of(&r, "house"),
+            Class::Skip(SkipReason::Pattern(pattern.to_owned())),
+            "{model}"
+        );
+    }
+}
+
+/// A 700 × 700 box 40 units tall, or a strip of it.
+fn slab_facts(size: [f32; 3], area: Option<f64>) -> MeshFacts {
+    MeshFacts {
+        bounds: Some([
+            [-size[0] / 2.0, -size[1] / 2.0, 0.0],
+            [size[0] / 2.0, size[1] / 2.0, size[2]],
+        ]),
+        surface_area: area,
+        triangles: 12,
+    }
+}
+
+#[test]
+fn low_paved_slabs_flatten_but_kerbs_stay_upright() {
+    let config = SlicerConfig::default();
+    let class = |model: &str, f: &MeshFacts| {
+        classify(&make("STAT", model, "slab"), Some(f), 140.0, &config)
+    };
+    let box_area = |s: [f32; 3]| {
+        let [x, y, z] = s.map(f64::from);
+        Some(2.0 * (x * y + x * z + y * z))
+    };
+    for height in [36.0, 40.0, 46.0] {
+        let size = [700.0, 700.0, height];
+        let slab = slab_facts(size, box_area(size));
+        for model in [
+            "meshes\\test\\airbase\\runway01.nif",
+            "meshes\\test\\strip\\sidewalk04.nif",
+            "meshes\\test\\nvtarmacpatch.nif",
+        ] {
+            assert_eq!(class(model, &slab), Class::GroundFlat, "{model} {height}");
+        }
+        // Known only by its bounds, a slab still flattens.
+        assert_eq!(
+            class("meshes\\test\\runway02.nif", &slab_facts(size, None)),
+            Class::GroundFlat
+        );
+        // The same box under another name is not a slab.
+        assert_eq!(class("meshes\\test\\planter01.nif", &slab), Class::Sliced);
+    }
+    // A kerb: narrow.
+    let kerb = [700.0, 20.0, 40.0];
+    assert_eq!(
+        class(
+            "meshes\\test\\sidewalkedge01.nif",
+            &slab_facts(kerb, box_area(kerb))
+        ),
+        Class::Sliced
+    );
+    assert_eq!(
+        class(
+            "meshes\\test\\sidewalkcurb01.nif",
+            &slab_facts([700.0, 700.0, 40.0], None)
+        ),
+        Class::Sliced
+    );
+    // A kerb ring around a block: a wide box with little area.
+    let ring = slab_facts([700.0, 700.0, 40.0], Some(4.0 * 700.0 * 60.0));
+    assert_eq!(
+        class("meshes\\test\\sidewalkring01.nif", &ring),
+        Class::Sliced
+    );
+    // Taller than a slab: upright.
+    let tall = [700.0, 700.0, 60.0];
+    assert_eq!(
+        class(
+            "meshes\\test\\runway03.nif",
+            &slab_facts(tall, box_area(tall))
+        ),
+        Class::Sliced
+    );
+}
+
+#[test]
+fn the_footprint_width_is_its_narrowest_side() {
+    let f = crate::Footprint::of(
+        &Transform {
+            rotation: [0.0, 0.0, 0.6],
+            ..Transform::default()
+        },
+        [[-350.0, -10.0, 0.0], [350.0, 10.0, 40.0]],
+    );
+    assert!((f.width() - 20.0).abs() < 1e-3, "{}", f.width());
+}

@@ -16,28 +16,31 @@ use vault_formats::map::{MAX_OBJECTS, MapObject, ObjectDetail, ObjectState, Tile
 use vault_formats::pro::{BasicFlags, Category, LockFlags};
 use vault_formats::{Fid, Prototype};
 
+use vault_formats::HexGrid;
+
+use crate::cover::{Cover, Sight};
 use crate::critters::{self, AI_TXT};
 use crate::exits::{self, DoorExit, STUB_ENTRY, STUB_EXIT_RADIUS, STUB_FLOOR_RADIUS};
+use crate::islands;
 use crate::names::{ArtNames, map_stem, message_text, stub_stem};
+use crate::passages;
 use crate::walk::{self, Frame, HEXES};
 use crate::{
-    ArtCategory, BuildError, BuildInput, BuildReport, Built, CRITTER_BASE_FROM,
-    CritterPrototypeReport, CritterSetReport, ExitReport, LANGUAGE, PlacedCritter, Role,
-    base_file_paths,
+    ArtCategory, ArtListReport, BLANK_SQUARE, BuildError, BuildInput, BuildReport, Built,
+    CRITTER_BASE_FROM, ComponentReport, CritterComponent, CritterPrototypeReport, CritterSetReport,
+    EntranceReport, ExitComponents, ExitReport, InteriorBuild, InteriorDoor, InteriorReport,
+    LANGUAGE, PlacedCritter, Role, SkippedTeleport, base_file_paths,
 };
 
-const ART_ITEMS: u8 = 0;
-const ART_CRITTERS: u8 = 1;
-const ART_SCENERY: u8 = 2;
-const ART_WALLS: u8 = 3;
-const ART_TILES: u8 = 4;
-const ART_MISC: u8 = 5;
+use crate::budget::{
+    ART_CRITTERS, ART_ITEMS, ART_MISC, ART_SCENERY, ART_TILES, ART_WALLS, BUILD_LISTS,
+};
 /// A floor tile's size.
 pub(crate) const TILE_WIDTH: usize = 80;
 pub(crate) const TILE_HEIGHT: usize = 36;
 /// Tile art indexes 0 and 1 are reserved: 1 is the blank tile, and a roof
-/// of index 1 is not drawn (SPEC-003).
-const RESERVED_TILES: usize = 2;
+/// of index 1 is not drawn (SPEC-003 §2.8).
+const RESERVED_TILES: usize = emit::RESERVED_TILE_ENTRIES;
 /// The exit-grid prototype every exit uses (variant 0).
 pub(crate) const EXIT_GRID_PID: u32 = 0x0500_0010;
 pub(crate) const MAPS_TXT: &str = "data/maps.txt";
@@ -158,7 +161,11 @@ fn frm(
 /// The lists the layer extends, with what it changed.
 struct Lists {
     art: BTreeMap<u8, ArtList>,
+    /// Entries each art list started with (the base list, or the reserved
+    /// entries of a standalone one).
     art_base: BTreeMap<u8, usize>,
+    /// Entries of each base art list (0 without one).
+    art_base_entries: BTreeMap<u8, usize>,
     protos: BTreeMap<Category, ProtoList>,
     messages: BTreeMap<Category, MsgFile>,
     touched_art: BTreeSet<u8>,
@@ -174,18 +181,14 @@ fn base_error(file: &str, error: impl std::fmt::Display) -> BuildError {
 }
 
 impl Lists {
-    fn load(base: &BTreeMap<String, Vec<u8>>) -> Result<Self, BuildError> {
+    fn load(base: &BTreeMap<String, Vec<u8>>, standalone: bool) -> Result<Self, BuildError> {
         let mut art = BTreeMap::new();
         let mut art_base = BTreeMap::new();
-        for category in [ART_ITEMS, ART_SCENERY, ART_WALLS, ART_TILES, ART_MISC] {
-            let path = format!("art/{0}/{0}.lst", directory(category));
-            let list = match base.get(&path) {
-                Some(bytes) => {
-                    ArtList::from_base(category, bytes).map_err(|e| base_error(&path, e))?
-                }
-                None => ArtList::new(category).map_err(|e| base_error(&path, e))?,
-            };
+        let mut art_base_entries = BTreeMap::new();
+        for category in BUILD_LISTS {
+            let (list, entries) = crate::budget::start_list(category, base, standalone)?;
             art_base.insert(category, list.len());
+            art_base_entries.insert(category, entries);
             art.insert(category, list);
         }
         let mut protos = BTreeMap::new();
@@ -216,6 +219,7 @@ impl Lists {
         Ok(Self {
             art,
             art_base,
+            art_base_entries,
             protos,
             messages,
             touched_art: BTreeSet::new(),
@@ -446,7 +450,7 @@ fn validate(input: &BuildInput) -> Result<(), BuildError> {
         .squares
         .iter()
         .enumerate()
-        .find(|(_, tile)| usize::from(**tile) >= ground.tiles.len())
+        .find(|(_, tile)| **tile != BLANK_SQUARE && usize::from(**tile) >= ground.tiles.len())
     {
         return Err(BuildError::Input(format!(
             "square {square} names library tile {tile}; the library has {}",
@@ -523,7 +527,106 @@ fn validate(input: &BuildInput) -> Result<(), BuildError> {
             )));
         }
     }
+    if let Some(interior) = &input.options.interior {
+        let finite_point = |p: [f32; 2]| p.iter().all(|v| v.is_finite());
+        if !interior.floor_z.is_finite()
+            || !(interior.below.is_finite() && interior.below >= 0.0)
+            || !(interior.above.is_finite() && interior.above >= 0.0)
+        {
+            return Err(BuildError::Input(format!(
+                "interior floor z {} with band -{} / +{}: the floor must be finite and the band \
+                 finite and not negative",
+                interior.floor_z, interior.below, interior.above
+            )));
+        }
+        if interior.entrance_near.is_some_and(|p| !finite_point(p)) {
+            return Err(BuildError::Input(format!(
+                "interior entrance point {:?} is not finite",
+                interior.entrance_near
+            )));
+        }
+        if interior.clamp_radius < 0 {
+            return Err(BuildError::Input(format!(
+                "interior clamp radius {} is negative",
+                interior.clamp_radius
+            )));
+        }
+    }
     Ok(())
+}
+
+/// Every teleport door of the interior cells, sorted by form key, with the
+/// hex of its door placement when there is one.
+fn interior_doors(input: &BuildInput) -> Vec<InteriorDoor> {
+    let mut doors: BTreeMap<String, InteriorDoor> = BTreeMap::new();
+    for cell in input.cells.iter().filter(|cell| cell.is_interior()) {
+        for reference in &cell.references {
+            let Some(teleport) = &reference.teleport else {
+                continue;
+            };
+            let form = reference.form.to_string();
+            doors.entry(form.clone()).or_insert_with(|| InteriorDoor {
+                hex: input
+                    .placements
+                    .iter()
+                    .find(|p| p.role == Role::Door && p.reference == form)
+                    .map(|p| p.hex),
+                door: form,
+                destination: teleport.cell.as_ref().map(|c| c.form.to_string()),
+                destination_editor_id: teleport.cell.as_ref().and_then(|c| c.editor_id.clone()),
+            });
+        }
+    }
+    doors.into_values().collect()
+}
+
+/// Where each critter stands relative to the interior's floor level.
+enum CritterLevel {
+    Floor,
+    /// Its reference is not in the cells.
+    Unknown,
+    Other(f32),
+}
+
+fn critter_levels(input: &BuildInput, interior: &InteriorBuild) -> Vec<CritterLevel> {
+    let heights: BTreeMap<String, f32> = input
+        .cells
+        .iter()
+        .filter(|cell| cell.is_interior())
+        .flat_map(|cell| cell.references.iter())
+        .map(|r| (r.form.to_string(), r.transform.position[2]))
+        .collect();
+    input
+        .critters
+        .iter()
+        .map(|critter| match heights.get(&critter.reference) {
+            None => CritterLevel::Unknown,
+            Some(z) if interior.in_band(*z) => CritterLevel::Floor,
+            Some(z) => CritterLevel::Other(*z),
+        })
+        .collect()
+}
+
+/// A critter's search radius by its level, or why it is skipped.
+fn critter_radius(
+    levels: &[CritterLevel],
+    interior: Option<&InteriorBuild>,
+    index: usize,
+) -> Result<i32, String> {
+    let Some(interior) = interior else {
+        return Ok(critters::CRITTER_RADIUS);
+    };
+    match levels.get(index) {
+        Some(CritterLevel::Other(_)) if interior.clamp_levels => Ok(interior.clamp_radius),
+        Some(CritterLevel::Other(z)) => {
+            let [low, high] = interior.band();
+            Err(format!(
+                "on another level: it stands at z {z:.0}, the floor level is z {low:.0} to \
+                 {high:.0} (InteriorBuild::clamp_levels places it anyway)"
+            ))
+        }
+        _ => Ok(critters::CRITTER_RADIUS),
+    }
 }
 
 /// The AI packet for this build's critters, and a note when it fell back.
@@ -574,6 +677,19 @@ fn largest(labels: impl IntoIterator<Item = String>) -> Vec<(String, usize)> {
     out
 }
 
+/// The blank floor tile's art index (drawn black).
+const BLANK_TILE: u16 = 1;
+
+/// A square's floor art index: its library tile's, or the blank tile for
+/// [`BLANK_SQUARE`].
+fn floor_of(tile_index: &[u16], library: u16) -> u16 {
+    if library == BLANK_SQUARE {
+        BLANK_TILE
+    } else {
+        tile_index[usize::from(library)]
+    }
+}
+
 fn tile_word(floor: u16) -> TilePair {
     // Roof index 1: not drawn.
     let word = 0x0001_0000 | u32::from(floor & 0x0fff);
@@ -602,6 +718,128 @@ fn exit_object(
     object
 }
 
+/// The exterior map's objects read by the engine's movement rule: its
+/// components that hold a walkable hex, and where the entrance, exits,
+/// returns and placed critters (`report.critters`) are in them.
+fn component_report(
+    objects: &[MapObject],
+    walkable: &[bool],
+    entry: i32,
+    door_exits: &[DoorExit],
+    report: &BuildReport,
+) -> ComponentReport {
+    let blocked = islands::engine_blocked(objects);
+    let comps =
+        islands::components(|h| !blocked[h as usize]).retain_holding(|h| walkable[h as usize]);
+    let leaked = (0..HEXES as i32)
+        .filter(|h| comps.of(*h).is_some() && !walkable[*h as usize])
+        .count();
+    let mut exits: Vec<ExitComponents> = door_exits
+        .iter()
+        .map(|exit| ExitComponents {
+            door: exit.door.clone(),
+            door_hex: exit.door_hex,
+            grids: exit
+                .grid_hexes
+                .iter()
+                .map(|hex| (*hex, comps.of(*hex)))
+                .collect(),
+            return_hex: exit.return_hex,
+            return_component: comps.of(exit.return_hex),
+        })
+        .collect();
+    exits.sort_by(|a, b| a.door.cmp(&b.door).then(a.door_hex.cmp(&b.door_hex)));
+    ComponentReport {
+        sizes: comps.sizes().to_vec(),
+        first_hexes: (0..comps.len())
+            .filter_map(|id| comps.first_hex(id))
+            .collect(),
+        main: comps.of(entry),
+        exits,
+        critters: report
+            .critters
+            .iter()
+            .map(|critter| CritterComponent {
+                reference: critter.reference.clone(),
+                hex: critter.hex,
+                component: comps.around(critter.hex),
+            })
+            .collect(),
+        leaked,
+    }
+}
+
+/// The walkability pass's own grid, before any passage.
+fn walkable_before(verdicts: &[walk::Verdict]) -> Vec<bool> {
+    verdicts
+        .iter()
+        .map(|v| *v == walk::Verdict::Walkable)
+        .collect()
+}
+
+/// The entrance by the crate notes' rule: in the largest component, off
+/// the border and `avoid`, clearest [`Sight`] first, nearest `centre`
+/// within a tier; else the walkable hex nearest `centre` off `grids`.
+fn entrance(
+    frame: &Frame,
+    walkable: &[bool],
+    centre: [f64; 2],
+    grids: &BTreeSet<i32>,
+    avoid: &BTreeSet<i32>,
+    cover: &Cover,
+    figure: [u32; 2],
+) -> Option<EntranceReport> {
+    let nearest = walk::nearest_walkable(frame, walkable, centre, grids)?;
+    let comps = islands::components(|h| walkable[h as usize]);
+    let distance = |hex: i32| {
+        frame.hex_centre_tile(hex).map_or(f64::INFINITY, |c| {
+            (c[0] - centre[0]).powi(2) + (c[1] - centre[1]).powi(2)
+        })
+    };
+    let mut candidates: Vec<(f64, i32)> = comps
+        .members(0)
+        .filter(|hex| !islands::on_border(*hex) && !avoid.contains(hex))
+        .map(|hex| (distance(hex), hex))
+        .collect();
+    candidates.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    let steps = |hex: i32| HexGrid::lattice_distance(nearest, hex).unwrap_or(0);
+    let mut fallback: [Option<i32>; 2] = [None, None];
+    for (_, hex) in candidates {
+        match cover.sight(hex, figure) {
+            Sight::Clear => {
+                return Some(EntranceReport {
+                    hex,
+                    sight: Sight::Clear,
+                    in_main: true,
+                    steps_from_centre: steps(hex),
+                });
+            }
+            Sight::Behind => {
+                fallback[0].get_or_insert(hex);
+            }
+            Sight::Covered => {
+                fallback[1].get_or_insert(hex);
+            }
+        }
+    }
+    for (slot, sight) in [(fallback[0], Sight::Behind), (fallback[1], Sight::Covered)] {
+        if let Some(hex) = slot {
+            return Some(EntranceReport {
+                hex,
+                sight,
+                in_main: true,
+                steps_from_centre: steps(hex),
+            });
+        }
+    }
+    Some(EntranceReport {
+        hex: nearest,
+        sight: cover.sight(nearest, figure),
+        in_main: comps.of(nearest) == Some(0),
+        steps_from_centre: 0,
+    })
+}
+
 fn header_name(stem: &str) -> Result<String, BuildError> {
     let name = format!("{}.MAP", stem.to_ascii_uppercase());
     if name.len() > MAP_NAME_BYTES {
@@ -617,7 +855,7 @@ pub(crate) fn build(input: &BuildInput) -> Result<Built, BuildError> {
     let mut report = BuildReport::default();
     let mut layer = ModLayer::new(input.layer_id, input.layer_name, env!("CARGO_PKG_VERSION"))
         .map_err(|e| BuildError::emit("vault-mod.toml", e))?;
-    let mut lists = Lists::load(input.base_files)?;
+    let mut lists = Lists::load(input.base_files, options.standalone)?;
 
     // Map numbers.
     let maps_txt = input.base_files.get(MAPS_TXT);
@@ -660,14 +898,22 @@ pub(crate) fn build(input: &BuildInput) -> Result<Built, BuildError> {
         }
     }
     let (verdicts, stats) = walk::verdicts(&frame, input.sampler, input.cells, &blocked, options);
-    let walkable: Vec<bool> = verdicts
+    let mut walkable: Vec<bool> = verdicts
         .iter()
         .map(|v| *v == walk::Verdict::Walkable)
         .collect();
     if stats.walkable == 0 {
         return Err(BuildError::NoWalkableHex);
     }
-    if stats.triangles == 0 {
+    let interior = options.interior.as_ref();
+    if let Some(interior) = interior {
+        let [low, high] = interior.band();
+        report.notes.push(format!(
+            "interior demo: walkable ground is the navmesh from z {low:.0} to {high:.0} \
+             ({} of {} triangles; {} on other levels ignored)",
+            stats.triangles_rasterized, stats.triangles, stats.triangles_off_level
+        ));
+    } else if stats.triangles == 0 {
         report.notes.push(
             "no exterior cell of the window has a navmesh: walkability is the slope test alone"
                 .into(),
@@ -679,11 +925,38 @@ pub(crate) fn build(input: &BuildInput) -> Result<Built, BuildError> {
         ));
     }
     report.walk = stats;
-    let border = walk::sealing_border(&walkable, &engine_blocked, &open);
 
-    // Exits.
-    let (door_exits, skipped, unknown_doors) =
-        exits::plan(&frame, input.placements, input.cells, &verdicts);
+    // Exits; none on an interior demo, whose doors are listed instead.
+    let interior_doors = if interior.is_some() {
+        interior_doors(input)
+    } else {
+        Vec::new()
+    };
+    let (door_exits, skipped, unknown_doors) = if interior.is_some() {
+        let skipped = interior_doors
+            .iter()
+            .map(|door| SkippedTeleport {
+                door: door.door.clone(),
+                reason: format!(
+                    "not converted on an interior demo{}",
+                    match (&door.destination_editor_id, &door.destination) {
+                        (Some(id), _) => format!(" (it leads to {id})"),
+                        (None, Some(form)) => format!(" (it leads to {form})"),
+                        (None, None) => String::new(),
+                    }
+                ),
+            })
+            .collect();
+        (Vec::new(), skipped, 0)
+    } else {
+        exits::plan(
+            &frame,
+            input.placements,
+            input.cells,
+            &verdicts,
+            options.door_reach,
+        )
+    };
     if unknown_doors > 0 {
         report.notes.push(format!(
             "{unknown_doors} door placements name references the cells do not hold; they are \
@@ -702,14 +975,92 @@ pub(crate) fn build(input: &BuildInput) -> Result<Built, BuildError> {
         stubs.entry(exit.door.clone()).or_default().push(index);
     }
 
-    // Entrance: the walkable hex nearest the window centre.
+    let door_hexes: BTreeSet<i32> = input
+        .placements
+        .iter()
+        .filter(|placement| placement.role == Role::Door)
+        .map(|placement| placement.hex)
+        .collect();
+    let return_hexes: BTreeSet<i32> = door_exits.iter().map(|exit| exit.return_hex).collect();
+
+    // Islands: join those holding an exit, a return hex or a critter (where
+    // it would stand, the entrance aside) to the largest component.
+    let cover = Cover::new(input.art, input.placements);
+    let levels = match interior {
+        Some(interior) => critter_levels(input, interior),
+        None => Vec::new(),
+    };
+    let radius = |index: usize| critter_radius(&levels, interior, index);
+    let provisional: Vec<(String, i32)> = if input.critters.is_empty() {
+        Vec::new()
+    } else {
+        let mut reserved: BTreeSet<i32> = grid_hexes.clone();
+        reserved.extend(&return_hexes);
+        reserved.extend(&door_hexes);
+        critters::place(&frame, input.critters, &walkable, &reserved, radius)
+            .0
+            .into_iter()
+            .map(|spot| (input.critters[spot.index].reference.clone(), spot.hex))
+            .collect()
+    };
+    let targets = passages::targets(&door_exits, &provisional);
+    let (passages, islands_left) = passages::reconnect(
+        &mut walkable,
+        &targets,
+        || {
+            passages::open_costs(
+                &frame,
+                input.sampler,
+                input.cells,
+                options,
+                &walkable_before(&verdicts),
+                input.placements,
+                |p| effective_blocking(p.role, p.blocking),
+                &cover,
+            )
+        },
+        options,
+        options.reconnect,
+    );
+    let opened: BTreeSet<i32> = passages
+        .iter()
+        .flat_map(|p| p.opened.iter().copied())
+        .collect();
+    report.opened_hexes = opened.len();
+    report.passages = passages;
+    report.islands_left = islands_left;
+    let border = walk::sealing_border(&walkable, &engine_blocked, &open);
+
+    // Entrance (crate notes); an interior's is near its given point or its
+    // floor's navmesh centre.
     let window = &input.window;
-    let centre = frame.tile_of_source(
+    let window_centre = [
         f64::from(window.x_west) + f64::from(window.size) / 2.0,
         f64::from(window.y_north) - f64::from(window.size) / 2.0,
-    );
-    let entry = walk::nearest_walkable(&frame, &walkable, centre, &grid_hexes)
-        .ok_or(BuildError::NoWalkableHex)?;
+    ];
+    let entrance_near = interior.map(|interior| match interior.entrance_near {
+        Some(p) => ([f64::from(p[0]), f64::from(p[1])], true),
+        None => (
+            walk::navmesh_centre(input.cells, interior)
+                .map_or(window_centre, |p| [f64::from(p[0]), f64::from(p[1])]),
+            false,
+        ),
+    });
+    let target = entrance_near.map_or(window_centre, |(p, _)| p);
+    let centre = frame.tile_of_source(target[0], target[1]);
+    let mut avoid = grid_hexes.clone();
+    avoid.extend(&return_hexes);
+    report.entrance = entrance(
+        &frame,
+        &walkable,
+        centre,
+        &grid_hexes,
+        &avoid,
+        &cover,
+        options.entrance_box,
+    )
+    .ok_or(BuildError::NoWalkableHex)?;
+    let entry = report.entrance.hex;
     report.entry_hex = entry;
 
     // Critters: every sprite set a critter names is checked; then each
@@ -727,17 +1078,14 @@ pub(crate) fn build(input: &BuildInput) -> Result<Built, BuildError> {
     let spots = if input.critters.is_empty() {
         Vec::new()
     } else {
+        // A critter standing in a passage would close it again.
         let mut reserved: BTreeSet<i32> = grid_hexes.clone();
         reserved.insert(entry);
-        reserved.extend(door_exits.iter().map(|exit| exit.return_hex));
-        reserved.extend(
-            input
-                .placements
-                .iter()
-                .filter(|placement| placement.role == Role::Door)
-                .map(|placement| placement.hex),
-        );
-        let (spots, skipped) = critters::place(&frame, input.critters, &walkable, &reserved);
+        reserved.extend(&return_hexes);
+        reserved.extend(&door_hexes);
+        reserved.extend(&opened);
+        let (spots, skipped) =
+            critters::place(&frame, input.critters, &walkable, &reserved, radius);
         report.skipped_critters = skipped;
         spots
     };
@@ -800,12 +1148,20 @@ pub(crate) fn build(input: &BuildInput) -> Result<Built, BuildError> {
         }
     }
     let tile_pad = RESERVED_TILES.saturating_sub(lists.art_base[&ART_TILES]);
+    // An interior's all-transparent library tiles are the blank tile.
+    let blank_tile: Vec<bool> = input
+        .ground
+        .tiles
+        .iter()
+        .map(|tile| interior.is_some() && tile.iter().all(|p| *p == 0))
+        .collect();
+    let written_tiles = blank_tile.iter().filter(|blank| !**blank).count();
     new_labels
         .entry(ART_TILES)
         .or_default()
         .extend(std::iter::repeat_n(
             "ground tiles".to_owned(),
-            input.ground.tiles.len() + tile_pad,
+            written_tiles + tile_pad,
         ));
     new_labels
         .entry(ART_SCENERY)
@@ -844,7 +1200,11 @@ pub(crate) fn build(input: &BuildInput) -> Result<Built, BuildError> {
         lists.add_art(&mut layer, ART_TILES, &mut tile_names, blank)?;
     }
     let mut tile_index = Vec::with_capacity(input.ground.tiles.len());
-    for tile in input.ground.tiles {
+    for (tile, blank) in input.ground.tiles.iter().zip(&blank_tile) {
+        if *blank {
+            tile_index.push(BLANK_TILE);
+            continue;
+        }
         let bytes = frm(TILE_WIDTH, TILE_HEIGHT, tile.clone(), [0, 0])?;
         let fid = lists.add_art(&mut layer, ART_TILES, &mut tile_names, bytes)?;
         tile_index.push(fid.base());
@@ -906,6 +1266,22 @@ pub(crate) fn build(input: &BuildInput) -> Result<Built, BuildError> {
         report
             .art_entries
             .insert(directory(*category).into(), added);
+    }
+    for category in BUILD_LISTS {
+        let kept = lists.art_base[&category];
+        let len = lists.art[&category].len();
+        report.art_lists.insert(
+            directory(category).into(),
+            ArtListReport {
+                replaced: crate::budget::replaced(category, options.standalone),
+                base_entries: lists.art_base_entries[&category],
+                kept,
+                added: len - kept,
+                free_before: FID_INDEX_CAP - kept,
+                free_after: FID_INDEX_CAP - len,
+                shipped: lists.touched_art.contains(&category),
+            },
+        );
     }
 
     // Prototypes: one per distinct (art, role, blocking).
@@ -1033,6 +1409,19 @@ pub(crate) fn build(input: &BuildInput) -> Result<Built, BuildError> {
         report
             .art_entries
             .insert(directory(ART_CRITTERS).into(), used_sets.len());
+        let kept = list.len() - used_sets.len();
+        report.art_lists.insert(
+            directory(ART_CRITTERS).into(),
+            ArtListReport {
+                replaced: false,
+                base_entries: kept,
+                kept,
+                added: used_sets.len(),
+                free_before: FID_INDEX_CAP - kept,
+                free_after: list.remaining(),
+                shipped: true,
+            },
+        );
     }
 
     // Critter prototypes: one per distinct character, in placement order.
@@ -1179,6 +1568,14 @@ pub(crate) fn build(input: &BuildInput) -> Result<Built, BuildError> {
         )));
     }
     report.objects = objects.len();
+    report.components = component_report(&objects, &walkable, entry, &door_exits, &report);
+    if report.components.leaked > 0 {
+        report.notes.push(format!(
+            "{} hexes that are not walkable can be walked onto from walkable ones: the sealing \
+             border leaks",
+            report.components.leaked
+        ));
+    }
 
     // The exterior map.
     let map_file = format!("{stem}.map");
@@ -1189,7 +1586,7 @@ pub(crate) fn build(input: &BuildInput) -> Result<Built, BuildError> {
             .ground
             .squares
             .iter()
-            .map(|library| tile_word(tile_index[usize::from(*library)]))
+            .map(|library| tile_word(floor_of(&tile_index, *library)))
             .collect(),
     );
     map.objects.total = objects.len();
@@ -1212,7 +1609,7 @@ pub(crate) fn build(input: &BuildInput) -> Result<Built, BuildError> {
             exit_fid.ok_or_else(|| BuildError::Input("an exit without exit-grid art".into()))?;
         let floor = Frame::square_of_hex(first.door_hex)
             .and_then(|square| input.ground.squares.get(square as usize))
-            .map_or(1, |library| tile_index[usize::from(*library)]);
+            .map_or(1, |library| floor_of(&tile_index, *library));
         let mut tiles = vec![TilePair::BLANK; 10_000];
         for hex in exits::hexes_around(STUB_ENTRY, STUB_FLOOR_RADIUS, false) {
             if let Some(square) = Frame::square_of_hex(hex) {
@@ -1257,6 +1654,7 @@ pub(crate) fn build(input: &BuildInput) -> Result<Built, BuildError> {
                 stub_file: file.clone(),
                 stub_number: *number,
                 grid_hexes: exit.grid_hexes.clone(),
+                grid_steps: exit.grid_steps,
                 return_hex: exit.return_hex,
                 return_orientation: exit.return_orientation,
                 return_from_teleport: exit.return_from_teleport,
@@ -1324,6 +1722,67 @@ pub(crate) fn build(input: &BuildInput) -> Result<Built, BuildError> {
     }
 
     report.verify = crate::verify_layer(&layer, input.base_files)?;
+    if let Some(interior) = interior {
+        let maps = &report.verify.maps;
+        if maps.len() != 1 || maps.iter().any(|map| map.exit_grids > 0) {
+            return Err(BuildError::verify(
+                &report.map_file,
+                format!(
+                    "an interior demo is one map without exit grids; the layer holds {} maps \
+                     and {} exit grids",
+                    maps.len(),
+                    maps.iter().map(|map| map.exit_grids).sum::<usize>()
+                ),
+            ));
+        }
+        let (near, given) = entrance_near.unwrap_or((window_centre, false));
+        let mut account = InteriorReport {
+            cells: input
+                .cells
+                .iter()
+                .filter(|cell| cell.is_interior())
+                .map(|cell| (cell.form.to_string(), cell.editor_id.clone()))
+                .collect(),
+            floor_z: interior.floor_z,
+            band: interior.band(),
+            entrance_near: [near[0] as f32, near[1] as f32],
+            entrance_near_given: given,
+            doors: interior_doors,
+            ..InteriorReport::default()
+        };
+        let other = |index: usize| match levels.get(index) {
+            Some(CritterLevel::Other(z)) => Some(*z),
+            _ => None,
+        };
+        for critter in &report.critters {
+            if let Some(z) = other(critter.index) {
+                account.clamped.push((critter.reference.clone(), z));
+            }
+        }
+        account.other_level = report
+            .skipped_critters
+            .iter()
+            .filter(|skipped| {
+                other(skipped.index).is_some() && skipped.reason.starts_with("on another level")
+            })
+            .cloned()
+            .collect();
+        account.unknown_level = input
+            .critters
+            .iter()
+            .zip(&levels)
+            .filter(|(_, level)| matches!(level, CritterLevel::Unknown))
+            .map(|(critter, _)| critter.reference.clone())
+            .collect();
+        if !account.unknown_level.is_empty() {
+            report.notes.push(format!(
+                "{} critters name references the interior cells do not hold; their level is \
+                 unknown and they were placed as on the floor level",
+                account.unknown_level.len()
+            ));
+        }
+        report.interior = Some(account);
+    }
     Ok(Built {
         layer,
         walkable,

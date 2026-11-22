@@ -238,9 +238,36 @@ impl Shading {
 /// tone.
 type Slot = Option<u32>;
 
+/// Where a layer's texture comes from, for the stats and for what a layer
+/// with nothing to draw does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Origin {
+    /// The layer's own land texture.
+    #[default]
+    Own,
+    /// The engine's default land texture, standing in for a layer that
+    /// names no usable one ([`LandLayer::defaulted`]).
+    Defaulted,
+    /// The layer's texture is missing: a file that is not in the MIR, or
+    /// no texture at all (a quadrant without a base layer in a document
+    /// written before the default land texture was extracted).
+    Missing,
+}
+
+impl Origin {
+    fn of(layer: &LandLayer, slot: Slot) -> Self {
+        match (slot, layer.is_defaulted()) {
+            (None, _) => Origin::Missing,
+            (Some(_), true) => Origin::Defaulted,
+            (Some(_), false) => Origin::Own,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Layer {
     texture: Slot,
+    origin: Origin,
     /// 17 × 17, row 0 south, column 0 west.
     opacity: Vec<f32>,
 }
@@ -253,9 +280,12 @@ impl Layer {
 
 #[derive(Debug, Clone, Default)]
 struct Quadrant {
-    /// The base layer's texture; `None` (no base layer, or its texture
-    /// missing) is the missing tone.
+    /// The base layer's texture. When the base is missing (no base layer,
+    /// or its texture missing) this is the nearest quadrant's base texture
+    /// ([`Terrain::borrow_bases`]), or `None`, the missing tone.
     base: Slot,
+    /// [`Origin::Missing`] for a missing base, even when one is borrowed.
+    base_origin: Origin,
     /// Blended layers, in ascending layer order.
     layers: Vec<Layer>,
 }
@@ -287,7 +317,7 @@ fn bilinear(grid: &[f32], side: usize, u: f64, v: f64) -> f32 {
 /// Per-worker scratch space.
 #[derive(Default)]
 pub(crate) struct Scratch {
-    weights: Vec<(Slot, f32)>,
+    weights: Vec<(Slot, Origin, f32)>,
 }
 
 /// One evaluated ground pixel.
@@ -297,8 +327,11 @@ pub(crate) struct Sample {
     pub rgb: [f32; 3],
     /// No land here: the fallback colour.
     pub fallback: bool,
-    /// A missing texture contributed.
+    /// A missing texture contributed, or would have: a missing blended
+    /// layer that was left out still counts.
     pub missing: bool,
+    /// The engine's default land texture contributed.
+    pub defaulted: bool,
 }
 
 /// The prepared terrain of every cell the map can see.
@@ -310,12 +343,21 @@ pub(crate) struct Terrain {
     cells: Vec<Option<Cell>>,
     textures: Vec<Prefiltered>,
     missing_rgb: [f32; 3],
+    /// Whether a missing layer is drawn from its neighbours (a blended
+    /// layer left out, a base borrowed) rather than in the missing tone:
+    /// true unless the caller set the tone.
+    substitute: bool,
     fallback_rgb: [f32; 3],
     /// Sub-sample offsets in source units, relative to the pixel centre.
     offsets: Vec<[f64; 2]>,
     pub cells_with_land: usize,
     pub cells_without_land: usize,
     pub missing_layers: usize,
+    /// Of `missing_layers`, those that name no texture file at all.
+    pub unnamed_layers: usize,
+    /// Missing bases drawn with a neighbouring quadrant's base texture.
+    pub borrowed_bases: usize,
+    pub defaulted_layers: usize,
     pub textures_loaded: usize,
     pub textures_missing: usize,
 }
@@ -426,11 +468,15 @@ impl Terrain {
             cells: Vec::with_capacity(nx * ny),
             textures,
             missing_rgb,
+            substitute: options.missing_texture_rgb.is_none(),
             fallback_rgb: options.fallback_rgb.map(f32::from),
             offsets: Vec::new(),
             cells_with_land: 0,
             cells_without_land: 0,
             missing_layers: 0,
+            unnamed_layers: 0,
+            borrowed_bases: 0,
+            defaulted_layers: 0,
             textures_loaded: 0,
             textures_missing,
         };
@@ -443,6 +489,9 @@ impl Terrain {
                 terrain.cells_without_land += 1;
             }
             terrain.cells.push(prepared);
+        }
+        if terrain.substitute {
+            terrain.borrow_bases();
         }
         let n = options.supersample;
         for j in 0..n {
@@ -470,6 +519,18 @@ impl Terrain {
         };
         let mut quadrants: [Quadrant; 4] = Default::default();
         let mut missing = 0;
+        let mut unnamed = 0;
+        let mut defaulted = 0;
+        let mut count = |origin: Origin, layer: Option<&LandLayer>| match origin {
+            Origin::Own => {}
+            Origin::Defaulted => defaulted += 1,
+            Origin::Missing => {
+                missing += 1;
+                if layer.is_none_or(|l| l.texture.is_none() && l.texture_hash.is_none()) {
+                    unnamed += 1;
+                }
+            }
+        };
         for (index, quadrant) in quadrants.iter_mut().enumerate() {
             let mut layers: Vec<&LandLayer> = land
                 .layers
@@ -482,13 +543,15 @@ impl Terrain {
             match base {
                 Some(base) => {
                     quadrant.base = slot_of(base);
-                    if quadrant.base.is_none() {
-                        missing += 1;
-                    }
+                    quadrant.base_origin = Origin::of(base, quadrant.base);
+                    count(quadrant.base_origin, Some(base));
                 }
-                // No base layer: the game's default land texture, which is
-                // not extracted.
-                None => missing += 1,
+                // No base layer: the game's default land texture, which a
+                // document written before it was extracted lacks.
+                None => {
+                    quadrant.base_origin = Origin::Missing;
+                    count(Origin::Missing, None);
+                }
             }
             for layer in layers.iter().filter(|l| l.layer >= 0) {
                 let mut opacity = vec![0.0f32; QUAD_GRID * QUAD_GRID];
@@ -504,13 +567,18 @@ impl Terrain {
                     continue;
                 }
                 let texture = slot_of(layer);
-                if texture.is_none() {
-                    missing += 1;
-                }
-                quadrant.layers.push(Layer { texture, opacity });
+                let origin = Origin::of(layer, texture);
+                count(origin, Some(layer));
+                quadrant.layers.push(Layer {
+                    texture,
+                    origin,
+                    opacity,
+                });
             }
         }
         self.missing_layers += missing;
+        self.unnamed_layers += unnamed;
+        self.defaulted_layers += defaulted;
         let colors = land
             .colors
             .as_ref()
@@ -521,6 +589,68 @@ impl Terrain {
                     .collect()
             });
         Some(Cell { quadrants, colors })
+    }
+
+    /// Gives every missing base the base texture of the nearest quadrant
+    /// whose own base is drawn (its own texture or the default), by steps
+    /// between edge-sharing quadrants across the loaded cells, so a hole in
+    /// the ground takes the look of the ground around it. Ties go to the
+    /// quadrant reached first from the sources in cell and quadrant order,
+    /// east, west, north, south. A base with no such quadrant anywhere
+    /// keeps the missing tone.
+    fn borrow_bases(&mut self) {
+        let (w, h) = (self.nx * 2, self.ny * 2);
+        let at = |gx: usize, gy: usize| ((gy / 2) * self.nx + gx / 2, (gy % 2) * 2 + gx % 2);
+        let mut nearest: Vec<Slot> = vec![None; w * h];
+        let mut queue = std::collections::VecDeque::new();
+        let mut any_missing = false;
+        for gy in 0..h {
+            for gx in 0..w {
+                let (cell, q) = at(gx, gy);
+                let Some(cell) = &self.cells[cell] else {
+                    continue;
+                };
+                let quadrant = &cell.quadrants[q];
+                if quadrant.base_origin == Origin::Missing {
+                    any_missing = true;
+                } else if quadrant.base.is_some() {
+                    nearest[gy * w + gx] = quadrant.base;
+                    queue.push_back((gx, gy));
+                }
+            }
+        }
+        if !any_missing {
+            return;
+        }
+        while let Some((gx, gy)) = queue.pop_front() {
+            let slot = nearest[gy * w + gx];
+            let steps = [
+                (gx + 1 < w).then(|| (gx + 1, gy)),
+                gx.checked_sub(1).map(|x| (x, gy)),
+                (gy + 1 < h).then(|| (gx, gy + 1)),
+                gy.checked_sub(1).map(|y| (gx, y)),
+            ];
+            for (nx, ny) in steps.into_iter().flatten() {
+                if nearest[ny * w + nx].is_none() {
+                    nearest[ny * w + nx] = slot;
+                    queue.push_back((nx, ny));
+                }
+            }
+        }
+        for gy in 0..h {
+            for gx in 0..w {
+                let (cell, q) = at(gx, gy);
+                if let Some(cell) = &mut self.cells[cell] {
+                    let quadrant = &mut cell.quadrants[q];
+                    if quadrant.base_origin == Origin::Missing && quadrant.base.is_none() {
+                        quadrant.base = nearest[gy * w + gx];
+                        if quadrant.base.is_some() {
+                            self.borrowed_bases += 1;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// The cell under a source point and the point's grid coordinates in
@@ -562,6 +692,7 @@ impl Terrain {
                 rgb: self.fallback_rgb,
                 fallback: true,
                 missing: false,
+                defaulted: false,
             };
         };
         let (index, lu, lv) = quadrant_of(u, v);
@@ -569,14 +700,21 @@ impl Terrain {
         let weights = &mut scratch.weights;
         weights.clear();
         let mut remaining = 1.0f32;
+        // What missing blended layers left out would have covered.
+        let mut left_out = 0.0f32;
         for layer in quadrant.layers.iter().rev() {
             let alpha = layer.opacity_at(lu, lv);
             if alpha <= 0.0 {
                 continue;
             }
             let weight = alpha * remaining;
+            if self.substitute && layer.origin == Origin::Missing {
+                // Nothing to draw: the layers below show through.
+                left_out += weight;
+                continue;
+            }
             if weight > WEIGHT_EPSILON {
-                weights.push((layer.texture, weight));
+                weights.push((layer.texture, layer.origin, weight));
             }
             remaining *= 1.0 - alpha;
             if remaining <= WEIGHT_EPSILON {
@@ -585,14 +723,20 @@ impl Terrain {
             }
         }
         if remaining > 0.0 {
-            weights.push((quadrant.base, remaining));
+            weights.push((quadrant.base, quadrant.base_origin, remaining));
         }
-        let total: f32 = weights.iter().map(|(_, w)| w).sum();
+        let total: f32 = weights.iter().map(|(_, _, w)| w).sum();
         let mut rgb = [0.0f32; 3];
         let mut missing = 0.0f32;
+        let mut defaulted = 0.0f32;
         let inv_samples = 1.0 / self.offsets.len() as f32;
-        for &(slot, weight) in weights.iter() {
+        for &(slot, origin, weight) in weights.iter() {
             let weight = weight / total;
+            match origin {
+                Origin::Own => {}
+                Origin::Defaulted => defaulted += weight,
+                Origin::Missing => missing += weight,
+            }
             match slot.and_then(|s| self.textures.get(s as usize)) {
                 Some(texture) => {
                     let mut acc = [0.0f32; 3];
@@ -607,7 +751,6 @@ impl Terrain {
                     }
                 }
                 None => {
-                    missing += weight;
                     for k in 0..3 {
                         rgb[k] += self.missing_rgb[k] * weight;
                     }
@@ -629,7 +772,8 @@ impl Terrain {
         Sample {
             rgb,
             fallback: false,
-            missing: missing > COUNT_EPSILON,
+            missing: missing > COUNT_EPSILON || left_out > COUNT_EPSILON,
+            defaulted: defaulted > COUNT_EPSILON,
         }
     }
 }

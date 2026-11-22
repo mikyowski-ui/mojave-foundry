@@ -18,13 +18,14 @@ use std::path::Path;
 use foundry_render::Projection;
 use mir::{CellDoc, CellLocation, GroundSampler, MapWindow, Mir};
 use quantize::PaletteMap;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use vault_formats::geometry::HexGrid;
 
 use crate::config::{ConvertError, Inputs};
 
 /// Bumped whenever the stage's output for the same inputs would change.
-const STAGE_VERSION: &str = "map-6";
+const STAGE_VERSION: &str = "map-8";
 /// Land textures are filtered one mip level finer than the pixel footprint
 /// asks for: crisper cracks and grain, judged on engine frames.
 const GROUND_LOD_BIAS: f32 = -1.0;
@@ -37,8 +38,70 @@ const DOOR_APPROACH: i32 = 6;
 pub const LAYER_ID: &str = "mojave";
 
 /// Art-list entries kept back for what the builder adds itself (the
-/// invisible blocker, padding).
+/// invisible blocker, padding), in a run that extends the base lists. A
+/// standalone run uses `map_builder::art_budget`'s exact count instead.
 const BUILDER_RESERVE: usize = 8;
+/// The terrain library cap of a run that extends the base tile list.
+const EXTENDING_TILE_CAP: usize = 2000;
+
+/// The map stage's own record of the largest things it placed, beside the
+/// report: what `shots --auto` points the camera at.
+pub const FEATURES_FILE: &str = "map-features.json";
+/// At most this many features are recorded.
+const MAX_FEATURES: usize = 64;
+
+/// What one run may spend: the slicer's budget, the terrain library cap,
+/// and every art list as `map_builder::art_budget` sees it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Budgets {
+    pub standalone: bool,
+    pub slicer: map_slicer::Budget,
+    pub tile_cap: usize,
+    pub lists: BTreeMap<String, map_builder::ArtListBudget>,
+}
+
+/// The budgets for these base files and mode. A run that extends the base
+/// lists keeps the numbers it always had: the free entries of each list
+/// less [`BUILDER_RESERVE`], tiles capped at 2,000. A standalone run takes
+/// what `art_budget` leaves the caller's art, all of it.
+pub fn budgets(
+    base: &BTreeMap<String, Vec<u8>>,
+    standalone: bool,
+) -> Result<Budgets, ConvertError> {
+    let lists = map_builder::art_budget(base, standalone).map_err(stage)?;
+    let list = |name: &str| {
+        lists
+            .get(name)
+            .copied()
+            .ok_or_else(|| stage(format!("the builder reports no {name} list")))
+    };
+    let (slicer, tile_cap) = if standalone {
+        (
+            map_slicer::Budget {
+                walls: list("walls")?.available(),
+                scenery: list("scenery")?.available(),
+                items: list("items")?.available(),
+            },
+            list("tiles")?.available(),
+        )
+    } else {
+        let kept_back = |name: &str| list(name).map(|l| l.free.saturating_sub(BUILDER_RESERVE));
+        (
+            map_slicer::Budget {
+                walls: kept_back("walls")?,
+                scenery: kept_back("scenery")?,
+                items: kept_back("items")?,
+            },
+            kept_back("tiles")?.min(EXTENDING_TILE_CAP),
+        )
+    };
+    Ok(Budgets {
+        standalone,
+        slicer,
+        tile_cap,
+        lists,
+    })
+}
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MapSummary {
@@ -67,28 +130,6 @@ fn io(path: &Path) -> impl FnOnce(std::io::Error) -> ConvertError + '_ {
 
 fn stage(error: impl std::fmt::Display) -> ConvertError {
     ConvertError::stage("map", error)
-}
-
-/// The art directory number of a category name, from the engine's own
-/// table.
-fn art_category(name: &str) -> Result<u8, ConvertError> {
-    vault_formats::fid::ART_DIRECTORIES
-        .iter()
-        .position(|d| *d == name)
-        .map(|index| index as u8)
-        .ok_or_else(|| stage(format!("no art directory named {name}")))
-}
-
-/// Entries still free in a base art list (all of them when the install has
-/// no such list).
-fn free_entries(base: &BTreeMap<String, Vec<u8>>, name: &str) -> Result<usize, ConvertError> {
-    let category = art_category(name)?;
-    let list = match base.get(&format!("art/{name}/{name}.lst")) {
-        Some(bytes) => emit::ArtList::from_base(category, bytes),
-        None => emit::ArtList::new(category),
-    }
-    .map_err(stage)?;
-    Ok(list.remaining().saturating_sub(BUILDER_RESERVE))
 }
 
 fn slicer_category(category: map_slicer::ArtCategory) -> map_builder::ArtCategory {
@@ -141,6 +182,11 @@ fn cache_key(
     hasher.update(Sha256::digest(palette_bytes));
     hasher.update(format!("{:?}", inputs.backend).as_bytes());
     hasher.update(inputs.slice.to_toml().as_bytes());
+    // Only a standalone run hashes its mode, so that every key made before
+    // the mode existed stays valid.
+    if inputs.standalone {
+        hasher.update(b"standalone");
+    }
     // The critter stage's index names every sprite set by content key.
     let critters = inputs.critters_dir().join("index.json");
     if let Ok(index) = std::fs::read(&critters) {
@@ -157,24 +203,70 @@ fn cache_key(
         .collect())
 }
 
+/// A person (or creature) of an interior the map stage did not hand to the
+/// builder, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersonSkip {
+    pub name: String,
+    pub reference: String,
+    pub reason: String,
+}
+
+/// `name` after "a" or "an", by its first letter.
+fn with_article(name: &str) -> String {
+    let vowel = name
+        .chars()
+        .next()
+        .is_some_and(|c| "AEIOUaeiou".contains(c));
+    format!("{} {name}", if vowel { "an" } else { "a" })
+}
+
+/// The display name of an actor entry: its name, else its editor id.
+fn person_name(entry: &crate::critters::CritterEntry) -> String {
+    entry
+        .name
+        .clone()
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| entry.editor_id.clone())
+        .unwrap_or_else(|| "Resident".to_owned())
+}
+
+/// The townsfolk the builder is given, and on an interior slice whoever
+/// was left out before it.
+type CritterInputs = (
+    Vec<map_builder::CritterArt>,
+    Vec<map_builder::CritterPlacement>,
+    Vec<PersonSkip>,
+);
+
 /// The slice's townsfolk for the builder: the sprite sets the critter stage
 /// rendered, and one placement per human reference in the window that
 /// starts enabled (by its own flag and by its enable parent, the rule the
 /// slicer applies to statics) and whose actor has a sprite set.
+///
+/// On an interior slice, `place_disabled` places people the data starts
+/// disabled too; a person whose actor has fewer than 1 hit point is dead
+/// in the data and left out (an exterior lifts it to 1); every person and
+/// creature left out is returned with the reason. Several references to
+/// one actor each get a placement.
 fn critter_inputs(
     inputs: &Inputs,
     cells: &[CellDoc],
     references: &[mir::Reference],
-) -> Result<
-    (
-        Vec<map_builder::CritterArt>,
-        Vec<map_builder::CritterPlacement>,
-    ),
-    ConvertError,
-> {
+) -> Result<CritterInputs, ConvertError> {
+    let interior = inputs.slice.is_interior();
+    let place_disabled = interior && inputs.slice.place_disabled;
+    let mut skipped: Vec<PersonSkip> = Vec::new();
     let index = crate::critters::read_index(inputs)?;
     let by_actor: BTreeMap<&str, &crate::critters::CritterEntry> =
         index.iter().map(|e| (e.actor.as_str(), e)).collect();
+    let label = |reference: &mir::Reference| {
+        by_actor
+            .get(reference.base.to_string().as_str())
+            .map(|e| person_name(e))
+            .or_else(|| reference.base_editor_id.clone())
+            .unwrap_or_else(|| reference.base.to_string())
+    };
     let enabled: BTreeMap<String, bool> = cells
         .iter()
         .flat_map(|cell| cell.references.iter())
@@ -189,33 +281,57 @@ fn critter_inputs(
     let mut art = Vec::new();
     let mut placements = Vec::new();
     for reference in references {
-        if reference.base_kind.as_deref() != Some("NPC_")
-            || reference.flags.deleted
-            || reference.flags.initially_disabled
-        {
+        let mut skip = |reason: String| {
+            if interior {
+                skipped.push(PersonSkip {
+                    name: label(reference),
+                    reference: reference.form.to_string(),
+                    reason,
+                });
+            }
+        };
+        if reference.base_kind.as_deref() == Some("CREA") && !reference.flags.deleted {
+            skip("a creature: creatures are not rendered yet".to_owned());
             continue;
         }
-        if let Some(parent) = &reference.enable_parent {
+        if reference.base_kind.as_deref() != Some("NPC_") || reference.flags.deleted {
+            continue;
+        }
+        if reference.flags.initially_disabled && !place_disabled {
+            skip("starts disabled in the data (place_disabled is off)".to_owned());
+            continue;
+        }
+        if let Some(parent) = &reference.enable_parent
+            && !place_disabled
+        {
             let parent_on = enabled
                 .get(&parent.reference.to_string())
                 .copied()
                 .unwrap_or(true);
             if parent_on == parent.opposite {
+                skip(format!(
+                    "its enable parent {} starts it disabled (place_disabled is off)",
+                    parent.reference
+                ));
                 continue;
             }
         }
         let Some(entry) = by_actor.get(reference.base.to_string().as_str()) else {
+            skip("no actor document (run the critter stage)".to_owned());
             continue;
         };
         let Some(key) = &entry.set else {
+            skip(format!(
+                "no sprite set: {}",
+                entry.error.as_deref().unwrap_or("not rendered")
+            ));
             continue;
         };
-        let name = entry
-            .name
-            .clone()
-            .filter(|name| !name.trim().is_empty())
-            .or_else(|| entry.editor_id.clone())
-            .unwrap_or_else(|| "Resident".to_owned());
+        if interior && entry.health < 1 {
+            skip(format!("dead in the data ({} hit points)", entry.health));
+            continue;
+        }
+        let name = person_name(entry);
         let set = match sets.get(key) {
             Some(set) => *set,
             None => {
@@ -239,7 +355,20 @@ fn critter_inputs(
             female: entry.female,
         });
     }
-    Ok((art, placements))
+    if interior {
+        // A name several people share is not a proper name: "You see a
+        // Powder Ganger." (An exterior keeps its descriptions as they were.)
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        for placement in &placements {
+            *counts.entry(placement.name.clone()).or_default() += 1;
+        }
+        for placement in &mut placements {
+            if counts[&placement.name] > 1 {
+                placement.description = format!("You see {}.", with_article(&placement.name));
+            }
+        }
+    }
+    Ok((art, placements, skipped))
 }
 
 /// Paints the map as the engine draws it: floor tiles, then every object in
@@ -285,41 +414,58 @@ fn compose_preview(
     (canvas, width, height)
 }
 
-/// Builds the slice's map and writes the mod layer.
-pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
-    let mir = Mir::open(&inputs.mir_dir()).map_err(stage)?;
-    let palette_bytes = inputs.f2_file("color.pal")?;
-    let palette = inputs.palette()?;
-    let palette_map = PaletteMap::try_new(&palette).map_err(stage)?;
-
-    // The base game's lists, which the layer must ship whole. A synthetic
-    // install has none, and then everything starts empty.
+/// The base game's files the builder takes (`map_builder::base_file_paths`),
+/// which the layer must ship whole. A synthetic install has none, and then
+/// everything starts empty.
+fn base_files(inputs: &Inputs) -> BTreeMap<String, Vec<u8>> {
     let mut base: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     for path in map_builder::base_file_paths() {
         if let Ok(bytes) = inputs.f2_file(path) {
             base.insert((*path).to_owned(), bytes);
         }
     }
+    base
+}
 
-    let mod_dir = inputs.mod_dir();
-    let key = cache_key(inputs, &palette_bytes, &base)?;
-    let key_path = inputs.out.join("cache").join("map.key");
-    let summary_path = inputs.out.join("cache").join("map.summary");
-    if mod_dir.join("vault-mod.toml").is_file()
-        && std::fs::read_to_string(&key_path).is_ok_and(|stored| stored == key)
-        && let Ok(text) = std::fs::read_to_string(&summary_path)
-        && let Some(summary) = MapSummary::from_cache(&text)
-    {
-        return Ok(MapSummary {
-            reused: true,
-            ..summary
-        });
+/// The map window and everything the slicer needs about it.
+struct Scene {
+    projection: Projection,
+    window: MapWindow,
+    worldspace: String,
+    sampler: GroundSampler,
+    cells: Vec<CellDoc>,
+    references: Vec<mir::Reference>,
+    build_options: map_builder::BuildOptions,
+    slicer_config: map_slicer::SlicerConfig,
+    open: OpenHexes,
+    /// What an interior slice chose; `None` for an exterior window.
+    interior: Option<InteriorScene>,
+}
+
+/// Where an interior slice's numbers came from, for the report.
+#[derive(Debug, Clone)]
+struct InteriorScene {
+    /// The cell's editor id as the slice names it, and its form key.
+    cell: String,
+    form: String,
+    floor_z: f32,
+    floor_from: &'static str,
+    storeys: Vec<mir::Storey>,
+    centre: [f32; 2],
+    centre_from: &'static str,
+    /// The point the entrance is sought near, and what it is.
+    entrance_near: Option<[f32; 2]>,
+    entrance_from: String,
+}
+
+fn scene(inputs: &Inputs, mir: &Mir) -> Result<Scene, ConvertError> {
+    if let Some(id) = &inputs.slice.interior {
+        return interior_scene(inputs, mir, id);
     }
-
     let projection = Projection::new(&inputs.calibration).map_err(stage)?;
     let window = MapWindow::from_center(inputs.slice.center(), projection.tile_units());
     let worldspace = inputs.slice.worldspace.to_ascii_lowercase();
-    let sampler = GroundSampler::load(&mir, &worldspace, &window).map_err(stage)?;
+    let sampler = GroundSampler::load(mir, &worldspace, &window).map_err(stage)?;
 
     // Cells the window touches, with a margin so that an object standing
     // just outside still reaches in.
@@ -338,16 +484,698 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
             inputs.slice.worldspace
         )));
     }
+    // A reference belongs to the map when its origin is in the window. A
+    // standalone run also takes a static whose origin is outside but whose
+    // footprint reaches in (a control tower, a hotel wing): left out, the
+    // ground it stands on shows, often painted black under it in the
+    // source. Its pixels off the map are dropped by the slicer.
+    let reaches_in = |r: &mir::Reference| {
+        inputs.standalone
+            && matches!(r.base_kind.as_deref(), Some("STAT" | "SCOL"))
+            && footprint_reaches(mir, r, &window)
+    };
     let references: Vec<mir::Reference> = cells
         .iter()
         .flat_map(|cell| cell.references.iter())
-        .filter(|r| window.contains(r.transform.position[0], r.transform.position[1]))
+        .filter(|r| {
+            window.contains(r.transform.position[0], r.transform.position[1]) || reaches_in(r)
+        })
         .cloned()
         .collect();
 
-    // Interiors the window's doors open on, for the exits.
+    // Where the game's own navmesh lets an actor stand, a building's
+    // bounding footprint must not block: porches, canopies, doorsteps.
+    let build_options = map_builder::BuildOptions {
+        standalone: inputs.standalone,
+        ..map_builder::BuildOptions::default()
+    };
+    let frame = map_builder::walk::Frame::new(&window, &projection).map_err(stage)?;
+    let standable = map_builder::walk::standable_hexes(&frame, &sampler, &cells, &build_options);
+    let policy = OpenPolicy::of(inputs.standalone);
+    let open_hexes: BTreeSet<i32> = match policy {
+        OpenPolicy::Everywhere => standable.iter().copied().collect(),
+        OpenPolicy::NearDoors => {
+            let near_doors: BTreeSet<i32> = references
+                .iter()
+                .filter(|r| r.teleport.is_some())
+                .filter_map(|r| {
+                    let [x, y, _] = r.transform.position;
+                    frame.hex_of_source(f64::from(x), f64::from(y))
+                })
+                .flat_map(|door| map_builder::exits::hexes_around(door, DOOR_APPROACH, false))
+                .collect();
+            standable
+                .iter()
+                .copied()
+                .filter(|hex| near_doors.contains(hex))
+                .collect()
+        }
+    };
+    // Every hex the builder could ever make walkable (navmesh and slope,
+    // and slope alone in cells without a navmesh), before anything blocks:
+    // landmark pieces need not be cut for walkers who cannot exist.
+    let (verdicts, _) = map_builder::walk::verdicts(&frame, &sampler, &cells, &[], &build_options);
+    let landmark_walkers: BTreeSet<i32> = verdicts
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| **v == map_builder::walk::Verdict::Walkable)
+        .map(|(hex, _)| hex as i32)
+        .collect();
+    let open = OpenHexes {
+        policy,
+        standable: standable.len(),
+        opened: open_hexes.len(),
+        walkers: landmark_walkers.len(),
+    };
+    let slicer_config = map_slicer::SlicerConfig {
+        open_hexes,
+        landmark_walkers: Some(landmark_walkers),
+        ..map_slicer::SlicerConfig::default()
+    };
+    Ok(Scene {
+        projection,
+        window,
+        worldspace,
+        sampler,
+        cells,
+        references,
+        build_options,
+        slicer_config,
+        open,
+        interior: None,
+    })
+}
+
+/// The scene of an interior slice (`SliceSpec::interior`): the one room,
+/// on a flat floor, the window centred on it, every standable hex open.
+fn interior_scene(inputs: &Inputs, mir: &Mir, id: &str) -> Result<Scene, ConvertError> {
+    let slice = &inputs.slice;
+    let projection = Projection::new(&inputs.calibration).map_err(stage)?;
+    let doc = mir.interior(id).map_err(stage)?.ok_or_else(|| {
+        let known: Vec<&str> = mir.interiors().map(|e| e.id.as_str()).collect();
+        stage(format!(
+            "interior {id} was not extracted: no door of the slice's cells leads to it within \
+             interior_depth {} (extracted: {})",
+            slice.interior_depth,
+            if known.is_empty() {
+                "none".to_owned()
+            } else {
+                known.join(", ")
+            }
+        ))
+    })?;
+    let cells = vec![doc];
+    let storeys = mir::storeys(&cells[0]);
+    let (floor_z, floor_from) = match (slice.floor_z, storeys.first()) {
+        (Some(z), _) => (z, "the slice's floor_z"),
+        (None, Some(storey)) => (storey.floor_z, "the largest navmesh storey"),
+        (None, None) => (
+            map_builder::dominant_floor_z(&cells).ok_or_else(|| {
+                stage(format!(
+                    "interior {id} has no navmesh to find its floor from; set floor_z"
+                ))
+            })?,
+            "the dominant navmesh height",
+        ),
+    };
+    let mut interior_build = slice.interior_build(floor_z);
+    let (centre, centre_from) = match slice.map_center {
+        Some(c) => (c, "the slice's map_center"),
+        None => match map_builder::navmesh_centre(&cells, &interior_build) {
+            Some(c) => (c, "the floor level's navmesh centre"),
+            None => (
+                reference_centre(&cells[0].references),
+                "the centre of the room's references",
+            ),
+        },
+    };
+    let window = MapWindow::from_center(centre, projection.tile_units());
+    let (entrance_near, entrance_from) = match slice.entrance {
+        Some(p) => (Some(p), "the slice's entrance".to_owned()),
+        None => match first_door(&cells[0].references) {
+            Some(door) => (
+                Some([door.transform.position[0], door.transform.position[1]]),
+                format!("door {}, the room's first teleport door", door.form),
+            ),
+            None => (
+                None,
+                "the floor level's navmesh centre (no door)".to_owned(),
+            ),
+        },
+    };
+    interior_build.entrance_near = entrance_near;
+    let sampler = GroundSampler::flat(floor_z);
+    let references: Vec<mir::Reference> = cells[0]
+        .references
+        .iter()
+        .filter(|r| {
+            window.contains(r.transform.position[0], r.transform.position[1])
+                || (matches!(r.base_kind.as_deref(), Some("STAT" | "SCOL"))
+                    && footprint_reaches(mir, r, &window))
+        })
+        .cloned()
+        .collect();
+    let build_options = map_builder::BuildOptions {
+        standalone: inputs.standalone,
+        interior: Some(interior_build),
+        ..map_builder::BuildOptions::default()
+    };
+    let frame = map_builder::walk::Frame::new(&window, &projection).map_err(stage)?;
+    let standable = map_builder::walk::standable_hexes(&frame, &sampler, &cells, &build_options);
+    let (verdicts, _) = map_builder::walk::verdicts(&frame, &sampler, &cells, &[], &build_options);
+    let landmark_walkers: BTreeSet<i32> = verdicts
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| **v == map_builder::walk::Verdict::Walkable)
+        .map(|(hex, _)| hex as i32)
+        .collect();
+    let open_hexes: BTreeSet<i32> = standable.iter().copied().collect();
+    let open = OpenHexes {
+        policy: OpenPolicy::Everywhere,
+        standable: standable.len(),
+        opened: open_hexes.len(),
+        walkers: landmark_walkers.len(),
+    };
+    let slicer_config = map_slicer::SlicerConfig {
+        open_hexes,
+        landmark_walkers: Some(landmark_walkers),
+        interior: Some(slice.interior_slice(floor_z)),
+        ..map_slicer::SlicerConfig::default()
+    };
+    let interior = InteriorScene {
+        cell: cells[0].editor_id.clone().unwrap_or_else(|| id.to_owned()),
+        form: cells[0].form.to_string(),
+        floor_z,
+        floor_from,
+        storeys,
+        centre,
+        centre_from,
+        entrance_near,
+        entrance_from,
+    };
+    Ok(Scene {
+        projection,
+        window,
+        worldspace: slice.worldspace.to_ascii_lowercase(),
+        sampler,
+        cells,
+        references,
+        build_options,
+        slicer_config,
+        open,
+        interior: Some(interior),
+    })
+}
+
+/// The teleport door of `references` with the lowest form key: the door a
+/// player would usually arrive by (the cell's first).
+fn first_door(references: &[mir::Reference]) -> Option<&mir::Reference> {
+    references
+        .iter()
+        .filter(|r| r.teleport.is_some() && !r.flags.deleted && r.transform.is_finite())
+        .min_by(|a, b| a.form.cmp(&b.form))
+}
+
+/// The centre of the bounding box of the references' origins; the origin
+/// when there are none.
+fn reference_centre(references: &[mir::Reference]) -> [f32; 2] {
+    let (mut lo, mut hi) = ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]);
+    for r in references.iter().filter(|r| r.transform.is_finite()) {
+        for k in 0..2 {
+            lo[k] = lo[k].min(r.transform.position[k]);
+            hi[k] = hi[k].max(r.transform.position[k]);
+        }
+    }
+    if lo[0] > hi[0] {
+        return [0.0, 0.0];
+    }
+    [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5]
+}
+
+/// Whether the bounding footprint of `reference`'s mesh, as placed,
+/// overlaps the window (by the footprint's bounding rectangle).
+fn footprint_reaches(mir: &Mir, reference: &mir::Reference, window: &MapWindow) -> bool {
+    let Some(bounds) = reference
+        .mesh
+        .as_deref()
+        .and_then(|hash| mir.manifest().mesh_info.get(hash))
+        .and_then(|info| info.bounds)
+    else {
+        return false;
+    };
+    if !reference.transform.is_finite() {
+        return false;
+    }
+    let footprint = map_slicer::Footprint::of(&reference.transform, bounds);
+    let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+    for p in &footprint.polygon {
+        for k in 0..2 {
+            lo[k] = lo[k].min(p[k]);
+            hi[k] = hi[k].max(p[k]);
+        }
+    }
+    let west = f64::from(window.x_west);
+    let north = f64::from(window.y_north);
+    let size = f64::from(window.size);
+    lo[0] < west + size && hi[0] > west && lo[1] < north && hi[1] > north - size
+}
+
+/// Which standable hexes a building's bounding footprint leaves open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenPolicy {
+    /// Only those within [`DOOR_APPROACH`] steps of a teleporting door: a
+    /// run that extends the base lists, whose walls list cannot afford the
+    /// strips that no longer merge.
+    NearDoors,
+    /// Every one: a standalone run, with twice the walls list and the
+    /// budget ladder.
+    Everywhere,
+}
+
+impl OpenPolicy {
+    pub fn of(standalone: bool) -> Self {
+        if standalone {
+            OpenPolicy::Everywhere
+        } else {
+            OpenPolicy::NearDoors
+        }
+    }
+}
+
+/// The open hexes of a run, counted, for the report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenHexes {
+    pub policy: OpenPolicy,
+    /// Hexes the navmesh and the slope limit let an actor stand on.
+    pub standable: usize,
+    /// Of those, the ones given to the slicer as open.
+    pub opened: usize,
+    /// Hexes given to the slicer as `landmark_walkers`.
+    pub walkers: usize,
+}
+
+/// The hexes of the slicer's merged strip runs: every hex from a run's
+/// first to its last, in its row. They hold wall art and must never be
+/// opened by a passage (`BuildOptions::protected_hexes`). Sorted.
+pub fn run_hexes(placements: &[map_slicer::Placement]) -> Vec<i32> {
+    let hexes: BTreeSet<i32> = placements
+        .iter()
+        .filter_map(|p| p.run)
+        .flat_map(|(a, b)| a.min(b)..=a.max(b))
+        .collect();
+    hexes.into_iter().collect()
+}
+
+/// What [`estimate`] found: the slicer's pre-check of the window against
+/// the run's budgets, nothing rendered.
+#[derive(Debug, Clone)]
+pub struct EstimateSummary {
+    pub slice: String,
+    pub references: usize,
+    pub budgets: Budgets,
+    pub report: map_slicer::BudgetReport,
+}
+
+/// The slicer's fast pre-check (`map_slicer::estimate`) of the slice's
+/// window against the budget of the chosen mode. Needs `extract`; renders
+/// and writes nothing.
+pub fn estimate(inputs: &Inputs) -> Result<EstimateSummary, ConvertError> {
+    inputs.check_mode()?;
+    let mir = Mir::open(&inputs.mir_dir()).map_err(stage)?;
+    let base = base_files(inputs);
+    let budgets = budgets(&base, inputs.standalone)?;
+    let scene = scene(inputs, &mir)?;
+    let report = map_slicer::estimate(
+        &mir,
+        &scene.references,
+        &scene.window,
+        &scene.sampler,
+        &scene.projection,
+        &budgets.slicer,
+        &scene.slicer_config,
+    )
+    .map_err(stage)?;
+    Ok(EstimateSummary {
+        slice: inputs.slice.name.clone(),
+        references: scene.references.len(),
+        budgets,
+        report,
+    })
+}
+
+impl std::fmt::Display for EstimateSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let report = &self.report;
+        let mode = if self.budgets.standalone {
+            "standalone: the walls and tiles lists replace Fallout 2's"
+        } else {
+            "extending Fallout 2's lists"
+        };
+        writeln!(
+            f,
+            "estimate for {} ({mode}): {} references in the window",
+            self.slice, self.references
+        )?;
+        writeln!(
+            f,
+            "  {:<8}  {:>6}  {:>6}  verdict",
+            "list", "demand", "free"
+        )?;
+        for c in &report.categories {
+            let headroom = c.headroom();
+            let verdict = if headroom < 0 {
+                format!("OVER by {}", -headroom)
+            } else {
+                format!("under by {headroom}")
+            };
+            writeln!(
+                f,
+                "  {:<8}  {:>6}  {:>6}  {verdict}",
+                c.category.name(),
+                c.used,
+                c.free
+            )?;
+        }
+        writeln!(
+            f,
+            "  {:<8}  {:>6}  {:>6}  terrain library cap",
+            "tiles", "-", self.budgets.tile_cap
+        )?;
+        let classes: Vec<String> = report
+            .classes
+            .iter()
+            .filter(|(_, count)| count.references > 0)
+            .map(|(kind, count)| format!("{} {}", kind.name(), count.references))
+            .collect();
+        writeln!(f, "references by class: {}", classes.join(", "))?;
+        writeln!(
+            f,
+            "landmarks: {} references in about {} pieces (scenery list)",
+            report.landmarks.references, report.landmarks.pieces
+        )?;
+        for category in map_slicer::ArtCategory::ALL {
+            let rows: Vec<&map_slicer::Contributor> = report
+                .contributors
+                .iter()
+                .filter(|c| c.category == category)
+                .take(8)
+                .collect();
+            if rows.is_empty() {
+                continue;
+            }
+            writeln!(f, "largest {} contributors:", category.name())?;
+            for c in rows {
+                writeln!(
+                    f,
+                    "  {:>6} entries  {:>4} refs  {:<13}  {}",
+                    c.entries,
+                    c.references,
+                    c.class.name(),
+                    c.model
+                )?;
+            }
+        }
+        if report.fits() {
+            write!(
+                f,
+                "fits: the map stage should not need the budget ladder (an estimate)"
+            )
+        } else {
+            write!(
+                f,
+                "over: the map stage will climb the budget ladder; it fails only if the last step does not fit"
+            )
+        }
+    }
+}
+
+/// One of the largest things on the map, for pointing a camera at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Feature {
+    /// `landmark` (bands in the scenery list) or `walls` (wall strips).
+    pub kind: String,
+    /// The reference's form key.
+    pub reference: String,
+    /// The normalised model path of its art.
+    pub model: String,
+    /// The hex under the centre of its drawn extent.
+    pub hex: i32,
+    /// Placements (bands or strips).
+    pub pieces: usize,
+    /// Opaque pixels of its art, as placed.
+    pub pixels: u64,
+}
+
+/// `map-features.json`: the exterior map and its largest features, largest
+/// first. On an interior demo also the room and the people placed in it,
+/// for aiming frames at them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MapFeatures {
+    pub map_file: String,
+    pub entry_hex: i32,
+    pub features: Vec<Feature>,
+    /// The interior cell's editor id; absent on an exterior map.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interior: Option<String>,
+    /// The people placed, ranked by [`rank_people`]; absent on an
+    /// exterior map.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub people: Vec<Person>,
+}
+
+/// A person placed on the map.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Person {
+    pub name: String,
+    /// The reference's form key.
+    pub reference: String,
+    pub hex: i32,
+}
+
+/// Orders people for the camera: those with a name of their own first
+/// (Sunny Smiles before the fourth Powder Ganger), then by name, then by
+/// hex. Applying it twice changes nothing.
+pub fn rank_people(people: &mut [Person]) {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for person in people.iter() {
+        *counts.entry(person.name.clone()).or_default() += 1;
+    }
+    people.sort_by(|a, b| {
+        (counts[&a.name] > 1, &a.name, a.hex).cmp(&(counts[&b.name] > 1, &b.name, b.hex))
+    });
+}
+
+/// The people as features the shots stage aims at: kind `person`, the
+/// name as the model, so that a shared name is shot again only after every
+/// other.
+pub fn people_features(people: &[Person]) -> Vec<Feature> {
+    people
+        .iter()
+        .map(|p| Feature {
+            kind: "person".to_owned(),
+            reference: p.reference.clone(),
+            model: p.name.clone(),
+            hex: p.hex,
+            pieces: 1,
+            pixels: 0,
+        })
+        .collect()
+}
+
+impl MapFeatures {
+    /// Reads `<out>/map-features.json`.
+    pub fn read(out: &Path) -> Result<Self, ConvertError> {
+        let path = out.join(FEATURES_FILE);
+        let text = std::fs::read_to_string(&path).map_err(io(&path))?;
+        serde_json::from_str(&text)
+            .map_err(|e| ConvertError::stage("map", format!("{}: {e}", path.display())))
+    }
+}
+
+/// The largest landmarks and wall-strip objects of a slicer run. A
+/// landmark is a reference placed as more than one scenery piece, or whose
+/// model the report counts as a landmark; a walls feature is a reference
+/// placed as wall strips.
+pub fn features(sliced: &map_slicer::Sliced) -> Vec<Feature> {
+    let landmark_models: BTreeSet<&str> = sliced
+        .report
+        .contributors
+        .iter()
+        .filter(|c| c.class == map_slicer::ClassKind::Landmark)
+        .map(|c| c.model.as_str())
+        .collect();
+    features_of(&sliced.art, &sliced.placements, &landmark_models)
+}
+
+fn features_of(
+    art: &[map_slicer::ArtImage],
+    placements: &[map_slicer::Placement],
+    landmark_models: &BTreeSet<&str>,
+) -> Vec<Feature> {
+    #[derive(Default)]
+    struct Group {
+        walls: usize,
+        scenery: usize,
+        pixels: u64,
+        model: String,
+        bounds: Option<[i64; 4]>,
+        /// Each placement's hex and the centre of its drawn extent.
+        anchors: Vec<(i32, [i64; 2])>,
+    }
+    let grid = HexGrid::default();
+    let mut groups: BTreeMap<&str, Group> = BTreeMap::new();
+    for placement in placements {
+        let wall = match placement.role {
+            map_slicer::Role::WallStrip => true,
+            map_slicer::Role::Scenery => false,
+            _ => continue,
+        };
+        let (Some(art), Ok(centre)) = (art.get(placement.art), grid.hex_center(placement.hex))
+        else {
+            continue;
+        };
+        let group = groups.entry(placement.reference.as_str()).or_default();
+        if wall {
+            group.walls += 1;
+        } else {
+            group.scenery += 1;
+        }
+        if group.model.is_empty() {
+            group.model = art.source.clone();
+        }
+        group.pixels += art.pixels.iter().filter(|p| **p != 0).count() as u64;
+        let x = centre[0] + i64::from(art.shift[0]) + i64::from(placement.displacement[0]);
+        let bottom = centre[1] + i64::from(art.shift[1]) + i64::from(placement.displacement[1]);
+        let left = x - i64::from(art.width / 2);
+        let top = bottom - i64::from(art.height) + 1;
+        let right = left + i64::from(art.width);
+        group
+            .anchors
+            .push((placement.hex, [(left + right) / 2, (top + bottom) / 2]));
+        let b = group.bounds.get_or_insert([left, top, right, bottom]);
+        *b = [
+            b[0].min(left),
+            b[1].min(top),
+            b[2].max(right),
+            b[3].max(bottom),
+        ];
+    }
+    let mut out: Vec<Feature> = groups
+        .into_iter()
+        .filter_map(|(reference, group)| {
+            let kind = if group.walls > 0 {
+                "walls"
+            } else if group.scenery > 1 || landmark_models.contains(group.model.as_str()) {
+                "landmark"
+            } else {
+                return None;
+            };
+            let [l, t, r, b] = group.bounds?;
+            let centre = [(l + r) / 2, (t + b) / 2];
+            // A landmark cut off by the map's edge has the centre of its
+            // drawn extent off the grid: aim at the piece nearest it.
+            let hex = i32::try_from(centre[0])
+                .ok()
+                .zip(i32::try_from(centre[1]).ok())
+                .and_then(|(x, y)| grid.pick_hex([x, y]))
+                .or_else(|| {
+                    group
+                        .anchors
+                        .iter()
+                        .min_by_key(|(hex, c)| {
+                            ((c[0] - centre[0]).pow(2) + (c[1] - centre[1]).pow(2), *hex)
+                        })
+                        .map(|(hex, _)| *hex)
+                })?;
+            Some(Feature {
+                kind: kind.to_owned(),
+                reference: reference.to_owned(),
+                model: group.model,
+                hex,
+                pieces: group.walls + group.scenery,
+                pixels: group.pixels,
+            })
+        })
+        .collect();
+    rank_features(&mut out);
+    out.truncate(MAX_FEATURES);
+    out
+}
+
+/// How many of the largest landmarks lead the features list.
+pub const LEADING_LANDMARKS: usize = 4;
+
+/// Orders features as `map-features.json` lists them: the
+/// [`LEADING_LANDMARKS`] largest landmarks first, so that a long run of
+/// fences, kerbs or crates never pushes a tower out of the list, then
+/// everything else by placed pixels, largest first. A model the budget
+/// ladder turned into a landmark (a retaining wall) ranks by its pixels
+/// like any building after those. Applying it twice changes nothing.
+pub fn rank_features(features: &mut [Feature]) {
+    let by_pixels = |a: &Feature, b: &Feature| {
+        b.pixels
+            .cmp(&a.pixels)
+            .then_with(|| a.reference.cmp(&b.reference))
+    };
+    features.sort_by(by_pixels);
+    let leading: BTreeSet<String> = features
+        .iter()
+        .filter(|f| f.kind == "landmark")
+        .take(LEADING_LANDMARKS)
+        .map(|f| f.reference.clone())
+        .collect();
+    features.sort_by(|a, b| {
+        leading
+            .contains(&b.reference)
+            .cmp(&leading.contains(&a.reference))
+            .then_with(|| by_pixels(a, b))
+    });
+}
+
+/// Builds the slice's map and writes the mod layer.
+pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
+    inputs.check_mode()?;
+    let mir = Mir::open(&inputs.mir_dir()).map_err(stage)?;
+    let palette_bytes = inputs.f2_file("color.pal")?;
+    let palette = inputs.palette()?;
+    let palette_map = PaletteMap::try_new(&palette).map_err(stage)?;
+    let base = base_files(inputs);
+
+    let mod_dir = inputs.mod_dir();
+    let key = cache_key(inputs, &palette_bytes, &base)?;
+    let key_path = inputs.out.join("cache").join("map.key");
+    let summary_path = inputs.out.join("cache").join("map.summary");
+    let features_path = inputs.out.join(FEATURES_FILE);
+    if mod_dir.join("vault-mod.toml").is_file()
+        && features_path.is_file()
+        && std::fs::read_to_string(&key_path).is_ok_and(|stored| stored == key)
+        && let Ok(text) = std::fs::read_to_string(&summary_path)
+        && let Some(summary) = MapSummary::from_cache(&text)
+    {
+        return Ok(MapSummary {
+            reused: true,
+            ..summary
+        });
+    }
+
+    let budgets = budgets(&base, inputs.standalone)?;
+    let Scene {
+        projection,
+        window,
+        worldspace,
+        sampler,
+        cells,
+        references,
+        mut build_options,
+        slicer_config,
+        open,
+        interior,
+    } = scene(inputs, &mir)?;
+
+    // Interiors the window's doors open on, for the exits. An interior
+    // demo has no exits.
     let mut interiors: BTreeMap<String, CellDoc> = BTreeMap::new();
-    for reference in &references {
+    for reference in references.iter().filter(|_| interior.is_none()) {
         let Some(teleport) = &reference.teleport else {
             continue;
         };
@@ -363,33 +1191,6 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
         }
     }
 
-    let budget = map_slicer::Budget {
-        walls: free_entries(&base, "walls")?,
-        scenery: free_entries(&base, "scenery")?,
-        items: free_entries(&base, "items")?,
-    };
-    // Where the game's own navmesh lets an actor stand, a building's
-    // bounding footprint must not block: porches, canopies, doorsteps.
-    let build_options = map_builder::BuildOptions::default();
-    let frame = map_builder::walk::Frame::new(&window, &projection).map_err(stage)?;
-    // Only around doors that lead somewhere: opened everywhere, the strips
-    // that can no longer merge overflow the walls list.
-    let near_doors: BTreeSet<i32> = references
-        .iter()
-        .filter(|r| r.teleport.is_some())
-        .filter_map(|r| {
-            let [x, y, _] = r.transform.position;
-            frame.hex_of_source(f64::from(x), f64::from(y))
-        })
-        .flat_map(|door| map_builder::exits::hexes_around(door, DOOR_APPROACH, false))
-        .collect();
-    let slicer_config = map_slicer::SlicerConfig {
-        open_hexes: map_builder::walk::standable_hexes(&frame, &sampler, &cells, &build_options)
-            .into_iter()
-            .filter(|hex| near_doors.contains(hex))
-            .collect(),
-        ..map_slicer::SlicerConfig::default()
-    };
     let mut renderer =
         foundry_render::renderer(inputs.backend, &inputs.calibration).map_err(stage)?;
     // A budget overflow arrives here as an error whose message carries the
@@ -402,10 +1203,17 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
         &projection,
         renderer.as_mut(),
         &palette_map,
-        &budget,
+        &budgets.slicer,
         &slicer_config,
     )
     .map_err(stage)?;
+    // A passage must never open a hex that wall art stands on. The builder
+    // finds most of them itself; the slicer's merged runs are named here.
+    // (The slicer does not report a landmark's blocked core apart from
+    // relief, which passages may cross, so that core is left to the
+    // builder's own test.)
+    build_options.protected_hexes = run_hexes(&sliced.placements);
+    let protected = build_options.protected_hexes.len();
 
     let overlays: Vec<map_terrain::Overlay<'_>> = sliced
         .overlays
@@ -417,24 +1225,61 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
             rgba: &o.rgba,
         })
         .collect();
+    // A standalone run has about four times the tiles; greedy merging
+    // spends them better than k-means at every cap. A run that extends the
+    // base list keeps the default method, and so its bytes.
     let terrain_options = map_terrain::TerrainOptions {
-        library_cap: free_entries(&base, "tiles")?.min(2000),
+        library_cap: budgets.tile_cap,
+        library_method: if inputs.standalone {
+            map_terrain::LibraryMethod::GreedyMerge
+        } else {
+            map_terrain::TerrainOptions::default().library_method
+        },
         jobs: inputs.jobs,
         texture_lod_bias: GROUND_LOD_BIAS,
+        // Indoors only the baked floor is drawn; the rest stays black.
+        blank_without_land: interior.is_some(),
         ..map_terrain::TerrainOptions::default()
     };
-    let ground = map_terrain::build_ground(
-        &mir,
-        &worldspace,
-        &window,
-        &sampler,
-        &projection,
-        &inputs.calibration,
-        &palette_map,
-        &overlays,
-        &terrain_options,
-    )
+    let ground = if interior.is_some() {
+        // A room has no land: its coordinates would read the worldspace's.
+        map_terrain::build_ground_from(
+            &map_terrain::MemoryLand::default(),
+            &window,
+            &sampler,
+            &projection,
+            &inputs.calibration,
+            &palette_map,
+            &overlays,
+            &terrain_options,
+        )
+    } else {
+        map_terrain::build_ground(
+            &mir,
+            &worldspace,
+            &window,
+            &sampler,
+            &projection,
+            &inputs.calibration,
+            &palette_map,
+            &overlays,
+            &terrain_options,
+        )
+    }
     .map_err(stage)?;
+    // Blank squares get the engine's blank tile, not a library tile.
+    let squares: Vec<u16> = ground
+        .squares
+        .iter()
+        .enumerate()
+        .map(|(q, tile)| {
+            if ground.is_blank(q) {
+                map_builder::BLANK_SQUARE
+            } else {
+                *tile
+            }
+        })
+        .collect();
 
     let art: Vec<map_builder::ArtImage> = sliced
         .art
@@ -460,7 +1305,7 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
             blocking: p.blocking,
         })
         .collect();
-    let (critter_art, critters) = critter_inputs(inputs, &cells, &references)?;
+    let (critter_art, critters, people_skipped) = critter_inputs(inputs, &cells, &references)?;
     let mut builder_cells = cells.clone();
     builder_cells.extend(interiors.into_values());
     let stem = map_stem(&inputs.slice.name);
@@ -475,7 +1320,7 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
         projection: &projection,
         ground: map_builder::GroundTiles {
             tiles: &ground.tiles,
-            squares: &ground.squares,
+            squares: &squares,
         },
         art: &art,
         placements: &placements,
@@ -535,9 +1380,24 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
         "Window: {} units square, north-west corner at ({}, {}).\n",
         window.size, window.x_west, window.y_north
     );
+    if let Some(scene) = &interior {
+        write_interior_section(
+            &mut text,
+            scene,
+            &sliced,
+            report,
+            &critters,
+            &people_skipped,
+            &references,
+        );
+    }
     let _ = writeln!(text, "## Art budget\n\n```\n{}\n```\n", sliced.report);
-    let _ = writeln!(text, "## Ground\n\n```\n{:#?}\n```\n", ground.stats);
+    write_list_section(&mut text, &budgets, report, &verified);
+    write_slicer_sections(&mut text, &sliced);
+    write_ground_section(&mut text, &ground.stats);
+    write_open_section(&mut text, &open, protected);
     let _ = writeln!(text, "## Walkability\n\n```\n{:#?}\n```\n", report.walk);
+    write_reach_sections(&mut text, report);
     let _ = writeln!(
         text,
         "## Map\n\n- file: `{}`, number {}\n- entry hex: {}\n- objects: {}, of which blockers: {}\n- maps in the layer: {:?}\n",
@@ -552,8 +1412,15 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
     for exit in &report.exits {
         let _ = writeln!(
             text,
-            "- door {} at hex {} leads to `{}` (map {}); returns to hex {}",
-            exit.door, exit.door_hex, exit.stub_file, exit.stub_number, exit.return_hex
+            "- door {} at hex {} leads to `{}` (map {}); grids {} step{} out on {:?}; returns to hex {}",
+            exit.door,
+            exit.door_hex,
+            exit.stub_file,
+            exit.stub_number,
+            exit.grid_steps,
+            if exit.grid_steps == 1 { "" } else { "s" },
+            exit.grid_hexes,
+            exit.return_hex
         );
     }
     for skipped in &report.skipped_teleports {
@@ -602,11 +1469,440 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
     let report_path = inputs.out.join("map-report.md");
     std::fs::write(&report_path, text).map_err(io(&report_path))?;
 
+    let mut people: Vec<Person> = Vec::new();
+    if interior.is_some() {
+        people = report
+            .critters
+            .iter()
+            .map(|c| Person {
+                name: critters[c.index].name.clone(),
+                reference: c.reference.clone(),
+                hex: c.hex,
+            })
+            .collect();
+        rank_people(&mut people);
+    }
+    let map_features = MapFeatures {
+        map_file: report.map_file.clone(),
+        entry_hex: report.entry_hex,
+        features: features(&sliced),
+        interior: interior.as_ref().map(|s| s.cell.clone()),
+        people,
+    };
+    let json = serde_json::to_string_pretty(&map_features).map_err(stage)?;
+    std::fs::write(&features_path, json + "\n").map_err(io(&features_path))?;
+
     let cache_dir = inputs.out.join("cache");
     std::fs::create_dir_all(&cache_dir).map_err(io(&cache_dir))?;
     std::fs::write(&summary_path, summary.to_cache()).map_err(io(&summary_path))?;
     std::fs::write(&key_path, key).map_err(io(&key_path))?;
     Ok(summary)
+}
+
+/// `## Interior`: the room, its floor and storeys, the cut, what the slicer
+/// and the builder did indoors, the doors not converted, and every person
+/// placed or left out with the reason.
+fn write_interior_section(
+    text: &mut String,
+    scene: &InteriorScene,
+    sliced: &map_slicer::Sliced,
+    report: &map_builder::BuildReport,
+    critters: &[map_builder::CritterPlacement],
+    skipped: &[PersonSkip],
+    references: &[mir::Reference],
+) {
+    let _ = writeln!(text, "## Interior\n");
+    let _ = writeln!(
+        text,
+        "- cell: {} ({}); {} references in the window; a standalone demo map, one storey, \
+         doors drawn but leading nowhere, no interior lighting",
+        scene.cell,
+        scene.form,
+        references.len()
+    );
+    let _ = writeln!(
+        text,
+        "- floor: z {:.1}, from {}",
+        scene.floor_z, scene.floor_from
+    );
+    if let Some(build) = &report.interior {
+        let _ = writeln!(
+            text,
+            "- walkable band (navmesh): z {:.0} to {:.0}",
+            build.band[0], build.band[1]
+        );
+    }
+    let _ = writeln!(
+        text,
+        "- window centre: ({:.0}, {:.0}), from {}",
+        scene.centre[0], scene.centre[1], scene.centre_from
+    );
+    match scene.entrance_near {
+        Some(p) => {
+            let _ = writeln!(
+                text,
+                "- entrance sought near ({:.0}, {:.0}): {}",
+                p[0], p[1], scene.entrance_from
+            );
+        }
+        None => {
+            let _ = writeln!(text, "- entrance sought near {}", scene.entrance_from);
+        }
+    }
+    let _ = writeln!(text, "- storeys found: {}", scene.storeys.len());
+    for (n, s) in scene.storeys.iter().enumerate() {
+        let chosen = if s.contains_z(scene.floor_z) || (s.floor_z - scene.floor_z).abs() < 1.0 {
+            " (holds the chosen floor)"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            text,
+            "  {}. floor z {:.1}, z {:.0} to {:.0}, {:.0} square units, {} triangles, \
+             x {:.0} to {:.0}, y {:.0} to {:.0}{chosen}",
+            n + 1,
+            s.floor_z,
+            s.z_range[0],
+            s.z_range[1],
+            s.area,
+            s.triangles,
+            s.min[0],
+            s.max[0],
+            s.min[1],
+            s.max[1]
+        );
+    }
+    match &sliced.report.interior {
+        Some(i) => {
+            let s = &i.settings;
+            let _ = writeln!(
+                text,
+                "- cut: {} above the floor (z {}); floor band {} to {}; hanging above {}",
+                s.cut_height,
+                s.cut_z(),
+                s.floor_band[0],
+                s.floor_band[1],
+                s.hang_clearance
+            );
+            let _ = writeln!(
+                text,
+                "- floor baked: {} triangles from {} references ({} floor only), {} hexes, \
+                 {:.0} square units, {} overlays",
+                i.floor_triangles,
+                i.floor_references,
+                i.floor_only,
+                i.floor_hexes.len(),
+                i.floor_area,
+                i.floor_overlays
+            );
+            let _ = writeln!(
+                text,
+                "- ceiling cut: {} references clipped, {} triangles over the cut, {} ceiling \
+                 triangles dropped; left out: {} above the cut, {} hanging, {} below the floor",
+                i.clipped_references,
+                i.cut_triangles,
+                i.ceiling_triangles,
+                i.above_cut,
+                i.hanging,
+                i.below_floor
+            );
+        }
+        None => {
+            let _ = writeln!(text, "- the slicer reported no interior statistics");
+        }
+    }
+    let _ = writeln!(text, "\nBuilder:\n");
+    for line in report.interior_summary() {
+        let _ = writeln!(text, "- {line}");
+    }
+    let _ = writeln!(text, "\nPeople placed: {}\n", report.critters.len());
+    for critter in &report.critters {
+        let _ = writeln!(
+            text,
+            "- {} ({}) on hex {}",
+            critters[critter.index].name, critter.reference, critter.hex
+        );
+    }
+    let skipped_count = skipped.len() + report.skipped_critters.len();
+    let _ = writeln!(text, "\nPeople and creatures left out: {skipped_count}\n");
+    for person in skipped {
+        let _ = writeln!(
+            text,
+            "- {} ({}): {}",
+            person.name, person.reference, person.reason
+        );
+    }
+    for critter in &report.skipped_critters {
+        let _ = writeln!(
+            text,
+            "- {} ({}): {}",
+            critters[critter.index].name, critter.reference, critter.reason
+        );
+    }
+    let _ = writeln!(text);
+}
+
+/// `## Art lists`: the mode, and every list the build loaded with its
+/// free entries before and after.
+fn write_list_section(
+    text: &mut String,
+    budgets: &Budgets,
+    report: &map_builder::BuildReport,
+    verified: &map_builder::VerifyReport,
+) {
+    let _ = writeln!(text, "## Art lists\n");
+    let _ = writeln!(
+        text,
+        "Mode: {}.\n",
+        if budgets.standalone {
+            "standalone; the layer's walls and tiles lists replace Fallout 2's, so stock maps \
+             draw the wrong walls and floors while it is mounted"
+        } else {
+            "extending Fallout 2's lists"
+        }
+    );
+    let _ = writeln!(
+        text,
+        "Budget given: walls {}, scenery {}, items {}; terrain library cap {}.\n",
+        budgets.slicer.walls, budgets.slicer.scenery, budgets.slicer.items, budgets.tile_cap
+    );
+    let _ = writeln!(
+        text,
+        "| list | replaced | base entries | kept | added | free before | free after | shipped |\n|---|---|---|---|---|---|---|---|"
+    );
+    for (name, list) in &report.art_lists {
+        let _ = writeln!(
+            text,
+            "| {name} | {} | {} | {} | {} | {} | {} | {} |",
+            if list.replaced { "yes" } else { "no" },
+            list.base_entries,
+            list.kept,
+            list.added,
+            list.free_before,
+            list.free_after,
+            if list.shipped { "yes" } else { "no" }
+        );
+    }
+    let _ = writeln!(
+        text,
+        "\nReplaced lists the self-check accepted: {}.\n",
+        if verified.replaced_art_lists.is_empty() {
+            "none".to_owned()
+        } else {
+            verified.replaced_art_lists.join(", ")
+        }
+    );
+}
+
+/// `## Budget ladder`, `## Landmarks` and `## Trigger volumes skipped`.
+fn write_slicer_sections(text: &mut String, sliced: &map_slicer::Sliced) {
+    let report = &sliced.report;
+    let _ = writeln!(text, "## Budget ladder\n");
+    if report.ladder.is_empty() {
+        let _ = writeln!(text, "Not climbed: the window fit at once.\n");
+    }
+    for (n, step) in report.ladder.iter().enumerate() {
+        let _ = writeln!(
+            text,
+            "{}. {} ({}): walls {} -> {}, scenery {} -> {}, items {} -> {}; {} references, {} models",
+            n + 1,
+            step.kind.name(),
+            step.change,
+            step.before[0],
+            step.after[0],
+            step.before[1],
+            step.after[1],
+            step.before[2],
+            step.after[2],
+            step.references,
+            step.models.len()
+        );
+    }
+    if !report.ladder.is_empty() {
+        let _ = writeln!(text);
+    }
+    let landmarks = &report.landmarks;
+    let _ = writeln!(text, "## Landmarks\n");
+    let _ = writeln!(
+        text,
+        "{} references placed in {} pieces (scenery list); {} baked as relief instead.\n",
+        landmarks.references,
+        landmarks.pieces,
+        landmarks.fallbacks.len()
+    );
+    let _ = writeln!(
+        text,
+        "- pieces of the visibility cut: {}\n- visibility splits: {}\n- sorting splits: {}\n\
+         - unresolved pieces: {}\n- walkers beside a landmark: {}, still hidden behind a piece: {}\n\
+         - hexes sealed: {}\n",
+        landmarks.tiles,
+        landmarks.visibility_splits,
+        landmarks.sorting_splits,
+        landmarks.unresolved_pieces,
+        landmarks.walkers,
+        landmarks.hidden_walkers,
+        landmarks.sealed_hexes
+    );
+    for fallback in &landmarks.fallbacks {
+        let _ = writeln!(
+            text,
+            "- relief instead: {} `{}` ({})",
+            fallback.reference, fallback.model, fallback.reason
+        );
+    }
+    let triggers: Vec<&map_slicer::Skipped> = sliced
+        .skipped
+        .iter()
+        .filter(|s| s.reason == map_slicer::SkipReason::TriggerVolume)
+        .collect();
+    let _ = writeln!(text, "\n## Trigger volumes skipped\n");
+    let _ = writeln!(
+        text,
+        "{} references: invisible trigger or activator volumes, never drawn.",
+        triggers.len()
+    );
+    for skipped in &triggers {
+        let _ = writeln!(
+            text,
+            "- {} `{}`",
+            skipped.reference,
+            skipped.model.as_deref().unwrap_or("(no model)")
+        );
+    }
+    let _ = writeln!(text);
+}
+
+/// `## Ground`: the default-texture and missing-texture tallies, then
+/// every statistic.
+fn write_ground_section(text: &mut String, stats: &map_terrain::GroundStats) {
+    let _ = writeln!(text, "## Ground\n");
+    let _ = writeln!(
+        text,
+        "- tiles: {} distinct of {} squares, {} in the library; {} squares substituted\n\
+         - default land texture: {} layers, {} pixels\n\
+         - missing textures: {} layers ({} naming no file), {} pixels; {} bases borrowed from a neighbour\n\
+         - ground with no land: {} pixels\n",
+        stats.distinct_tiles,
+        stats.tiles_before,
+        stats.tiles_after,
+        stats.substituted_squares,
+        stats.defaulted_texture_layers,
+        stats.defaulted_texture_pixels,
+        stats.missing_texture_layers,
+        stats.unnamed_texture_layers,
+        stats.missing_texture_pixels,
+        stats.borrowed_base_layers,
+        stats.fallback_pixels
+    );
+    let _ = writeln!(text, "```\n{stats:#?}\n```\n");
+}
+
+/// `## Open hexes`: which standable hexes a bounding footprint left open,
+/// and what the slicer and the passages were told.
+fn write_open_section(text: &mut String, open: &OpenHexes, protected: usize) {
+    let _ = writeln!(text, "## Open hexes\n");
+    let policy = match open.policy {
+        OpenPolicy::Everywhere => "every standable hex (standalone)".to_owned(),
+        OpenPolicy::NearDoors => {
+            format!("standable hexes within {DOOR_APPROACH} steps of a teleporting door")
+        }
+    };
+    let _ = writeln!(
+        text,
+        "- policy: {policy}\n- standable: {}, open: {}\n- landmark walkers given to the slicer: {}\n\
+         - hexes protected from passages (merged strip runs): {protected}\n",
+        open.standable, open.opened, open.walkers
+    );
+}
+
+/// `## Entrance`, `## Components`, `## Passages` and `## Islands left`.
+fn write_reach_sections(text: &mut String, report: &map_builder::BuildReport) {
+    let entrance = &report.entrance;
+    let _ = writeln!(
+        text,
+        "## Entrance\n\n- hex {}: {:?} (how a figure there is drawn against the art)\n\
+         - in the largest component: {}\n- {} steps from the walkable hex nearest the window centre\n",
+        entrance.hex,
+        entrance.sight,
+        if entrance.in_main { "yes" } else { "no" },
+        entrance.steps_from_centre
+    );
+    let components = &report.components;
+    let total: usize = components.sizes.iter().sum();
+    let main = components
+        .main
+        .and_then(|m| components.sizes.get(m))
+        .copied()
+        .unwrap_or(0);
+    let largest: Vec<String> = components
+        .sizes
+        .iter()
+        .take(8)
+        .map(|s| s.to_string())
+        .collect();
+    let _ = writeln!(
+        text,
+        "## Components\n\n- {} components, {} hexes in all; the entrance's holds {} ({:.1} %)\n\
+         - largest: {}\n- unreachable exits: {} of {}; stranded returns: {}\n\
+         - critters outside the entrance's component: {}\n- hexes where the sealing border leaks: {}\n",
+        components.sizes.len(),
+        total,
+        main,
+        if total == 0 {
+            0.0
+        } else {
+            100.0 * main as f64 / total as f64
+        },
+        if largest.is_empty() {
+            "none".to_owned()
+        } else {
+            largest.join(", ")
+        },
+        components.unreachable_exits(),
+        components.exits.len(),
+        components.stranded_returns(),
+        components
+            .critters
+            .iter()
+            .filter(|c| c.component.is_none() || c.component != components.main)
+            .count(),
+        components.leaked
+    );
+    let _ = writeln!(
+        text,
+        "## Passages\n\n{} opened, {} hexes made walkable.\n",
+        report.passages.len(),
+        report.opened_hexes
+    );
+    for passage in &report.passages {
+        let _ = writeln!(
+            text,
+            "- {} to {}: {} hexes ({} off the navmesh), {} opened; joins an island of {} at {} holding {}",
+            passage.from,
+            passage.to,
+            passage.length,
+            passage.off_navmesh,
+            passage.opened.len(),
+            passage.island_size,
+            passage.island_hex,
+            passage.holds.join(", ")
+        );
+    }
+    let _ = writeln!(text, "\n## Islands left\n");
+    if report.islands_left.is_empty() {
+        let _ = writeln!(text, "None.");
+    }
+    for island in &report.islands_left {
+        let _ = writeln!(
+            text,
+            "- {} hexes at {} holding {}: {}",
+            island.island_size,
+            island.island_hex,
+            island.holds.join(", "),
+            island.reason
+        );
+    }
+    let _ = writeln!(text);
 }
 
 impl MapSummary {
@@ -647,5 +1943,253 @@ impl MapSummary {
             layer_files: number()?,
             critters: number()?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A synthetic art list of `n` entries.
+    fn list(n: usize, stem: &str) -> Vec<u8> {
+        (0..n)
+            .flat_map(|i| format!("{stem}{i:05}.frm\r\n").into_bytes())
+            .collect()
+    }
+
+    fn base() -> BTreeMap<String, Vec<u8>> {
+        BTreeMap::from([
+            ("art/walls/walls.lst".to_owned(), list(1670, "w")),
+            ("art/scenery/scenery.lst".to_owned(), list(1860, "s")),
+            ("art/items/items.lst".to_owned(), list(300, "i")),
+            ("art/tiles/tiles.lst".to_owned(), list(3119, "t")),
+        ])
+    }
+
+    /// What every run computed before standalone mode existed.
+    fn old_free_entries(base: &BTreeMap<String, Vec<u8>>, name: &str) -> usize {
+        let category = vault_formats::fid::ART_DIRECTORIES
+            .iter()
+            .position(|d| *d == name)
+            .expect("an art directory") as u8;
+        let list = match base.get(&format!("art/{name}/{name}.lst")) {
+            Some(bytes) => emit::ArtList::from_base(category, bytes),
+            None => emit::ArtList::new(category),
+        }
+        .expect("a list");
+        list.remaining().saturating_sub(BUILDER_RESERVE)
+    }
+
+    #[test]
+    fn an_extending_run_keeps_the_budget_it_always_had() {
+        for base in [base(), BTreeMap::new()] {
+            let budgets = budgets(&base, false).expect("budgets");
+            assert!(!budgets.standalone);
+            assert_eq!(
+                budgets.slicer,
+                map_slicer::Budget {
+                    walls: old_free_entries(&base, "walls"),
+                    scenery: old_free_entries(&base, "scenery"),
+                    items: old_free_entries(&base, "items"),
+                }
+            );
+            assert_eq!(budgets.tile_cap, old_free_entries(&base, "tiles").min(2000));
+        }
+    }
+
+    #[test]
+    fn a_standalone_run_has_nearly_every_wall_and_tile_entry() {
+        let base = base();
+        let extending = budgets(&base, false).expect("budgets");
+        let standalone = budgets(&base, true).expect("budgets");
+        assert_eq!(standalone.slicer.walls, 4096);
+        assert_eq!(standalone.tile_cap, 4094, "tiles 0 and 1 stay reserved");
+        assert!(standalone.lists["walls"].replaced && standalone.lists["tiles"].replaced);
+        assert!(!standalone.lists["scenery"].replaced);
+        // Scenery and items still extend the base: only the builder's own
+        // entry is held back.
+        assert_eq!(
+            standalone.slicer.scenery,
+            extending.lists["scenery"].free - 1
+        );
+        assert_eq!(
+            standalone.slicer.walls - extending.slicer.walls,
+            1670 + BUILDER_RESERVE
+        );
+    }
+
+    fn image(width: u32, height: u32, source: &str) -> map_slicer::ArtImage {
+        map_slicer::ArtImage {
+            category: map_slicer::ArtCategory::Walls,
+            width,
+            height,
+            pixels: vec![7; (width * height) as usize],
+            shift: [0, 0],
+            source: source.to_owned(),
+        }
+    }
+
+    fn placement(
+        art: usize,
+        hex: i32,
+        role: map_slicer::Role,
+        reference: &str,
+    ) -> map_slicer::Placement {
+        map_slicer::Placement {
+            art,
+            hex,
+            displacement: [0, 0],
+            role,
+            reference: reference.to_owned(),
+            blocking: true,
+            run: None,
+        }
+    }
+
+    #[test]
+    fn features_rank_landmarks_and_buildings_by_pixels() {
+        use map_slicer::Role;
+        let art = vec![
+            image(32, 40, "house.nif"),
+            image(200, 300, "tower.nif"),
+            image(20, 20, "barrel.nif"),
+        ];
+        let placements = vec![
+            placement(0, 20_100, Role::WallStrip, "a:house"),
+            placement(0, 20_102, Role::WallStrip, "a:house"),
+            placement(1, 10_100, Role::Scenery, "a:tower"),
+            placement(1, 10_500, Role::Scenery, "a:tower"),
+            // A single sprite is not a feature.
+            placement(2, 30_000, Role::Scenery, "a:barrel"),
+            placement(2, 30_010, Role::Door, "a:door"),
+        ];
+        let found = features_of(&art, &placements, &BTreeSet::new());
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found[0].kind, "landmark");
+        assert_eq!(found[0].reference, "a:tower");
+        assert_eq!(found[0].pieces, 2);
+        assert_eq!(found[0].pixels, 2 * 200 * 300);
+        assert_eq!(found[1].kind, "walls");
+        assert_eq!(found[1].pixels, 2 * 32 * 40);
+        // The house's centre is between and above its two strips.
+        let [c, r] = HexGrid::coordinates(found[1].hex).expect("on the grid");
+        assert!((100..=102).contains(&c), "{c}");
+        assert!(r <= 100, "{r}");
+        // A one-piece scenery sprite counts when the report calls its
+        // model a landmark.
+        let one = vec![placement(1, 10_100, Role::Scenery, "a:tower")];
+        assert!(features_of(&art, &one, &BTreeSet::new()).is_empty());
+        let found = features_of(&art, &one, &BTreeSet::from(["tower.nif"]));
+        assert_eq!(found.len(), 1);
+    }
+
+    #[test]
+    fn landmarks_rank_first_and_one_cut_off_by_the_edge_stays() {
+        use map_slicer::Role;
+        let art = vec![image(32, 40, "fence.nif"), image(40, 300, "tower.nif")];
+        let mut placements: Vec<map_slicer::Placement> = (0..40)
+            .map(|i| placement(0, 20_000 + i, Role::WallStrip, "a:fence"))
+            .collect();
+        // A tall landmark in the grid's first rows: the centre of its drawn
+        // extent is above the grid.
+        placements.push(placement(1, 3 * 200 + 100, Role::Scenery, "a:tower"));
+        placements.push(placement(1, 3 * 200 + 102, Role::Scenery, "a:tower"));
+        let mut found = features_of(&art, &placements, &BTreeSet::new());
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found[0].pixels < found[1].pixels);
+        let again = found.clone();
+        rank_features(&mut found);
+        assert_eq!(found, again, "ranking twice changes nothing");
+        assert_eq!(found[0].kind, "landmark");
+        assert!(
+            [3 * 200 + 100, 3 * 200 + 102].contains(&found[0].hex),
+            "the piece nearest the centre: {}",
+            found[0].hex
+        );
+        assert_eq!(found[1].kind, "walls");
+    }
+
+    #[test]
+    fn only_the_largest_landmarks_lead_the_buildings() {
+        let feature = |reference: &str, kind: &str, pixels: u64| Feature {
+            kind: kind.to_owned(),
+            reference: reference.to_owned(),
+            model: format!("{reference}.nif"),
+            hex: 20_100,
+            pieces: 2,
+            pixels,
+        };
+        let mut features: Vec<Feature> = (0..6)
+            .map(|i| feature(&format!("wall{i}"), "landmark", 100 + i))
+            .collect();
+        features.push(feature("casino", "walls", 50_000));
+        features.push(feature("fence", "walls", 10));
+        rank_features(&mut features);
+        let order: Vec<&str> = features.iter().map(|f| f.reference.as_str()).collect();
+        assert_eq!(
+            order,
+            [
+                "wall5", "wall4", "wall3", "wall2", "casino", "wall1", "wall0", "fence"
+            ]
+        );
+    }
+
+    #[test]
+    fn run_hexes_cover_each_merged_run_whole() {
+        use map_slicer::Role;
+        let mut a = placement(0, 1_005, Role::WallStrip, "a:house");
+        a.run = Some((1_003, 1_007));
+        let mut b = placement(0, 2_001, Role::WallStrip, "a:house");
+        b.run = Some((2_001, 2_002));
+        let c = placement(0, 3_000, Role::WallStrip, "a:house");
+        assert_eq!(
+            run_hexes(&[a, b, c]),
+            [1_003, 1_004, 1_005, 1_006, 1_007, 2_001, 2_002]
+        );
+    }
+
+    #[test]
+    fn a_shared_name_takes_an_article() {
+        assert_eq!(with_article("Powder Ganger"), "a Powder Ganger");
+        assert_eq!(with_article("Ultra-Luxe Guard"), "an Ultra-Luxe Guard");
+    }
+
+    #[test]
+    fn people_with_a_name_of_their_own_lead() {
+        let person = |name: &str, hex: i32| Person {
+            name: name.to_owned(),
+            reference: format!("a:{hex}"),
+            hex,
+        };
+        let mut people = vec![
+            person("Powder Ganger", 300),
+            person("Trudy", 900),
+            person("Powder Ganger", 100),
+            person("Sunny Smiles", 500),
+        ];
+        rank_people(&mut people);
+        let order: Vec<(&str, i32)> = people.iter().map(|p| (p.name.as_str(), p.hex)).collect();
+        assert_eq!(
+            order,
+            [
+                ("Sunny Smiles", 500),
+                ("Trudy", 900),
+                ("Powder Ganger", 100),
+                ("Powder Ganger", 300)
+            ]
+        );
+        let again = people.clone();
+        rank_people(&mut people);
+        assert_eq!(people, again);
+        let features = people_features(&people);
+        assert_eq!(features[0].kind, "person");
+        assert_eq!(features[0].model, "Sunny Smiles");
+        assert_eq!(features[0].hex, 500);
+    }
+
+    #[test]
+    fn only_a_standalone_run_opens_every_standable_hex() {
+        assert_eq!(OpenPolicy::of(true), OpenPolicy::Everywhere);
+        assert_eq!(OpenPolicy::of(false), OpenPolicy::NearDoors);
     }
 }

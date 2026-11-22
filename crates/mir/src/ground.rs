@@ -81,9 +81,16 @@ struct Grid {
 }
 
 /// Bilinear terrain height, normal and slope over a block of cells.
+///
+/// A sampler made by [`GroundSampler::flat`] also has a constant-height
+/// floor under every point that no loaded cell covers: an interior cell,
+/// which has no land, then still gives every consumer a height (the floor),
+/// a zero gradient and slope and an upright normal everywhere.
 #[derive(Default)]
 pub struct GroundSampler {
     cells: BTreeMap<(i32, i32), Grid>,
+    /// The height of the flat floor under points no cell covers.
+    flat: Option<f32>,
 }
 
 impl GroundSampler {
@@ -104,6 +111,26 @@ impl GroundSampler {
         Ok(sampler)
     }
 
+    /// Flat ground at height `z` everywhere: every finite point has height
+    /// `z`, gradient `[0, 0]`, slope 0 and normal `[0, 0, 1]`. Meant for an
+    /// interior cell, whose floor height comes from its navmesh (see
+    /// [`crate::storeys()`]). Cells added later with
+    /// [`GroundSampler::insert`] take precedence over the flat floor where
+    /// they lie. A non-finite `z` gives no flat floor, the same as
+    /// [`GroundSampler::default`].
+    pub fn flat(z: f32) -> Self {
+        Self {
+            cells: BTreeMap::new(),
+            flat: z.is_finite().then_some(z),
+        }
+    }
+
+    /// The flat floor's height, when this sampler has one
+    /// ([`GroundSampler::flat`]).
+    pub fn flat_height(&self) -> Option<f32> {
+        self.flat
+    }
+
     /// Adds one cell's land. A grid of the wrong size is ignored.
     pub fn insert(&mut self, x: i32, y: i32, land: &LandDoc) {
         let expected = LAND_GRID * LAND_GRID;
@@ -119,9 +146,24 @@ impl GroundSampler {
         );
     }
 
-    /// Whether any terrain was loaded.
+    /// Whether there is no ground at all: no terrain was loaded and there
+    /// is no flat floor.
     pub fn is_empty(&self) -> bool {
-        self.cells.is_empty()
+        self.cells.is_empty() && self.flat.is_none()
+    }
+
+    /// The flat floor's height at a point no loaded cell covers; `None` for
+    /// a non-finite point, a point over a loaded cell, or no flat floor.
+    fn flat_at(&self, x: f32, y: f32) -> Option<f32> {
+        let z = self.flat?;
+        if !x.is_finite() || !y.is_finite() {
+            return None;
+        }
+        let cell = (
+            (x / CELL_UNITS).floor() as i32,
+            (y / CELL_UNITS).floor() as i32,
+        );
+        (!self.cells.contains_key(&cell)).then_some(z)
     }
 
     /// The cell, the grid square within it, and the position within that
@@ -142,8 +184,11 @@ impl GroundSampler {
     }
 
     /// Terrain height at a source point, or `None` where no land was
-    /// extracted.
+    /// extracted (and there is no flat floor).
     pub fn height(&self, x: f32, y: f32) -> Option<f32> {
+        if let Some(z) = self.flat_at(x, y) {
+            return Some(z);
+        }
         let (grid, row, column, fu, fv) = self.locate(x, y)?;
         let at = |r: usize, c: usize| grid.heights[r * LAND_GRID + c];
         let south = at(row, column) * (1.0 - fu) + at(row, column + 1) * fu;
@@ -157,8 +202,11 @@ impl GroundSampler {
     }
 
     /// The height gradient `(dz/dx, dz/dy)` of the grid square under a
-    /// point.
+    /// point; `[0, 0]` on the flat floor.
     pub fn gradient(&self, x: f32, y: f32) -> Option<[f32; 2]> {
+        if self.flat_at(x, y).is_some() {
+            return Some([0.0, 0.0]);
+        }
         let (grid, row, column, fu, fv) = self.locate(x, y)?;
         let at = |r: usize, c: usize| grid.heights[r * LAND_GRID + c];
         let dx_south = at(row, column + 1) - at(row, column);
@@ -179,8 +227,11 @@ impl GroundSampler {
 
     /// The unit surface normal at a point: the stored vertex normals
     /// blended bilinearly, or the normal of the height gradient when the
-    /// cell stores none.
+    /// cell stores none; straight up on the flat floor.
     pub fn normal(&self, x: f32, y: f32) -> Option<[f32; 3]> {
+        if self.flat_at(x, y).is_some() {
+            return Some([0.0, 0.0, 1.0]);
+        }
         let (grid, row, column, fu, fv) = self.locate(x, y)?;
         let mut normal = [0.0f32; 3];
         if let Some(normals) = &grid.normals {
@@ -289,6 +340,48 @@ mod tests {
         sampler.insert(0, 0, &doc);
         let normal = sampler.normal(100.0, 100.0).unwrap();
         assert!(normal[1] > 0.7 && normal[2] > 0.7);
+    }
+
+    #[test]
+    fn flat_ground_answers_everywhere() {
+        let sampler = GroundSampler::flat(3456.0);
+        assert!(!sampler.is_empty());
+        assert_eq!(sampler.flat_height(), Some(3456.0));
+        // Interior coordinates are arbitrary: far from the origin, negative,
+        // on cell edges.
+        for (x, y) in [
+            (0.0, 0.0),
+            (-12_345.5, 987.25),
+            (CELL_UNITS, -CELL_UNITS),
+            (1.0e7, -1.0e7),
+        ] {
+            assert_eq!(sampler.height(x, y), Some(3456.0));
+            assert_eq!(sampler.height_or(x, y, 0.0), 3456.0);
+            assert_eq!(sampler.gradient(x, y), Some([0.0, 0.0]));
+            assert_eq!(sampler.slope(x, y), Some(0.0));
+            assert_eq!(sampler.normal(x, y), Some([0.0, 0.0, 1.0]));
+        }
+        assert_eq!(sampler.height(f32::NAN, 0.0), None);
+        assert_eq!(sampler.slope(0.0, f32::INFINITY), None);
+    }
+
+    #[test]
+    fn loaded_land_wins_over_the_flat_floor() {
+        let mut sampler = GroundSampler::flat(-50.0);
+        sampler.insert(0, 0, &land(|_, c| c as f32 * LAND_SPACING * 0.5));
+        assert!((sampler.height(64.0, 10.0).unwrap() - 32.0).abs() < 1e-3);
+        assert!((sampler.slope(500.0, 500.0).unwrap() - 0.5).abs() < 1e-4);
+        assert_eq!(sampler.height(-1.0, 0.0), Some(-50.0));
+        assert_eq!(sampler.slope(-1.0, 0.0), Some(0.0));
+    }
+
+    #[test]
+    fn a_non_finite_flat_height_is_no_floor() {
+        let sampler = GroundSampler::flat(f32::NAN);
+        assert!(sampler.is_empty());
+        assert_eq!(sampler.flat_height(), None);
+        assert_eq!(sampler.height(0.0, 0.0), None);
+        assert!(GroundSampler::default().is_empty());
     }
 
     #[test]

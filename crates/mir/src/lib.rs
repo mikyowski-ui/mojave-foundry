@@ -23,6 +23,9 @@
 //! ([`Image`]), skeletons (`nif::Skeleton`), animations (`nif::Animation`)
 //! and typed record queries ([`Records`]). [`report`] writes `report.md`. [`fixture::mini_town`]
 //! writes a small synthetic install to run the whole pipeline on.
+//! [`storeys()`] splits a cell's navmeshes into levels by height, for
+//! interior cells, which have no land; [`GroundSampler::flat`] is the
+//! ground of such a cell.
 //!
 //! # `records.sqlite`
 //!
@@ -66,11 +69,13 @@ mod finite;
 pub mod fixture;
 pub mod ground;
 mod index;
+mod landscape;
 mod model;
 mod paths;
 mod reader;
 mod report;
 mod source;
+pub mod storeys;
 
 pub use actors::{
     HUMAN_SKELETON, HUMAN_STAND, HUMAN_WALK_FEMALE, HUMAN_WALK_MALE, MAX_CHAIN, USE_BASE_DATA,
@@ -81,13 +86,14 @@ pub use error::MirError;
 pub use extract::{ExtractOptions, ExtractSummary, extract};
 pub use ground::{GroundSampler, MAP_SIDE_SQUARES, MapWindow};
 pub use index::content_hash;
+pub use landscape::{DEFAULT_LAND_TEXTURE, DefaultLandTexture, default_land_texture};
 pub use model::{
     ActorAnimations, ActorDoc, ActorEntry, ActorKind, ActorPart, ActorTint, AnimationInfo,
     ArchiveEntry, AssetEntry, AssetStatus, CELL_UNITS, CellDoc, CellKey, CellLocation, CellRef,
-    EnableParentDoc, Image, InteriorEntry, Issue, LAND_GRID, LAND_SPACING, LandDoc, LandLayer,
-    LayerOpacity, LockDoc, Manifest, MeshInfo, NavDoorLinkDoc, NavExternalLinkDoc, NavTriangleDoc,
-    NavmeshDoc, PartRole, PluginEntry, RawStore, RefFlags, RefGroup, RefKind, Reference,
-    SCHEMA_VERSION, SkeletonInfo, Slice, TeleportDoc, TextureInfo, Transform, cell_of,
+    EnableParentDoc, Image, InteriorEntry, Issue, LAND_GRID, LAND_SPACING, LandDefault, LandDoc,
+    LandLayer, LayerOpacity, LockDoc, Manifest, MeshInfo, NavDoorLinkDoc, NavExternalLinkDoc,
+    NavTriangleDoc, NavmeshDoc, PartRole, PluginEntry, RawStore, RefFlags, RefGroup, RefKind,
+    Reference, SCHEMA_VERSION, SkeletonInfo, Slice, TeleportDoc, TextureInfo, Transform, cell_of,
 };
 pub use paths::{
     FormKey, MESH_ROOT, TEXTURE_ROOT, creature_model_path, form_file_stem, normalize_mesh_path,
@@ -99,3 +105,4 @@ pub use reader::{
 };
 pub use report::{ART_LIST_LIMIT, MAP_SQUARES, ReportParams, SCENERY_KINDS, report};
 pub use source::DataSource;
+pub use storeys::{DEFAULT_STOREY_GAP, Storey, navmesh_storeys, storeys, storeys_with_gap};

@@ -112,3 +112,58 @@ fn bad_names_and_categories_are_refused() {
     }
     assert!(list.is_empty());
 }
+
+#[test]
+fn a_standalone_list_keeps_only_the_reserved_base_entries() {
+    use emit::{RESERVED_TILE_ENTRIES, TILE_CATEGORY, WALL_CATEGORY, standalone_reserved};
+    assert_eq!(
+        standalone_reserved(TILE_CATEGORY),
+        Some(RESERVED_TILE_ENTRIES)
+    );
+    assert_eq!(standalone_reserved(WALL_CATEGORY), Some(0));
+    for category in [0, 1, 2, 5, 6, 10] {
+        assert_eq!(standalone_reserved(category), None, "{category}");
+        assert!(ArtList::standalone(category, b"a.frm\n").is_err());
+    }
+    // CRLF and a comment-like line are kept byte for byte.
+    let base = b"zero.frm ; note\r\none.frm\r\ntwo.frm\nthree.frm\n";
+    let mut tiles = ArtList::standalone(TILE_CATEGORY, base).unwrap();
+    assert_eq!(tiles.len(), 2);
+    assert_eq!(tiles.remaining(), FID_INDEX_CAP - 2);
+    assert_eq!(tiles.to_bytes(), b"zero.frm ; note\r\none.frm\r\n");
+    assert_eq!(tiles.find("two.frm"), None, "dropped entries are gone");
+    assert_eq!(tiles.push("mine.frm").unwrap(), 2);
+    let table = LstTable::parse(&tiles.to_bytes(), LstKind::Art).unwrap();
+    assert_eq!(table.entries().len(), 3);
+    assert_eq!(
+        table.art_id(1).unwrap().name.as_deref(),
+        Some(&b"one.frm"[..])
+    );
+
+    let mut walls = ArtList::standalone(WALL_CATEGORY, base).unwrap();
+    assert!(walls.is_empty());
+    assert_eq!(walls.remaining(), FID_INDEX_CAP);
+    assert_eq!(walls.push("w.frm").unwrap(), 0);
+    assert_eq!(walls.to_bytes(), b"w.frm\n");
+
+    // A base shorter than the reserved entries is kept whole; an
+    // unterminated last line gets its LF.
+    let short = ArtList::standalone(TILE_CATEGORY, b"only.frm").unwrap();
+    assert_eq!(short.len(), 1);
+    assert_eq!(short.to_bytes(), b"only.frm\n");
+    // An empty base gives an empty list.
+    assert!(ArtList::standalone(TILE_CATEGORY, b"").unwrap().is_empty());
+}
+
+#[test]
+fn a_kept_prefix_survives_a_split_read() {
+    // A 250-byte physical line is two positions (199 + 51 bytes).
+    let mut base = vec![b'a'; 250];
+    base.extend_from_slice(b"\nnext.frm\n");
+    let list = ArtList::from_base_prefix(SCENERY, &base, 1).unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list.to_bytes(), vec![b'a'; 199]);
+    let list = ArtList::from_base_prefix(SCENERY, &base, 2).unwrap();
+    assert_eq!(list.len(), 2);
+    assert_eq!(list.to_bytes(), base[..251].to_vec());
+}

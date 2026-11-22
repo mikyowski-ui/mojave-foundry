@@ -32,6 +32,8 @@ pub struct AllSummary {
 /// Every stage in order: extract, sprites, critters, map, gallery. Each stage skips
 /// the work its content-hash cache already holds.
 pub fn all(inputs: &Inputs) -> Result<AllSummary, ConvertError> {
+    // An interior slice without --standalone stops before extract.
+    inputs.check_mode()?;
     let extract = extract(inputs)?;
     let sprites = crate::sprites::sprites(inputs)?;
     let critters = crate::critters::critters(inputs)?;

@@ -22,6 +22,45 @@ impl Budget {
     }
 }
 
+/// What the slicer does when an art list would overflow: steps applied in
+/// order, cheapest loss first, each only while a list is still over (see
+/// the crate documentation, "Budget"). Every step taken is recorded in
+/// [`crate::BudgetReport::ladder`]; only when the last one still does not
+/// fit is the run a [`crate::SliceError::FidBudget`]. A run that fits at
+/// once is never touched. Each step re-renders the window, so a run that
+/// climbs the whole ladder costs a few times a plain one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BudgetLadder {
+    /// Climb at all. Off, an overflow is an error at once.
+    pub enabled: bool,
+    /// Step 1 (walls): perimeter runs merge up to this many hexes.
+    pub perimeter_run: usize,
+    /// Step 2 (walls): strips under this many pixels join a neighbour.
+    pub min_strip_pixels: usize,
+    /// Step 3 (walls to scenery): at most this many sliced models, largest
+    /// first, become landmarks.
+    pub max_landmarks: usize,
+    /// Step 4 (walls, scenery): demote the smallest contributors of an
+    /// overflowing list to ground relief, fewest entries first.
+    pub demote: bool,
+    /// Steps 3 and 4 pick from fresh numbers and re-run at most this many
+    /// times each.
+    pub max_rounds: usize,
+}
+
+impl Default for BudgetLadder {
+    fn default() -> Self {
+        BudgetLadder {
+            enabled: true,
+            perimeter_run: 8,
+            min_strip_pixels: 192,
+            max_landmarks: 64,
+            demote: true,
+            max_rounds: 4,
+        }
+    }
+}
+
 /// Classification thresholds and slicing options. Lengths are source
 /// units after the reference's scale; footprints are counted in hexes
 /// (a hex is a quarter of a floor square in area).
@@ -30,18 +69,81 @@ impl Budget {
 /// documentation); every one can be overridden.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SlicerConfig {
-    /// Model path fragments (normalised: lowercase, `\` separators) whose
-    /// references are skipped: effects, markers, light shafts. Matched as
-    /// substrings.
+    /// Model path patterns (normalised: lowercase, `\` separators) whose
+    /// references are skipped: effects, markers, light shafts. Every
+    /// pattern list is matched by the rules of the `pattern` module: `dir\`
+    /// a whole directory, `\name` a segment start, `*name` anywhere, a
+    /// plain `name` at a word start, `!text` an exclusion.
     pub skip_patterns: Vec<String>,
-    /// Model path fragments rendered as ground relief: rocks, cliffs.
+    /// Model path patterns rendered as ground relief: rocks, cliffs.
     pub relief_patterns: Vec<String>,
-    /// Model path fragments always rendered flat onto the ground, whatever
+    /// Model path patterns always rendered flat onto the ground, whatever
     /// their height: road pieces whose bounds include a kerb or a slope.
     pub flat_patterns: Vec<String>,
-    /// Model path fragments that are one sprite whatever their size:
+    /// Model path patterns that are one sprite whatever their size:
     /// vegetation, which Fallout 2 also draws as single scenery sprites.
     pub sprite_patterns: Vec<String>,
+    /// Leading name prefixes after which a plain pattern also starts a
+    /// word: `scol` (static collections: `scolroad…`) and `nv`.
+    pub name_prefixes: Vec<String>,
+    /// Model path patterns of paved slabs (runways, sidewalks) that are
+    /// flattened when lower than `slab_height`, even above `flat_height`,
+    /// provided they are slab-shaped: at least `slab_min_width` across
+    /// their narrowest side, and (when the triangle area is known) with at
+    /// least `slab_min_fill` times their footprint in triangle area. A kerb
+    /// or a barrier is narrow, and a kerb ring around a block has little
+    /// area for its box, so both stay upright and keep blocking.
+    pub slab_patterns: Vec<String>,
+    /// Below this height (units), a slab matching `slab_patterns` is flat.
+    pub slab_height: f32,
+    /// A flattened slab is at least this wide (units) across.
+    pub slab_min_width: f64,
+    /// ...and its triangle area at least this fraction of its footprint.
+    pub slab_min_fill: f64,
+    /// Model path patterns of terrain pieces: above `max_sliced_hexes` they
+    /// stay ground relief instead of becoming landmarks. Below it they are
+    /// classified as usual.
+    pub terrain_patterns: Vec<String>,
+    /// A mesh above `max_sliced_hexes` that is not terrain (it matches no
+    /// relief or terrain pattern) is a landmark: rendered upright, cut into
+    /// pieces and placed as scenery (see the crate documentation,
+    /// "Landmarks"). Off, it is ground relief as in the first pass.
+    pub landmarks: bool,
+    /// How far beyond the edges of the engine's map view (640 × 380 under
+    /// the 640 × 480 interface) a placed object's hex centre may lie and the
+    /// object still be drawn, in pixels: `[left, top, right, bottom]`. The
+    /// engine draws an object only when its hex is among the hexes a
+    /// refresh visits, a fixed lattice over the view widened by 320 pixels
+    /// each side and 240 above and below (the `engine_view` module); every
+    /// hex centre within 335, 253, 320 and 230 pixels of the left, top,
+    /// right and bottom edge is visited, corners included. The defaults
+    /// keep 15 or 16 pixels in hand. A piece's anchor is chosen so that its
+    /// hex is visited whenever any of its pixels is in the view.
+    pub landmark_reach: [u32; 4],
+    /// A landmark piece's drawn extent is at most this many pixels wide and
+    /// high before sorting cuts it further. Each side must be less than the
+    /// matching sum of `landmark_reach` (left plus right, top plus bottom):
+    /// the anchor must lie within the reach of the piece's far edges.
+    pub landmark_piece_max: [u32; 2],
+    /// A landmark is cut into at most this many pieces, so it costs at
+    /// most this many scenery entries per distinct render. Pieces past the
+    /// visibility cut are spent on sorting (crate documentation).
+    pub landmark_max_pieces: usize,
+    /// The screen box of a standing character, `[width, height]` pixels,
+    /// its bottom centre on its hex centre: the region a landmark piece is
+    /// checked against for sorting.
+    pub walker_box: [u32; 2],
+    /// A walker's box may hold this many landmark pixels sorted the wrong
+    /// way before it counts: specks and antenna tips do not.
+    pub landmark_sort_tolerance: usize,
+    /// When set, the hexes the map builder can make walkable at all (under
+    /// the navmesh and the slope limit, before any blocking): landmark
+    /// pieces are sorted for walkers on these hexes (and open hexes) only.
+    /// Unset, every hex a landmark does not block counts, which costs more
+    /// pieces but assumes nothing.
+    pub landmark_walkers: Option<BTreeSet<i32>>,
+    /// What to do when an art list would overflow.
+    pub ladder: BudgetLadder,
     /// Base kinds that are not static scenery (actors, sounds); skipped.
     pub skip_kinds: Vec<String>,
     /// Base kinds of carried items: one sprite each, in the items list.
@@ -113,6 +215,10 @@ pub struct SlicerConfig {
     /// Floors are kept this many hex steps around an open hex, so the
     /// see-through circle around someone standing there finds floor too.
     pub floor_reach: i32,
+    /// Interior mode (an interior cell: no land, one floor, a ceiling cut);
+    /// see [`crate::InteriorSlice`]. Off (`None`, the default), nothing
+    /// changes.
+    pub interior: Option<crate::InteriorSlice>,
 }
 
 fn strings(items: &[&str]) -> Vec<String> {
@@ -122,12 +228,59 @@ fn strings(items: &[&str]) -> Vec<String> {
 impl Default for SlicerConfig {
     fn default() -> Self {
         SlicerConfig {
-            skip_patterns: strings(&["effects\\", "marker", "fx\\", "\\fx", "lightbeam", "godray"]),
-            relief_patterns: strings(&["rock", "cliff", "canyon", "boulder", "mesa", "rubble"]),
-            flat_patterns: strings(&["road", "decal", "tracks", "parkinglot"]),
-            sprite_patterns: strings(&[
-                "trees\\", "plants\\", "creosote", "shrub", "bush", "cactus",
+            skip_patterns: strings(&[
+                "effects\\",
+                "*marker",
+                "fx\\",
+                "\\fx",
+                "*lightbeam",
+                "*godray",
             ]),
+            relief_patterns: strings(&[
+                "rock",
+                "cliff",
+                "canyon",
+                "boulder",
+                "mesa",
+                "rubble",
+                "!rocket",
+                "!bouldercity",
+            ]),
+            flat_patterns: strings(&[
+                "road",
+                "*decal",
+                "tracks",
+                "parkinglot",
+                "!roadsign",
+                "!roadblock",
+            ]),
+            sprite_patterns: strings(&[
+                "trees\\", "plants\\", "creosote", "*shrub", "*bush", "*cactus", "!ambush",
+            ]),
+            name_prefixes: strings(&["nv", "scol"]),
+            slab_patterns: strings(&[
+                "runway",
+                "sidewalk",
+                "tarmac",
+                "taxiway",
+                "helipad",
+                "airstrip",
+                "pavement",
+                "!sidewalkcurb",
+                "!sidewalkkerb",
+            ]),
+            slab_height: 48.0,
+            slab_min_width: 140.0,
+            slab_min_fill: 0.9,
+            terrain_patterns: strings(&["landscape\\", "terrain", "plateau", "dune"]),
+            landmarks: true,
+            landmark_reach: [320, 238, 304, 214],
+            landmark_piece_max: [512, 352],
+            landmark_max_pieces: 160,
+            walker_box: [48, 80],
+            landmark_sort_tolerance: 24,
+            landmark_walkers: None,
+            ladder: BudgetLadder::default(),
             skip_kinds: strings(&["NPC_", "CREA", "LVLN", "LVLC", "SOUN", "IDLM", "ASPC"]),
             item_kinds: strings(&[
                 "ALCH", "AMMO", "ARMO", "BOOK", "CCRD", "CHIP", "CMNY", "IMOD", "KEYM", "MISC",
@@ -157,6 +310,7 @@ impl Default for SlicerConfig {
             floor_band: [8.0, 80.0],
             floor_min_up: 0.9,
             floor_reach: 2,
+            interior: None,
         }
     }
 }
@@ -197,13 +351,36 @@ impl SlicerConfig {
         if !(self.flatten.is_finite() && self.flatten > 0.0 && self.flatten <= 1.0) {
             return bad("flatten must be in (0, 1]");
         }
+        if !(self.slab_height.is_finite()
+            && self.slab_min_width.is_finite()
+            && self.slab_min_fill.is_finite())
+        {
+            return bad("slab_height, slab_min_width and slab_min_fill must be finite");
+        }
+        if self.landmark_max_pieces == 0 {
+            return bad("landmark_max_pieces must be at least 1");
+        }
+        let [left, top, right, bottom] = self.landmark_reach.map(u64::from);
+        let [width, height] = self.landmark_piece_max.map(u64::from);
+        if width == 0 || height == 0 || width >= left + right || height >= top + bottom {
+            return bad(
+                "landmark_piece_max must be positive and less than landmark_reach's left + right \
+                 and top + bottom",
+            );
+        }
+        if self.walker_box.contains(&0) {
+            return bad("walker_box must be positive");
+        }
+        if let Some(interior) = &self.interior {
+            interior
+                .validate()
+                .map_err(|e| crate::SliceError::Config(e.to_owned()))?;
+        }
         Ok(())
     }
 
-    pub(crate) fn matches(patterns: &[String], model: &str) -> Option<String> {
-        patterns
-            .iter()
-            .find(|p| !p.is_empty() && model.contains(p.as_str()))
-            .cloned()
+    /// The first pattern of `patterns` matching the normalised `model`.
+    pub(crate) fn matches(&self, patterns: &[String], model: &str) -> Option<String> {
+        crate::pattern::first_match(patterns, model, &self.name_prefixes)
     }
 }

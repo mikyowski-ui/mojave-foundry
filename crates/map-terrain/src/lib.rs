@@ -24,8 +24,9 @@
 //!    the tile's absolute corner, so the pattern is continuous across
 //!    tiles.
 //! 5. **Deduplication** into at most `library_cap` tiles (see the
-//!    `library` module): exact duplicates, then weighted k-means on Oklab
-//!    thumbnails with medoid representatives.
+//!    `library` module): exact duplicates, then either weighted k-means on
+//!    Oklab thumbnails with medoid representatives or a greedy merge
+//!    ([`LibraryMethod`]), then a seam-aware choice per square.
 //!
 //! **Tile shape.** Square `q`'s tile is the 80 × 36 box at
 //! `square_corner(q, false)`; a box pixel belongs to `q` exactly when
@@ -42,10 +43,33 @@
 //! crate keeps absolute coordinates.
 //!
 //! **No land.** A pixel over a cell that was not extracted, or that has no
-//! land, takes [`TerrainOptions::fallback_rgb`] and is counted. A layer
-//! whose texture is missing (or a quadrant with no base layer, which in the
-//! source means the engine's default land texture) uses a flat mid tone,
-//! [`TerrainOptions::missing_texture_rgb`], and is counted.
+//! land, takes [`TerrainOptions::fallback_rgb`] and is counted.
+//!
+//! **Blank ground (interiors).** With [`TerrainOptions::blank_without_land`]
+//! a pixel with no land is instead black under its overlays, and, where no
+//! overlay covers it at all (alpha 0 in every overlay), it is left index 0:
+//! not drawn, so the engine's black shows. A square none of whose pixels
+//! has land or overlay coverage is *blank*: its tile is all index 0 and it
+//! is flagged in [`Ground::blank_squares`], so a map writer can give it the
+//! engine's blank tile instead. In the library the blank tile is a class of
+//! its own, never substituted for a drawn tile nor by one (unless
+//! `library_cap` is below the number of phase classes, when classes are
+//! ignored; blank squares still keep the blank tile then).
+//!
+//! **Default and missing textures.** A layer the source draws with the
+//! engine's default land texture (a quadrant with no base layer, a layer
+//! with a null land texture; `mir::LandLayer::defaulted`) is an ordinary
+//! layer here, drawn with that texture, and is counted apart
+//! ([`GroundStats::defaulted_texture_pixels`]). A layer whose texture is
+//! missing (its file was not extracted or does not decode, or, in a
+//! document written before the default land texture was extracted, a
+//! quadrant with no base layer) is counted as missing and drawn from its
+//! neighbours: a blended layer is left out, so the layers below it show
+//! through, and a base takes the base texture of the nearest quadrant that
+//! has one. Only with nothing to borrow anywhere does a base take the mean
+//! colour of the textures found. Setting
+//! [`TerrainOptions::missing_texture_rgb`] instead draws every missing
+//! layer in that flat tone.
 
 mod library;
 mod parallel;
@@ -114,11 +138,33 @@ pub struct Overlay<'a> {
     pub rgba: &'a [u8],
 }
 
+/// How the library is reduced to the cap when more distinct tiles remain
+/// (see the `library` module). Both keep a substitute inside its tile's
+/// phase class, and both end with the same seam-aware choice per square.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LibraryMethod {
+    /// Weighted k-means on Oklab thumbnails, per class, with the cap shared
+    /// among the classes in proportion to their distinct tiles; medoids
+    /// are the library. The default, and what every run made before
+    /// [`LibraryMethod::GreedyMerge`] existed.
+    #[default]
+    KMeans,
+    /// Start from every distinct tile and repeatedly drop the library tile
+    /// whose squares lose least by moving to their next best library tile
+    /// (full-resolution error, weighted by squares), until the cap is met.
+    /// The cap goes wherever it saves most error, across classes too, and
+    /// distinctive tiles are the last to go. Lower error than k-means at
+    /// every cap measured; meant for large caps (thousands of tiles).
+    GreedyMerge,
+}
+
 /// Tunables of [`build_ground`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct TerrainOptions {
     /// Most tiles in the library; at least 1 (default 2000).
     pub library_cap: usize,
+    /// How the library meets the cap (default [`LibraryMethod::KMeans`]).
+    pub library_method: LibraryMethod,
     /// Ordered dither strength in Oklab lightness (default
     /// [`Dither::DEFAULT_STRENGTH`]); 0 is no dither.
     pub dither_strength: f32,
@@ -146,11 +192,20 @@ pub struct TerrainOptions {
     /// How much of each filtered texture's fine detail is added back on
     /// top, an unsharp mask in texture space (default 0, at most 4).
     pub texture_sharpen: f32,
-    /// Colour of a missing texture; `None` is the mean colour of every land
-    /// texture that was found (mid grey when none was).
+    /// `None` (the default): a missing texture is drawn from its
+    /// neighbours (see the crate documentation), and a base with nothing
+    /// to borrow takes the mean colour of every land texture that was
+    /// found (mid grey when none was). `Some`: every missing layer is drawn
+    /// in this flat tone, which shows the holes.
     pub missing_texture_rgb: Option<[u8; 3]>,
     /// Colour of ground with no land (default [`DEFAULT_FALLBACK_RGB`]).
+    /// Not used with [`TerrainOptions::blank_without_land`].
     pub fallback_rgb: [u8; 3],
+    /// For interiors (default false): ground with no land is black under
+    /// the overlays and not drawn (index 0) where no overlay covers it, and
+    /// squares with nothing drawn at all are blank squares
+    /// ([`Ground::blank_squares`]). See the crate documentation.
+    pub blank_without_land: bool,
     /// Lloyd iterations of the vector quantizer (default 8, at most 100).
     pub cluster_iterations: u32,
     /// Weight of seam continuity against a square's own error when the
@@ -162,6 +217,7 @@ impl Default for TerrainOptions {
     fn default() -> Self {
         TerrainOptions {
             library_cap: 2000,
+            library_method: LibraryMethod::KMeans,
             dither_strength: Dither::DEFAULT_STRENGTH,
             relief: 1.0,
             jobs: 1,
@@ -172,6 +228,7 @@ impl Default for TerrainOptions {
             texture_sharpen: 0.0,
             missing_texture_rgb: None,
             fallback_rgb: DEFAULT_FALLBACK_RGB,
+            blank_without_land: false,
             cluster_iterations: 8,
             seam_weight: 1.0,
         }
@@ -266,10 +323,25 @@ pub struct GroundStats {
     pub worst_substitution_error: f64,
     /// Screen pixels (inside the map's squares) over ground with no land.
     pub fallback_pixels: u64,
-    /// Screen pixels to which a missing texture contributed.
+    /// Squares with no land and no overlay coverage, drawn as the blank
+    /// tile; always 0 without [`TerrainOptions::blank_without_land`].
+    pub blank_squares: usize,
+    /// Screen pixels to which a missing texture contributed (or, when it
+    /// was left out, would have).
     pub missing_texture_pixels: u64,
     /// Layers (and quadrants without a base layer) whose texture is missing.
     pub missing_texture_layers: usize,
+    /// Of `missing_texture_layers`, the ones that name no texture file at
+    /// all; the others name a file that was not extracted or does not
+    /// decode.
+    pub unnamed_texture_layers: usize,
+    /// Missing bases drawn with the base texture of the nearest quadrant.
+    pub borrowed_base_layers: usize,
+    /// Screen pixels to which the engine's default land texture
+    /// contributed, drawn with it; not counted as missing.
+    pub defaulted_texture_pixels: u64,
+    /// Layers drawn with the engine's default land texture.
+    pub defaulted_texture_layers: usize,
     /// Distinct land textures loaded, and the ones that were missing.
     pub textures_loaded: usize,
     pub textures_missing: usize,
@@ -293,6 +365,12 @@ pub struct Ground {
     /// 10,000 entries: the library index of each square, numbered as
     /// `HexGrid` does.
     pub squares: Vec<u16>,
+    /// With [`TerrainOptions::blank_without_land`], 10,000 entries: whether
+    /// each square is blank (no land, no overlay coverage). Every blank
+    /// square's library tile is the one all-zero tile, which no other square
+    /// uses (but see the crate documentation on tiny caps). Empty without
+    /// the option.
+    pub blank_squares: Vec<bool>,
     pub stats: GroundStats,
 }
 
@@ -341,6 +419,18 @@ fn square_shape(grid: HexGrid, square: i32) -> library::Shape {
 }
 
 impl Ground {
+    /// Whether square `square` is blank ([`Ground::blank_squares`]); false
+    /// without [`TerrainOptions::blank_without_land`] or off the map.
+    pub fn is_blank(&self, square: usize) -> bool {
+        self.blank_squares.get(square).copied().unwrap_or(false)
+    }
+
+    /// The library index of the blank tile, when some square is blank.
+    pub fn blank_tile(&self) -> Option<u16> {
+        let q = self.blank_squares.iter().position(|&b| b)?;
+        self.squares.get(q).copied()
+    }
+
     /// The screen rectangle that holds every square's tile box:
     /// `(origin, width, height)` in map screen space.
     pub fn bounds() -> ([i32; 2], u32, u32) {
@@ -507,25 +597,48 @@ pub fn build_ground_from(
         terrain::Scratch::default,
         |scratch, q| {
             evaluate_square(
-                scratch, q as i32, grid, &land, sampler, &geometry, &shading, overlays, map, dither,
+                scratch,
+                q as i32,
+                grid,
+                &land,
+                sampler,
+                &geometry,
+                &shading,
+                overlays,
+                map,
+                dither,
+                options.blank_without_land,
             )
         },
     );
     let mut tiles = Vec::with_capacity(SQUARES);
     let mut fallback_pixels = 0;
     let mut missing_texture_pixels = 0;
+    let mut defaulted_texture_pixels = 0;
+    let mut blank_squares = Vec::new();
     for result in evaluated {
         let square = result?;
         fallback_pixels += square.fallback;
         missing_texture_pixels += square.missing;
+        defaulted_texture_pixels += square.defaulted;
         tiles.push(square.indexed);
+        if options.blank_without_land {
+            blank_squares.push(square.blank);
+        }
     }
+    let blank_count = blank_squares.iter().filter(|&&b| b).count();
     let evaluate_time = started.elapsed();
 
     let started = Instant::now();
     let shape = square_shape(grid, 5050);
+    // Blank squares form one class past the phase classes, so the blank
+    // tile is never substituted for a drawn one nor by one.
+    let blank_class = phase_period[0] * phase_period[1];
     let class_of: Vec<usize> = (0..SQUARES)
         .map(|q| {
+            if blank_squares.get(q).copied().unwrap_or(false) {
+                return blank_class;
+            }
             let (s, t) = (99 - q % 100, q / 100);
             (s % phase_period[0]) * phase_period[1] + t % phase_period[1]
         })
@@ -535,11 +648,16 @@ pub fn build_ground_from(
         &class_of,
         &shape,
         options.library_cap,
+        options.library_method,
         options.cluster_iterations,
         options.seam_weight,
         map,
         options.jobs,
     );
+    let mut library = library;
+    if blank_count > 0 {
+        settle_blank_tile(&mut library.tiles, &mut library.squares, &blank_squares);
+    }
     let deduplicate_time = started.elapsed();
 
     let stats = GroundStats {
@@ -554,8 +672,13 @@ pub fn build_ground_from(
         mean_substitution_error: library.mean_error,
         worst_substitution_error: library.worst_error,
         fallback_pixels,
+        blank_squares: blank_count,
         missing_texture_pixels,
         missing_texture_layers: land.missing_layers,
+        unnamed_texture_layers: land.unnamed_layers,
+        borrowed_base_layers: land.borrowed_bases,
+        defaulted_texture_pixels,
+        defaulted_texture_layers: land.defaulted_layers,
         textures_loaded: land.textures_loaded,
         textures_missing: land.textures_missing,
         cells_with_land: land.cells_with_land,
@@ -567,14 +690,34 @@ pub fn build_ground_from(
     Ok(Ground {
         tiles: library.tiles,
         squares: library.squares,
+        blank_squares,
         stats,
     })
+}
+
+/// Points every blank square at the library's all-zero tile, adding it
+/// when a reduction (only with a cap below the number of classes) merged
+/// it away.
+fn settle_blank_tile(tiles: &mut Vec<Vec<u8>>, squares: &mut [u16], blank: &[bool]) {
+    let zero = match tiles.iter().position(|t| t.iter().all(|&i| i == 0)) {
+        Some(index) => index,
+        None => {
+            tiles.push(vec![0; TILE_PIXELS]);
+            tiles.len() - 1
+        }
+    };
+    for (entry, _) in squares.iter_mut().zip(blank).filter(|(_, b)| **b) {
+        *entry = zero as u16;
+    }
 }
 
 struct SquareTile {
     indexed: Vec<u8>,
     fallback: u64,
     missing: u64,
+    defaulted: u64,
+    /// `blank_without_land` left every pixel undrawn.
+    blank: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -589,6 +732,7 @@ fn evaluate_square(
     overlays: &[Overlay],
     map: &PaletteMap,
     dither: Dither,
+    blank_without_land: bool,
 ) -> Result<SquareTile, TerrainError> {
     let corner = grid
         .square_corner(square, false)
@@ -611,6 +755,8 @@ fn evaluate_square(
     let mut rgba = vec![0u8; TILE_PIXELS * 4];
     let mut fallback = 0;
     let mut missing = 0;
+    let mut defaulted = 0;
+    let mut drawn = 0u64;
     for py in 0..th {
         for px in 0..tw {
             let point = [corner[0] + px, corner[1] + py];
@@ -621,7 +767,14 @@ fn evaluate_square(
             let sample = land.ground(scratch, sampler, geometry, shading, x, y);
             fallback += u64::from(sample.fallback);
             missing += u64::from(sample.missing);
-            let mut rgb = sample.rgb.map(|c| c.clamp(0.0, 255.0));
+            defaulted += u64::from(sample.defaulted);
+            let blank = blank_without_land && sample.fallback;
+            let mut rgb = if blank {
+                [0.0; 3]
+            } else {
+                sample.rgb.map(|c| c.clamp(0.0, 255.0))
+            };
+            let mut covered = false;
             for overlay in &touching {
                 let ox = i64::from(point[0]) - i64::from(overlay.origin[0]);
                 let oy = i64::from(point[1]) - i64::from(overlay.origin[1]);
@@ -634,11 +787,17 @@ fn evaluate_square(
                 }
                 let at = ((oy * i64::from(overlay.width) + ox) * 4) as usize;
                 let px = &overlay.rgba[at..at + 4];
+                covered |= px[3] > 0;
                 let alpha = f32::from(px[3]) / 255.0;
                 for k in 0..3 {
                     rgb[k] += (f32::from(px[k]) - rgb[k]) * alpha;
                 }
             }
+            if blank && !covered {
+                // Not drawn: index 0.
+                continue;
+            }
+            drawn += 1;
             let at = (py * tw + px) as usize * 4;
             for k in 0..3 {
                 rgba[at + k] = (rgb[k] + 0.5) as u8;
@@ -651,5 +810,7 @@ fn evaluate_square(
         indexed,
         fallback,
         missing,
+        defaulted,
+        blank: blank_without_land && drawn == 0,
     })
 }

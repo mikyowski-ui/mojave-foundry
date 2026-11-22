@@ -227,6 +227,34 @@ fn with_a_base_the_exit_grid_prototype_is_the_installs() {
 }
 
 #[test]
+fn standalone_exits_lead_out_and_back_over_the_installs_blank_tile() {
+    let mut scene = doors_scene();
+    scene.base = base_files(10);
+    scene.options.standalone = true;
+    let built = build_map(&scene.input()).unwrap();
+    check_chain(&built, &scene.base);
+    let files = built.layer.files();
+    assert!(files["art/tiles/tiles.lst"].starts_with(b"bti0000.frm\nbti0001.frm\nmft00000.frm\n"));
+    assert!(
+        !files.contains_key("proto/misc/misc.lst"),
+        "misc is the install's"
+    );
+    // Stub maps lay the blank tile 1, the install's, outside their floor;
+    // verification resolved it with every other floor.
+    let stub = &built.report.exits[0].stub_file;
+    let map = parse(&built, &scene.base, &format!("maps/{stub}"));
+    assert!(
+        map.tiles[0]
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|t| t.floor() == 1)
+    );
+    assert_eq!(built.report.verify.replaced_art_lists, ["walls", "tiles"]);
+    assert_eq!(built.report.verify.maps.len(), built.report.maps.len());
+}
+
+#[test]
 fn the_mini_town_door_leads_into_its_house_and_back() {
     let install = tempfile::tempdir().unwrap();
     let out = tempfile::tempdir().unwrap();

@@ -93,6 +93,19 @@ pub struct Lock {
 
 /// A primitive volume attached to a reference (`XPRM`, 32 bytes): the
 /// shape of a trigger, a room marker or a portal.
+///
+/// Layout, little-endian: bounds (3 × `f32`, bytes 0..12), colour
+/// (3 × `f32`, 12..24), an unnamed `f32` (24..28), shape (`u32`, 28..32).
+/// Any other length is not decoded and stays in `unknown`.
+///
+/// Checked against the retail masters (2026-11-22): every `XPRM` is 32
+/// bytes and decodes; colours are in 0..=1 and the unnamed float too;
+/// shapes are 1, 2 and 3 only. A primitive on a reference to an activator
+/// (`ACTI`) makes it a trigger volume (boxes and spheres); the same
+/// activator bases are also placed without one as ordinary, visible
+/// objects. Primitives also sit on room, collision and multibound marker
+/// statics, acoustic spaces, sounds, and portals (shape 3, whose bounds
+/// may have a zero extent: a flat portal), none of them with a model.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct Primitive {
     /// Extent along the reference's local X, Y and Z, as stored, in game
@@ -223,6 +236,13 @@ impl PlacedRef {
             rotation,
             flags: 0,
         });
+        self
+    }
+
+    /// Sets the primitive volume.
+    #[must_use]
+    pub fn with_primitive(mut self, primitive: Primitive) -> Self {
+        self.primitive = Some(primitive);
         self
     }
 

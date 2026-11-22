@@ -1,0 +1,14 @@
+# The Strip: a proof-of-concept window (owner brief, 2026-11-22).
+# Coordinates only: exterior cell ranges and a map centre in source units.
+# Run with --standalone; see README.md.
+# Centre moved west (2026-11-22) from (0, 3000): the window now takes in the
+# whole of the Tops (its west hotel and casino wings stood outside it) and
+# keeps the Lucky 38, Gomorrah and the Vault 21 plaza; its north edge is as
+# far north as Vault 21 allows. Cells: the window's plus one.
+name = "strip"
+worldspace = "TheStripWorldNew"
+plugins = ["FalloutNV.esm"]
+x = [-4, 2]
+y = [-2, 3]
+interior_depth = 1
+map_center = [-1200.0, 3100.0]

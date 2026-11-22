@@ -8,6 +8,8 @@ pub mod gallery;
 pub mod map;
 pub mod pipeline;
 pub mod probe;
+pub mod route;
+pub mod shots;
 pub mod sprites;
 
 pub use config::{ConvertError, Inputs, SliceSpec};

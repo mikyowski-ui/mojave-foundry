@@ -15,6 +15,17 @@
 //!   `2400,2200,3500`).
 //! - `SLICER_OUT`: output directory, which must sit under the workspace's
 //!   ignored `out/` (default `out/slicer-check`).
+//! - `SLICER_LADDER`: when set, slice a second time against the budget
+//!   itself, so the budget ladder runs if a list overflows.
+//! - `SLICER_LANDMARK`: `width,height,max_pieces,tolerance` landmark
+//!   limits to try instead of the defaults.
+//! - `SLICER_PROBE`: `hex,hex,...` hexes to report (blocked, anchored).
+//! - `SLICER_MODELS`: when set, a file name in the output directory: every
+//!   reference of the extraction classified (by manifest bounds), one
+//!   `model, class, count` line per pair.
+//!
+//! The output digest is a SHA-256 over everything the map builder receives,
+//! for comparing two runs byte for byte.
 //!
 //! Prints the classification and budget report; writes PNGs of the largest
 //! sliced object recomposed and spread apart, and a half-scale preview of
@@ -112,8 +123,38 @@ fn run() -> Result<(), String> {
         }
     }
     println!("{} references in the window", references.len());
-    let config = SlicerConfig::default();
+    let mut config = SlicerConfig::default();
+    if let Ok(text) = std::env::var("SLICER_LANDMARK") {
+        // Landmark limits to try: piece width, height, max pieces, tolerance.
+        let v = numbers(&text)?;
+        if v.len() != 4 {
+            return Err("SLICER_LANDMARK is width,height,max_pieces,tolerance".into());
+        }
+        config.landmark_piece_max = [v[0] as u32, v[1] as u32];
+        config.landmark_max_pieces = v[2] as usize;
+        config.landmark_sort_tolerance = v[3] as usize;
+    }
 
+    if let Some(name) = std::env::var_os("SLICER_MODELS") {
+        // Every reference of every cell, classified by manifest bounds: to
+        // compare classification rules over a whole extraction.
+        let mut all = Vec::new();
+        for key in mir.cells() {
+            if let Some(doc) = mir
+                .cell(&key.worldspace, key.x, key.y)
+                .map_err(|e| e.to_string())?
+            {
+                all.extend(doc.references);
+            }
+        }
+        let path = out.join(name);
+        write_models(&mir, &all, &config, calibration.tile_units(), &path)?;
+        println!(
+            "{} references classified into {}",
+            all.len(),
+            path.display()
+        );
+    }
     print_classes(&mir, &references, &config, calibration.tile_units());
     if std::env::var_os("SLICER_RATIOS").is_some() {
         print_ratios(&mir, &references, &config, calibration.tile_units());
@@ -158,6 +199,7 @@ fn run() -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     println!("slice in {:.1} s", started.elapsed().as_secs_f64());
+    println!("output digest {}", digest(&sliced));
     let mut report = sliced.report.clone();
     for c in &mut report.categories {
         c.free = budget.free(c.category);
@@ -181,6 +223,45 @@ fn run() -> Result<(), String> {
         println!("  failed: {:?} {}", s.model, s.reason);
     }
 
+    if std::env::var_os("SLICER_LADDER").is_some() {
+        // Slice again against the real budget, so the budget ladder runs
+        // when a list would overflow.
+        let started = Instant::now();
+        match map_slicer::slice_with(
+            &assets,
+            &references,
+            &window,
+            &sampler,
+            &projection,
+            &mut renderer,
+            &map,
+            &budget,
+            &config,
+        ) {
+            Ok(fitted) => println!(
+                "\nagainst {budget:?} in {:.1} s, output digest {}\n{}",
+                started.elapsed().as_secs_f64(),
+                digest(&fitted),
+                fitted.report
+            ),
+            Err(e) => println!("\nagainst {budget:?}: {e}"),
+        }
+    }
+
+    check_landmarks(&sliced);
+    if let Ok(text) = std::env::var("SLICER_PROBE") {
+        // Hexes to look at: blocked or not, and what is anchored there.
+        for hex in numbers(&text)? {
+            let hex = hex as i32;
+            let here: Vec<_> = sliced.placements.iter().filter(|p| p.hex == hex).collect();
+            println!(
+                "probe hex {hex}: blocked {}, {} placements ({} blocking)",
+                sliced.blocked_hexes.binary_search(&hex).is_ok(),
+                here.len(),
+                here.iter().filter(|p| p.blocking).count()
+            );
+        }
+    }
     write_images(&sliced, &palette, &out)?;
     println!("images in {}", out.display());
     Ok(())
@@ -234,6 +315,37 @@ fn print_classes(mir: &Mir, references: &[Reference], config: &SlicerConfig, til
     }
 }
 
+/// One line per distinct (model, class): the class by manifest bounds and
+/// how many references have it.
+fn write_models(
+    mir: &Mir,
+    references: &[Reference],
+    config: &SlicerConfig,
+    tile_units: f32,
+    path: &Path,
+) -> Result<(), String> {
+    let manifest = mir.manifest();
+    let mut rows: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for r in references {
+        let facts = r
+            .mesh
+            .as_ref()
+            .and_then(|h| manifest.mesh_info.get(h))
+            .map(|i| MeshFacts::from_bounds(i.bounds, u64::from(i.triangles)));
+        let class = match classify(r, facts.as_ref(), tile_units, config) {
+            Class::Skip(reason) => format!("skipped ({})", reason.label()),
+            other => other.kind().name().to_owned(),
+        };
+        let model = r.model.clone().unwrap_or_default().to_ascii_lowercase();
+        *rows.entry((model, class)).or_insert(0) += 1;
+    }
+    let text: String = rows
+        .iter()
+        .map(|((model, class), n)| format!("{model}\t{class}\t{n}\n"))
+        .collect();
+    std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
 /// Triangle area over footprint area of the sliced references: the sparse
 /// test's input.
 fn print_ratios(mir: &Mir, references: &[Reference], config: &SlicerConfig, tile_units: f32) {
@@ -260,6 +372,120 @@ fn print_ratios(mir: &Mir, references: &[Reference], config: &SlicerConfig, tile
     for (model, (ratio, hexes)) in rows.iter().take(25) {
         println!("  {ratio:>8.3}  {hexes:>7.0} hexes  {model}");
     }
+}
+
+/// SHA-256 over everything a run hands the map builder (art, placements,
+/// overlays, blocked hexes, skips), to compare two runs byte for byte.
+fn digest(sliced: &Sliced) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    let n = |h: &mut Sha256, v: i64| h.update(v.to_le_bytes());
+    n(&mut h, sliced.art.len() as i64);
+    for a in &sliced.art {
+        n(&mut h, a.category as i64);
+        n(&mut h, i64::from(a.width));
+        n(&mut h, i64::from(a.height));
+        n(&mut h, i64::from(a.shift[0]));
+        n(&mut h, i64::from(a.shift[1]));
+        h.update(&a.pixels);
+        h.update(a.source.as_bytes());
+    }
+    n(&mut h, sliced.placements.len() as i64);
+    for p in &sliced.placements {
+        n(&mut h, p.art as i64);
+        n(&mut h, i64::from(p.hex));
+        n(&mut h, i64::from(p.displacement[0]));
+        n(&mut h, i64::from(p.displacement[1]));
+        n(&mut h, p.role as i64);
+        h.update(p.reference.as_bytes());
+        n(&mut h, i64::from(p.blocking));
+        let run = p.run.unwrap_or((-1, -1));
+        n(&mut h, i64::from(run.0));
+        n(&mut h, i64::from(run.1));
+    }
+    n(&mut h, sliced.overlays.len() as i64);
+    for o in &sliced.overlays {
+        n(&mut h, i64::from(o.origin[0]));
+        n(&mut h, i64::from(o.origin[1]));
+        n(&mut h, i64::from(o.width));
+        n(&mut h, i64::from(o.height));
+        h.update(&o.rgba);
+    }
+    n(&mut h, sliced.blocked_hexes.len() as i64);
+    for b in &sliced.blocked_hexes {
+        n(&mut h, i64::from(*b));
+    }
+    n(&mut h, sliced.skipped.len() as i64);
+    for s in &sliced.skipped {
+        h.update(s.reference.as_bytes());
+        h.update(s.reason.to_string().as_bytes());
+    }
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Every landmark piece against the engine's drawing rule
+/// (`map_slicer::engine_view`): for every camera hex from which some piece
+/// shows a pixel in the 640 x 380 view, each such piece's hex must be
+/// visited. Prints the tally.
+fn check_landmarks(sliced: &Sliced) {
+    use map_slicer::engine_view::{VIEW, view_origin, visited_hexes};
+    let landmark_models: std::collections::BTreeSet<&str> = sliced
+        .report
+        .contributors
+        .iter()
+        .filter(|c| c.class == ClassKind::Landmark)
+        .map(|c| c.model.as_str())
+        .collect();
+    let pieces: Vec<(i32, [i64; 4])> = sliced
+        .placements
+        .iter()
+        .filter(|p| p.role == Role::Scenery)
+        .filter(|p| landmark_models.contains(sliced.art[p.art].source.as_str()))
+        .map(|p| {
+            let a = &sliced.art[p.art];
+            let o = origin(a, p);
+            (
+                p.hex,
+                [
+                    o[0],
+                    o[1],
+                    o[0] + i64::from(a.width) - 1,
+                    o[1] + i64::from(a.height) - 1,
+                ],
+            )
+        })
+        .collect();
+    if pieces.is_empty() {
+        return;
+    }
+    let (mut cameras, mut shown, mut missing) = (0usize, 0usize, 0usize);
+    for camera in 0..40_000 {
+        let Some(v) = view_origin(camera) else {
+            continue;
+        };
+        let view = [v[0], v[1], v[0] + VIEW[0] - 1, v[1] + VIEW[1] - 1];
+        let in_view: Vec<&(i32, [i64; 4])> = pieces
+            .iter()
+            .filter(|(_, r)| {
+                r[0] <= view[2] && r[2] >= view[0] && r[1] <= view[3] && r[3] >= view[1]
+            })
+            .collect();
+        if in_view.is_empty() {
+            continue;
+        }
+        cameras += 1;
+        let visited = visited_hexes(camera);
+        for (hex, _) in in_view {
+            shown += 1;
+            if !visited.contains(hex) {
+                missing += 1;
+            }
+        }
+    }
+    println!(
+        "landmark visibility: {} pieces, {cameras} camera hexes showing one, {shown} piece views, {missing} not drawn",
+        pieces.len()
+    );
 }
 
 /// Engine placement of a frame's pixel (0, 0).

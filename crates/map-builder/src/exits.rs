@@ -3,7 +3,22 @@
 //!
 //! **Footprint.** For a door on hex `D`, every walkable neighbour of `D`
 //! (lattice distance 1) holds an exit grid into the interior's stub map:
-//! a walker reaches the door only through them. The player comes back out
+//! a walker reaches the door only through them.
+//!
+//! **A door with no walkable neighbour** (its doorstep inside a blocked
+//! footprint) gets a doorstep further out instead of being skipped: the
+//! nearest walkable hexes 2 to `reach` steps away
+//! ([`crate::BuildOptions::door_reach`]) on the door's **outer side**. The
+//! outer side is the half plane, through the door's centre, facing the
+//! interior door's own teleport destination (where a traveller arrives
+//! outside); without that destination every direction counts. On the
+//! nearest ring that has such a hex, the doorstep is the one nearest the
+//! outward ray from the door (nearest the door when there is no ray; ties
+//! to the lower hex) plus its neighbours on that ring that are walkable
+//! and on the outer side too: one to three exit grids.
+//! [`DoorExit::grid_steps`] says how far out they are.
+//!
+//! The player comes back out
 //! on the **return hex**: the walkable hex nearest the interior door's own
 //! teleport destination (its arrival point outside), among hexes 2 to
 //! [`RETURN_RADIUS`] steps from `D` that hold no exit grid, so that
@@ -45,9 +60,68 @@ pub struct DoorExit {
     pub interior: String,
     pub interior_editor_id: Option<String>,
     pub grid_hexes: Vec<i32>,
+    /// Hex steps from the door to its exit grids: 1 when they stand next
+    /// to it, more for a doorstep found further out.
+    pub grid_steps: i32,
     pub return_hex: i32,
     pub return_orientation: u8,
     pub return_from_teleport: bool,
+}
+
+/// The default of [`crate::BuildOptions::door_reach`]: the doorsteps
+/// measured on the dense maps lay 2 to 7 steps from their doors.
+pub const DOOR_REACH: i32 = 8;
+
+/// The doorstep of a door on `door_hex` with no walkable neighbour (module
+/// notes): its hexes, sorted, and their distance from the door.
+fn far_doorstep(
+    frame: &Frame,
+    door_hex: i32,
+    outward: Option<[f64; 2]>,
+    walkable: &[bool],
+    reach: i32,
+) -> Option<(Vec<i32>, i32)> {
+    let door = frame.hex_centre_tile(door_hex)?;
+    let offset = |hex: i32| {
+        frame
+            .hex_centre_tile(hex)
+            .map(|c| [c[0] - door[0], c[1] - door[1]])
+    };
+    let outer = |hex: i32| match (outward, offset(hex)) {
+        (Some(u), Some(d)) => d[0] * u[0] + d[1] * u[1] > 0.0,
+        (None, Some(_)) => true,
+        (_, None) => false,
+    };
+    for steps in 2..=reach {
+        let ring: Vec<i32> = hexes_around(door_hex, steps, true)
+            .into_iter()
+            .filter(|hex| walkable.get(*hex as usize).copied().unwrap_or(false) && outer(*hex))
+            .collect();
+        // The hex nearest the outward ray (largest cosine), or without a
+        // ray the nearest the door.
+        let score = |hex: i32| -> f64 {
+            let d = offset(hex).unwrap_or([0.0; 2]);
+            let length = d[0].hypot(d[1]).max(1e-9);
+            match outward {
+                Some(u) => -(d[0] * u[0] + d[1] * u[1]) / length,
+                None => length,
+            }
+        };
+        let Some(&first) = ring
+            .iter()
+            .min_by(|a, b| score(**a).total_cmp(&score(**b)).then(a.cmp(b)))
+        else {
+            continue;
+        };
+        let mut step: Vec<i32> = ring
+            .iter()
+            .copied()
+            .filter(|hex| *hex == first || HexGrid::lattice_distance(*hex, first) == Ok(1))
+            .collect();
+        step.sort_unstable();
+        return Some((step, steps));
+    }
+    None
 }
 
 /// The hexes `radius` steps or fewer from `centre` (exactly `radius` when
@@ -119,12 +193,15 @@ fn surroundings(door_hex: i32, verdicts: &[Verdict]) -> String {
     }
 }
 
-/// Plan the exits of every teleporting door among `placements`.
+/// Plan the exits of every teleporting door among `placements`; a door
+/// with no walkable neighbour looks for a doorstep up to `reach` steps
+/// out (module notes; below 2, it is skipped as before).
 pub fn plan(
     frame: &Frame,
     placements: &[Placement],
     cells: &[CellDoc],
     verdicts: &[Verdict],
+    reach: i32,
 ) -> (Vec<DoorExit>, Vec<SkippedTeleport>, usize) {
     let walkable: Vec<bool> = verdicts.iter().map(|v| *v == Verdict::Walkable).collect();
     let mut references: BTreeMap<String, &Reference> = BTreeMap::new();
@@ -166,24 +243,6 @@ pub fn plan(
             });
             continue;
         }
-        let grid: Vec<i32> = {
-            let mut grid: Vec<i32> = neighbours(placement.hex)
-                .filter(|hex| walkable[*hex as usize])
-                .collect();
-            grid.sort_unstable();
-            grid
-        };
-        if grid.is_empty() {
-            skipped.push(SkippedTeleport {
-                door: placement.reference.clone(),
-                reason: format!(
-                    "no walkable hex next to the door on hex {} ({})",
-                    placement.hex,
-                    surroundings(placement.hex, verdicts)
-                ),
-            });
-            continue;
-        }
         // The interior door's own teleport is where a traveller arrives
         // outside.
         let back = cells
@@ -192,11 +251,46 @@ pub fn plan(
             .find_map(|c| c.reference(&teleport.door))
             .and_then(|door| door.teleport.as_ref())
             .map(|t| t.position);
-        doors.push((index, reference, teleport, cell, grid, back));
+        let mut grid: Vec<i32> = neighbours(placement.hex)
+            .filter(|hex| walkable[*hex as usize])
+            .collect();
+        grid.sort_unstable();
+        let mut steps = 1;
+        if grid.is_empty() {
+            let outward = back
+                .filter(|p| p.iter().all(|v| v.is_finite()))
+                .and_then(|p| {
+                    let to = frame.tile_of_source(f64::from(p[0]), f64::from(p[1]));
+                    let from = frame.hex_centre_tile(placement.hex)?;
+                    let d = [to[0] - from[0], to[1] - from[1]];
+                    let length = d[0].hypot(d[1]);
+                    (length > 1e-6).then(|| [d[0] / length, d[1] / length])
+                });
+            match far_doorstep(frame, placement.hex, outward, &walkable, reach) {
+                Some((far, at)) => {
+                    grid = far;
+                    steps = at;
+                }
+                None => {
+                    skipped.push(SkippedTeleport {
+                        door: placement.reference.clone(),
+                        reason: format!(
+                            "no walkable hex next to the door on hex {} nor on its outer side \
+                             within {} steps ({})",
+                            placement.hex,
+                            reach.max(1),
+                            surroundings(placement.hex, verdicts)
+                        ),
+                    });
+                    continue;
+                }
+            }
+        }
+        doors.push((index, reference, teleport, cell, grid, back, steps));
     }
     let all_grids: BTreeSet<i32> = doors.iter().flat_map(|d| d.4.iter().copied()).collect();
     let mut exits = Vec::new();
-    for (index, _reference, _teleport, cell, grid, back) in doors {
+    for (index, _reference, _teleport, cell, grid, back, grid_steps) in doors {
         let placement = &placements[index];
         let door_hex = placement.hex;
         let target = match back {
@@ -243,6 +337,7 @@ pub fn plan(
             interior: cell.form.to_string(),
             interior_editor_id: cell.editor_id.clone(),
             grid_hexes: grid,
+            grid_steps,
             return_hex,
             return_orientation: orientation_towards(door_hex, return_hex),
             return_from_teleport: from_teleport,

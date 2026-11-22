@@ -6,6 +6,7 @@
 //! MIR_PLUGINS=A.esm,B.esm          plugin list, in load order
 //! MIR_OUT=<dir>                    output; keep it outside git or under out/
 //! MIR_WORLDSPACE=<editor id>       the slice's worldspace
+//! MIR_NAME=<name>                  the slice's name (default: the worldspace, lowercase)
 //! MIR_X=-3..3  MIR_Y=-2..2         inclusive cell ranges
 //! MIR_DEPTH=1                      teleport hops into interiors (default 1)
 //! MIR_JOBS=4                       threads (default 4)
@@ -61,7 +62,10 @@ fn options() -> Result<ExtractOptions, String> {
             .collect(),
         out: PathBuf::from(var("MIR_OUT")?),
         slice: Slice {
-            name: worldspace.to_ascii_lowercase(),
+            name: env::var("MIR_NAME")
+                .ok()
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| worldspace.to_ascii_lowercase()),
             worldspace,
             x: range("MIR_X")?,
             y: range("MIR_Y")?,

@@ -131,6 +131,31 @@ impl Footprint {
             })
             .fold(0.0, f64::max)
     }
+
+    /// The narrowest width of the polygon, in units: the least distance
+    /// between two parallel lines that hold it (0 for a degenerate one).
+    pub fn width(&self) -> f64 {
+        let n = self.polygon.len();
+        if n < 3 {
+            return 0.0;
+        }
+        (0..n)
+            .map(|i| {
+                let a = self.polygon[i];
+                let b = self.polygon[(i + 1) % n];
+                let len = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
+                if len <= 0.0 {
+                    return f64::INFINITY;
+                }
+                self.polygon
+                    .iter()
+                    .map(|p| {
+                        ((b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])).abs() / len
+                    })
+                    .fold(0.0, f64::max)
+            })
+            .fold(f64::INFINITY, f64::min)
+    }
 }
 
 /// Why a reference produced nothing.
@@ -140,13 +165,17 @@ pub enum SkipReason {
     Deleted,
     /// Starts disabled.
     Disabled,
+    /// An invisible trigger or activator volume (`mir::Reference::
+    /// trigger_volume`): its base's mesh is an editor stand-in.
+    TriggerVolume,
     /// Its enable parent starts it disabled.
     DisabledByParent,
     /// The base kind is not static scenery (an actor, a sound).
     Kind(String),
     /// No model, or the model was not converted.
     NoMesh,
-    /// The model path matches a skip pattern.
+    /// The model path matches a skip pattern (named without a leading
+    /// `*`).
     Pattern(String),
     /// The mesh could not be read.
     Unreadable(String),
@@ -162,6 +191,15 @@ pub enum SkipReason {
     TooLarge,
     /// Rendering, quantizing or framing failed.
     Failed(String),
+    /// Interior mode: the placed bounds lie wholly above the ceiling cut
+    /// (an upper storey, a roof), or nothing of the mesh is left under it.
+    AboveCut,
+    /// Interior mode: it reaches above the cut and hangs higher than
+    /// `hang_clearance` (a lamp, a fan, a chandelier, a ceiling sign).
+    Hanging,
+    /// Interior mode: the placed bounds lie wholly below the floor band (a
+    /// lower storey, a basement).
+    BelowFloor,
 }
 
 impl SkipReason {
@@ -170,6 +208,7 @@ impl SkipReason {
         match self {
             SkipReason::Deleted => "deleted",
             SkipReason::Disabled => "initially disabled",
+            SkipReason::TriggerVolume => "trigger volume",
             SkipReason::DisabledByParent => "disabled by enable parent",
             SkipReason::Kind(_) => "not scenery",
             SkipReason::NoMesh => "no mesh",
@@ -181,6 +220,9 @@ impl SkipReason {
             SkipReason::OutsideMap => "outside the map",
             SkipReason::TooLarge => "too large to render",
             SkipReason::Failed(_) => "failed",
+            SkipReason::AboveCut => "above the ceiling cut",
+            SkipReason::Hanging => "hanging from the ceiling",
+            SkipReason::BelowFloor => "below the floor",
         }
     }
 }
@@ -210,6 +252,11 @@ pub enum Class {
     Sprite(Role),
     /// Per-hex strips in the walls list.
     Sliced,
+    /// Upright, but too large to slice: a few large pieces in the scenery
+    /// list, each drawn whenever it shows and sorted against every walker
+    /// as far as one sprite can be, its footprint blocked (crate
+    /// documentation, "Landmarks").
+    Landmark,
 }
 
 /// The class without its payload, for reports.
@@ -220,6 +267,7 @@ pub enum ClassKind {
     GroundRelief,
     Sprite,
     Sliced,
+    Landmark,
 }
 
 impl Class {
@@ -230,17 +278,19 @@ impl Class {
             Class::GroundRelief => ClassKind::GroundRelief,
             Class::Sprite(_) => ClassKind::Sprite,
             Class::Sliced => ClassKind::Sliced,
+            Class::Landmark => ClassKind::Landmark,
         }
     }
 }
 
 impl ClassKind {
-    pub const ALL: [ClassKind; 5] = [
+    pub const ALL: [ClassKind; 6] = [
         ClassKind::Skipped,
         ClassKind::GroundFlat,
         ClassKind::GroundRelief,
         ClassKind::Sprite,
         ClassKind::Sliced,
+        ClassKind::Landmark,
     ];
 
     pub fn name(self) -> &'static str {
@@ -250,6 +300,7 @@ impl ClassKind {
             ClassKind::GroundRelief => "ground relief",
             ClassKind::Sprite => "sprite",
             ClassKind::Sliced => "sliced",
+            ClassKind::Landmark => "landmark",
         }
     }
 }
@@ -282,27 +333,51 @@ fn kind_in(list: &[String], kind: Option<&str>) -> bool {
     kind.is_some_and(|k| list.iter().any(|l| l == k))
 }
 
+/// Whether a low mesh named like a paved slab is shaped like one: wide
+/// across its narrowest side, and (when the triangle area is known) with
+/// about as much surface as floor, unlike a kerb or a kerb ring.
+fn is_slab(footprint: &Footprint, facts: &MeshFacts, scale: f32, config: &SlicerConfig) -> bool {
+    if footprint.width() < config.slab_min_width {
+        return false;
+    }
+    match facts.surface_area {
+        Some(area) => {
+            let scale = f64::from(scale);
+            area * scale * scale >= config.slab_min_fill * footprint.area
+        }
+        None => true,
+    }
+}
+
 /// Classifies one reference from its record and its mesh's facts, for
 /// floor squares of `tile_units` source units.
 ///
 /// The rules, first match wins:
 ///
-/// 1. deleted, initially disabled → skip;
+/// 1. deleted, initially disabled, a trigger volume → skip;
 /// 2. a base kind in `skip_kinds` → skip;
 /// 3. no model or no converted mesh → skip; a model matching
 ///    `skip_patterns` → skip;
 /// 4. `facts` missing or without geometry → skip;
 /// 5. items, doors and containers → one sprite each, whatever their size;
 /// 6. a model matching `flat_patterns`, or a height under `flat_height` →
-///    ground flat;
+///    ground flat; a model matching `slab_patterns` under `slab_height`
+///    that is slab-shaped (`slab_min_width`, `slab_min_fill`) → ground flat;
 /// 7. a model matching `sprite_patterns` (vegetation) → a scenery sprite;
-/// 8. a model matching `relief_patterns`, or a footprint above
-///    `max_sliced_hexes` → ground relief;
+/// 8. a model matching `relief_patterns` → ground relief; a footprint
+///    above `max_sliced_hexes` → a landmark, or ground relief when it
+///    matches `terrain_patterns` or `landmarks` is off;
 /// 9. a footprint of at most `sprite_max_hexes`, no side longer than
 ///    `sprite_max_span` → a scenery sprite;
 /// 10. triangle area under `sparse_ratio` of the footprint area (wires) →
 ///     a scenery sprite, or skipped when `sparse_as_sprite` is off;
 /// 11. otherwise → sliced.
+///
+/// With [`SlicerConfig::interior`] set (the `interior` module): after rule
+/// 4, placed bounds wholly above the ceiling cut, hanging from it, or
+/// wholly below the floor band → skip; rule 6 applies only to what lies
+/// within the floor band; rule 8 becomes: a footprint above
+/// `max_sliced_hexes` → sliced, relief and terrain patterns ignored.
 ///
 /// Rendering can still skip a sprite or a sliced reference later (an empty
 /// render, outside the map).
@@ -318,6 +393,9 @@ pub fn classify(
     if reference.flags.initially_disabled {
         return Class::Skip(SkipReason::Disabled);
     }
+    if reference.trigger_volume {
+        return Class::Skip(SkipReason::TriggerVolume);
+    }
     let kind = reference.base_kind.as_deref();
     if kind_in(&config.skip_kinds, kind) {
         return Class::Skip(SkipReason::Kind(kind.unwrap_or_default().to_owned()));
@@ -326,8 +404,10 @@ pub fn classify(
         return Class::Skip(SkipReason::NoMesh);
     };
     let model = model.to_ascii_lowercase().replace('/', "\\");
-    if let Some(pattern) = SlicerConfig::matches(&config.skip_patterns, &model) {
-        return Class::Skip(SkipReason::Pattern(pattern));
+    if let Some(pattern) = config.matches(&config.skip_patterns, &model) {
+        // Named as in the first pass: `*marker` reads `marker`.
+        let name = pattern.strip_prefix('*').unwrap_or(&pattern).to_owned();
+        return Class::Skip(SkipReason::Pattern(name));
     }
     let Some(facts) = facts else {
         return Class::Skip(SkipReason::NoMesh);
@@ -338,6 +418,11 @@ pub fn classify(
     if !reference.transform.is_finite() {
         return Class::Skip(SkipReason::NoGeometry);
     }
+    let footprint = Footprint::of(&reference.transform, bounds);
+    let interior = config.interior.as_ref();
+    if let Some(reason) = interior.and_then(|i| i.skip(footprint.z)) {
+        return Class::Skip(reason);
+    }
     if kind_in(&config.item_kinds, kind) {
         return Class::Sprite(Role::Item);
     }
@@ -347,20 +432,41 @@ pub fn classify(
     if kind_in(&config.container_kinds, kind) {
         return Class::Sprite(Role::Container);
     }
-    let footprint = Footprint::of(&reference.transform, bounds);
-    if SlicerConfig::matches(&config.flat_patterns, &model).is_some()
-        || footprint.height() < config.flat_height
+    // Indoors, only what lies on the floor is flattened onto it.
+    let on_floor = interior.is_none_or(|i| i.on_floor(footprint.z[0]));
+    if on_floor
+        && (config.matches(&config.flat_patterns, &model).is_some()
+            || footprint.height() < config.flat_height)
     {
         return Class::GroundFlat;
     }
-    if SlicerConfig::matches(&config.sprite_patterns, &model).is_some() {
+    if on_floor
+        && footprint.height() < config.slab_height
+        && config.matches(&config.slab_patterns, &model).is_some()
+        && is_slab(&footprint, facts, reference.transform.scale, config)
+    {
+        return Class::GroundFlat;
+    }
+    if config.matches(&config.sprite_patterns, &model).is_some() {
         return Class::Sprite(Role::Scenery);
     }
     let hexes = footprint.hexes(tile_units);
-    if SlicerConfig::matches(&config.relief_patterns, &model).is_some()
-        || hexes > config.max_sliced_hexes
-    {
+    if interior.is_some() {
+        // Indoors there is no relief: rock is a wall, and a shell too
+        // large to slice is still walls once its floor is baked and its
+        // ceiling cut.
+        if hexes > config.max_sliced_hexes {
+            return Class::Sliced;
+        }
+    } else if config.matches(&config.relief_patterns, &model).is_some() {
         return Class::GroundRelief;
+    }
+    if hexes > config.max_sliced_hexes {
+        return if config.landmarks && config.matches(&config.terrain_patterns, &model).is_none() {
+            Class::Landmark
+        } else {
+            Class::GroundRelief
+        };
     }
     if hexes <= config.sprite_max_hexes && footprint.longest_side() <= config.sprite_max_span {
         return Class::Sprite(Role::Scenery);

@@ -15,9 +15,9 @@ use fnv_esm::{
     ActorBase, AlphaLayer, AlphaPoint, Armor, ArmorAddon, ArmorData, BaseLayer, BipedData, Cell,
     Comparison, Condition, Container, ContainerItem, Creature, CreatureData, Door, Eyes, FormId,
     FormList, Hair, Info, LAND_GRID, Land, LandTexture, LeveledEntry, LeveledKind, LeveledList,
-    MiscItem, NavDoorLink, NavTriangle, Navmesh, Npc, NpcStats, PlacedKind, PlacedRef, Quest,
-    QuestLogEntry, QuestObjective, QuestStage, Race, RaceData, RacePart, RaceParts, RecordFlags,
-    Response, Rgb, Script, ScriptBody, Static, TextureSet, Topic, World,
+    MiscItem, NavDoorLink, NavTriangle, Navmesh, Npc, NpcStats, PlacedKind, PlacedRef, Primitive,
+    Quest, QuestLogEntry, QuestObjective, QuestStage, Race, RaceData, RacePart, RaceParts,
+    RawRecord, RecordFlags, Response, Rgb, Script, ScriptBody, Static, TextureSet, Topic, World,
 };
 use nif::fixture::{
     KfDesc, KfTrack, NifBuilder, NodeDesc, box_mesh, box_shape, building_scene, linear_rotations,
@@ -36,6 +36,9 @@ pub const PLUGIN: &str = "MiniTown.esm";
 pub const WORLDSPACE: &str = "MiniTownWorld";
 /// The interior's editor id.
 pub const INTERIOR: &str = "MTHouseInterior";
+/// The stand-in model of the trigger activator: an ordinary archived mesh
+/// (the fence's), which a trigger volume must not draw.
+pub const TRIGGER_STAND_IN: &str = "meshes\\minitown\\fence.nif";
 /// A model path that no archive has.
 pub const MISSING_MESH: &str = "meshes\\minitown\\lostcrate.nif";
 /// A texture path whose archived bytes are not a DDS file.
@@ -114,6 +117,13 @@ pub struct MiniTown {
     pub topic: FormKey,
     /// The navmesh of cell (0, 0).
     pub navmesh: FormKey,
+    /// A trigger volume in cell (−1, 1): a reference to an activator whose
+    /// model is a stand-in ([`TRIGGER_STAND_IN`]), with a box primitive
+    /// (`XPRM`). Its document has `trigger_volume` set; no other reference
+    /// has.
+    pub trigger_volume: FormKey,
+    /// The trigger volume's base, an activator (`ACTI`).
+    pub trigger_base: FormKey,
     /// The cell (0, 0).
     pub centre_cell: FormKey,
     /// The actor a character test animates: the sheriff ([`Self::sheriff`],
@@ -411,6 +421,7 @@ pub fn mini_town(dir: &Path) -> MiniTown {
     const DEPUTY: u32 = 0x887;
     const DOG: u32 = 0x888;
     const GOGGLES: u32 = 0x889;
+    const TRIGGER: u32 = 0x88A;
     const R_HOUSE: u32 = 0x900;
     const R_FENCE: u32 = 0x901;
     const R_ROCK: u32 = 0x902;
@@ -428,6 +439,7 @@ pub fn mini_town(dir: &Path) -> MiniTown {
     const R_INSIDE_CAN: u32 = 0x924;
     const R_DEPUTY: u32 = 0x925;
     const R_DOG: u32 = 0x926;
+    const R_TRIGGER: u32 = 0x927;
 
     let cell_id = |x: i32, y: i32| CELL0 + ((x + 1) * 3 + (y + 1)) as u32;
     let land_id = |x: i32, y: i32| LAND0 + ((x + 1) * 3 + (y + 1)) as u32;
@@ -453,6 +465,12 @@ pub fn mini_town(dir: &Path) -> MiniTown {
     plugin.add(Static::new(FENCE, "MTFence", "MiniTown\\Fence.NIF"));
     plugin.add(Static::new(ROCK, "MTRock", "minitown\\rock.nif"));
     plugin.add(Static::new(SIGN, "MTSign", "minitown\\sign.nif"));
+    // A trigger activator; its model stands in for the volume in an editor.
+    plugin.add_raw(
+        RawRecord::new(b"ACTI", TRIGGER)
+            .with(b"EDID", &b"MTTownTrigger\0"[..])
+            .with(b"MODL", &b"minitown\\fence.nif\0"[..]),
+    );
     let mut door = Door::new(DOOR, "MTHouseDoor", "Door", "minitown\\door.nif");
     door.common.script = Some(FormId(SCRIPT));
     plugin.add(door);
@@ -882,6 +900,23 @@ pub fn mini_town(dir: &Path) -> MiniTown {
                         [0.0; 3],
                     ));
                 }
+                (-1, 1) => {
+                    spec = spec.with_temporary(
+                        PlacedRef::new(
+                            PlacedKind::Object,
+                            R_TRIGGER,
+                            TRIGGER,
+                            ground(ox + 2000.0, oy + 2000.0),
+                            [0.0, 0.0, 0.25],
+                        )
+                        .with_primitive(Primitive {
+                            bounds: [256.0, 192.0, 128.0],
+                            color: [0.8, 0.4, 0.1],
+                            unknown: 0.15,
+                            shape: Primitive::SHAPE_BOX,
+                        }),
+                    );
+                }
                 (0, 1) => {
                     spec = spec.with_temporary(PlacedRef::new(
                         PlacedKind::Object,
@@ -1126,6 +1161,8 @@ pub fn mini_town(dir: &Path) -> MiniTown {
         quest: key(QUEST),
         topic: key(TOPIC),
         navmesh: key(NAVMESH),
+        trigger_volume: key(R_TRIGGER),
+        trigger_base: key(TRIGGER),
         centre_cell: key(cell_id(0, 0)),
         animated_actor: key(SHERIFF),
     }

@@ -419,6 +419,7 @@ pub fn teleport_door(
         count: None,
         linked_ref: None,
         owner: None,
+        trigger_volume: false,
     }
 }
 

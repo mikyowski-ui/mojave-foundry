@@ -199,11 +199,16 @@ pub(crate) struct Spot {
 /// Place every critter by the rule in the module notes. `reserved` holds
 /// the hexes no critter may take besides those the earlier critters take:
 /// exit grids, doors, the entrance and return hexes.
+///
+/// Each critter's search radius ([`CRITTER_RADIUS`] on an exterior build),
+/// or the reason it is skipped (checked after its hit points, position and
+/// rotation), is `radius` of its index.
 pub(crate) fn place(
     frame: &Frame,
     critters: &[CritterPlacement],
     walkable: &[bool],
     reserved: &BTreeSet<i32>,
+    radius: impl Fn(usize) -> Result<i32, String>,
 ) -> (Vec<Spot>, Vec<SkippedCritter>) {
     let mut taken: BTreeSet<i32> = BTreeSet::new();
     let mut spots = Vec::new();
@@ -237,8 +242,15 @@ pub(crate) fn place(
             )));
             continue;
         };
+        let reach = match radius(index) {
+            Ok(reach) => reach,
+            Err(reason) => {
+                skipped.push(skip(reason));
+                continue;
+            }
+        };
         let mut best: Option<(f64, i32)> = None;
-        for hex in hexes_around(origin, CRITTER_RADIUS, false) {
+        for hex in hexes_around(origin, reach, false) {
             if !walkable.get(hex as usize).copied().unwrap_or(false)
                 || reserved.contains(&hex)
                 || taken.contains(&hex)
@@ -255,7 +267,7 @@ pub(crate) fn place(
         }
         let Some((distance, hex)) = best else {
             skipped.push(skip(format!(
-                "no free walkable hex within {CRITTER_RADIUS} steps of hex {origin}"
+                "no free walkable hex within {reach} steps of hex {origin}"
             )));
             continue;
         };

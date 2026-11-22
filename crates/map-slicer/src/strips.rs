@@ -230,7 +230,21 @@ pub(crate) fn cut(
             *h = target;
         }
     }
+    result.strips = frames(canvas, indexed, &owner, ground, &runs)?;
+    result.run_hexes.sort_unstable();
+    Ok(result)
+}
 
+/// One frame per owner hex: the bounding box of its pixels, placed for the
+/// engine's rule at that hex. Sorted by hex.
+pub(crate) fn frames(
+    canvas: &Canvas,
+    indexed: &[u8],
+    owner: &[i32],
+    ground: [i64; 2],
+    runs: &BTreeMap<i32, (i32, i32)>,
+) -> Result<Vec<Strip>, String> {
+    let mut strips = Vec::new();
     // Bounding boxes, then the pixels of each strip.
     let w = canvas.width as usize;
     let mut boxes: BTreeMap<i32, ([usize; 4], usize)> = BTreeMap::new();
@@ -270,13 +284,12 @@ pub(crate) fn cut(
         ];
         let frame = emit::placed_frame(&sub, bw as u32, bh as u32, origin)
             .map_err(|e| format!("strip at hex {h}: {e}"))?;
-        result.strips.push(Strip {
+        strips.push(Strip {
             hex: h,
             run: runs.get(&h).copied(),
             frame,
             pixels,
         });
     }
-    result.run_hexes.sort_unstable();
-    Ok(result)
+    Ok(strips)
 }

@@ -407,130 +407,36 @@ pub fn f2(dir: &Path) -> Result<(), String> {
 }
 
 /// Reads one map of a written mod layer back from disk and reports where a
-/// walker can go, by the engine's movement rule: an object stops movement
-/// when its art is critter, scenery or wall art and it is neither hidden
-/// nor non-blocking; a multi-hex object also stops its six neighbours; and
-/// no step leaves an outer-border hex. Prints, for each exit grid, whether
-/// it can be reached from the entry hex and a chain of waypoints `hop`
-/// steps apart, short enough for the engine's capped route search. For each
-/// hex in `from` (the points other maps' exits arrive at) it then reports
-/// what can be reached without stepping on an exit grid.
+/// walker can go, by the engine's movement rule ([`crate::route::WalkMap`]).
+/// Prints, for each exit grid, whether it can be reached from the entry hex
+/// and a chain of waypoints `hop` steps apart, short enough for the
+/// engine's capped route search. For each hex in `from` (the points other
+/// maps' exits arrive at) it then reports what can be reached without
+/// stepping on an exit grid.
 pub fn walk(layer_dir: &Path, map: &str, hop: usize, from: &[i32]) -> Result<(), String> {
-    use std::collections::VecDeque;
-    use vault_formats::map::{MapFile, ObjectDetail, ObjectState};
-    use vault_formats::pro::BasicFlags;
-    use vault_formats::pro_catalog::LocalPrototypeCatalog;
-    use vault_formats::vfs::{ByteSource, MemoryDir, MemoryMount};
-    use vault_formats::{Fid, GameProfile, HexGrid};
+    use crate::route::{self, HEXES, WalkMap};
 
-    const HEXES: usize = 40_000;
-    let layer = map_builder::read_layer(layer_dir).map_err(|e| e.to_string())?;
-    let mut entries = Vec::new();
-    for (path, bytes) in layer.files() {
-        if path == "vault-mod.toml" || path == "README.txt" {
-            continue;
-        }
-        let source = ByteSource::new(bytes.clone()).map_err(|e| format!("{path}: {e}"))?;
-        entries.push((path.clone(), source));
-    }
-    let tree = MemoryDir::new(entries).map_err(|e| e.to_string())?;
-    let provider = MemoryMount {
-        profile: GameProfile::Fallout2,
-        loose: Some(tree),
-        ..MemoryMount::default()
-    }
-    .mount()
-    .map_err(|e| e.to_string())?;
-    let catalog = LocalPrototypeCatalog::for_game(&provider, GameProfile::Fallout2);
-    let path = format!("maps/{map}");
-    let bytes = layer
-        .files()
-        .get(&path)
-        .ok_or_else(|| format!("{path} is not in the layer"))?;
-    let parsed = MapFile::parse_for(bytes, &catalog, GameProfile::Fallout2)
-        .map_err(|e| format!("{path}: {e}"))?;
-
-    let neighbours =
-        |hex: i32| (0..6u8).filter_map(move |o| HexGrid::neighbor(hex, o).ok().flatten());
-    let border = |hex: i32| {
-        HexGrid::coordinates(hex)
-            .map(|[c, r]| c == 0 || r == 0 || c == 199 || r == 199)
-            .unwrap_or(true)
-    };
-    let mut blocked = vec![false; HEXES];
-    let mut exits = Vec::new();
-    let mut blockers = 0usize;
-    for object in &parsed.objects.elevations[0] {
-        let Some(hex) = object.hex.filter(|h| (0..HEXES as i32).contains(h)) else {
-            continue;
-        };
-        if let ObjectState::Other {
-            detail: ObjectDetail::ExitGrid {
-                map: to, hex: at, ..
-            },
-            ..
-        } = &object.state
-        {
-            exits.push((hex, *to, *at));
-        }
-        let stops = object.flags.0 & (BasicFlags::HIDDEN.0 | BasicFlags::NONBLOCKING.0) == 0
-            && matches!(Fid(object.art_id).category(), 1..=3);
-        if !stops {
-            continue;
-        }
-        blockers += 1;
-        blocked[hex as usize] = true;
-        if object.flags.contains(BasicFlags::MULTIHEX) {
-            for next in neighbours(hex) {
-                blocked[next as usize] = true;
-            }
-        }
-    }
-
-    let entry = parsed.header.entry_hex;
-    let mut parent = vec![-2i32; HEXES];
-    let mut queue = VecDeque::new();
-    if (0..HEXES as i32).contains(&entry) && !blocked[entry as usize] {
-        parent[entry as usize] = -1;
-        queue.push_back(entry);
-    }
-    while let Some(hex) = queue.pop_front() {
-        if border(hex) {
-            continue;
-        }
-        for next in neighbours(hex) {
-            if parent[next as usize] == -2 && !blocked[next as usize] {
-                parent[next as usize] = hex;
-                queue.push_back(next);
-            }
-        }
-    }
+    let walk_map = WalkMap::load(layer_dir, map)?;
+    let path = &walk_map.path;
+    let blocked = &walk_map.blocked;
+    let entry = walk_map.entry;
+    let parent = walk_map.flood_from_entry();
     let reached = parent.iter().filter(|p| **p != -2).count();
     println!(
-        "{path}: {} objects on elevation 0, {blockers} stop movement, {} hexes blocked",
-        parsed.objects.elevations[0].len(),
+        "{path}: {} objects on elevation 0, {} stop movement, {} hexes blocked",
+        walk_map.objects,
+        walk_map.blockers,
         blocked.iter().filter(|b| **b).count()
     );
     println!("entry hex {entry}: {reached} hexes reachable");
-    exits.sort_unstable();
-    for &(hex, to, at) in &exits {
-        if parent[hex as usize] == -2 {
+    for exit in &walk_map.exits {
+        let (hex, to, at) = (exit.hex, exit.to_map, exit.to_hex);
+        let route = route::path_to(&parent, hex);
+        if route.is_empty() {
             println!("exit {hex} -> map {to} hex {at}: NOT reachable from the entry");
             continue;
         }
-        let mut route = vec![hex];
-        while let Some(&last) = route.last() {
-            let before = parent[last as usize];
-            if before < 0 {
-                break;
-            }
-            route.push(before);
-        }
-        route.reverse();
-        let mut waypoints: Vec<i32> = route.iter().copied().skip(1).step_by(hop.max(1)).collect();
-        if waypoints.last() != Some(&hex) {
-            waypoints.push(hex);
-        }
+        let waypoints = route::waypoints(&route, hop);
         println!(
             "exit {hex} -> map {to} hex {at}: {} steps, waypoints {waypoints:?}",
             route.len() - 1
@@ -539,36 +445,19 @@ pub fn walk(layer_dir: &Path, map: &str, hop: usize, from: &[i32]) -> Result<(),
     // Arrival points: what each reaches without stepping on an exit grid,
     // and whether that includes the entry hex. One that does not leaves the
     // walker no way on except back through an exit.
-    let on_exit: Vec<bool> = {
-        let mut on = vec![false; HEXES];
-        for (hex, _, _) in &exits {
-            on[*hex as usize] = true;
-        }
-        on
-    };
+    let on_exit = walk_map.exit_mask();
     for &start in from {
         if !(0..HEXES as i32).contains(&start) || blocked[start as usize] {
             println!("from {start}: not a free hex");
             continue;
         }
-        let mut seen = vec![false; HEXES];
-        seen[start as usize] = true;
-        let mut queue = VecDeque::from([start]);
-        let mut count = 0usize;
-        while let Some(hex) = queue.pop_front() {
-            count += 1;
-            if border(hex) {
-                continue;
-            }
-            for next in neighbours(hex) {
-                let n = next as usize;
-                if !seen[n] && !blocked[n] && !on_exit[n] {
-                    seen[n] = true;
-                    queue.push_back(next);
-                }
-            }
-        }
-        let free = (0..HEXES as i32).contains(&entry) && seen[entry as usize];
+        // The start itself may be an exit grid's arrival hex, never an
+        // exit grid: it is entered, not avoided.
+        let mut avoid = on_exit.clone();
+        avoid[start as usize] = false;
+        let seen = route::flood(blocked, &avoid, start);
+        let count = seen.iter().filter(|p| **p != -2).count();
+        let free = route::reached(&seen, entry);
         println!(
             "from {start}: {count} hexes without crossing an exit grid; entry {}",
             if free { "reachable" } else { "NOT reachable" }

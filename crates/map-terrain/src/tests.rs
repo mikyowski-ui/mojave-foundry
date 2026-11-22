@@ -37,6 +37,7 @@ fn base(quadrant: u8, texture: &str) -> LandLayer {
         texture: None,
         texture_hash: Some(texture.to_owned()),
         opacity: Vec::new(),
+        defaulted: None,
     }
 }
 
@@ -590,6 +591,295 @@ fn output_is_deterministic_and_independent_of_jobs() {
     );
 }
 
+/// FNV-1a over the library and the square entries.
+fn digest(ground: &Ground) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |b: u8| {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    for b in (ground.tiles.len() as u64).to_le_bytes() {
+        eat(b);
+    }
+    for tile in &ground.tiles {
+        tile.iter().copied().for_each(&mut eat);
+    }
+    for entry in &ground.squares {
+        entry.to_le_bytes().into_iter().for_each(&mut eat);
+    }
+    h
+}
+
+/// A gradient of vertex colours over a texture with detail at every
+/// phase: a 16 × 16 pattern of deterministic grain, so that the sixteen
+/// phase classes really differ.
+fn textured_gradient_world() -> World {
+    let a = hash('a');
+    let mut state = 0x1234_5678u32;
+    let mut rgba = Vec::with_capacity(16 * 16 * 4);
+    for _ in 0..16 * 16 {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let grain = 120 + (state >> 27) as u8 * 3;
+        rgba.extend_from_slice(&[grain, grain, grain, 255]);
+    }
+    let image = Image {
+        width: 16,
+        height: 16,
+        rgba,
+    };
+    let base = gradient_world();
+    World {
+        land: MemoryLand {
+            textures: [(a, image)].into_iter().collect(),
+            ..base.land
+        },
+        sampler: base.sampler,
+    }
+}
+
+#[test]
+fn todays_default_caps_give_the_output_they_gave_before() {
+    // Pinned on the library of before the large-cap work (k-means, the
+    // method callers get by default), at the cap today's map stage passes
+    // (977 free entries) and at the default cap.
+    let worlds = [
+        ("gradient", gradient_world()),
+        ("textured", textured_gradient_world()),
+    ];
+    let mut seen = Vec::new();
+    for (name, world) in &worlds {
+        for cap in [977, 2000] {
+            let ground = build(
+                world,
+                &[],
+                &TerrainOptions {
+                    library_cap: cap,
+                    ..options()
+                },
+            );
+            seen.push((
+                *name,
+                cap,
+                ground.stats.distinct_tiles,
+                ground.tiles.len(),
+                format!("{:016x}", digest(&ground)),
+            ));
+        }
+    }
+    let expected: Vec<(&str, usize, usize, usize, String)> = [
+        ("gradient", 977, 7600, 965, "0274ada47bdb5066"),
+        ("gradient", 2000, 7600, 1984, "55cfa9325b2345a5"),
+        ("textured", 977, 9758, 962, "24c546d9a80b70c1"),
+        ("textured", 2000, 9758, 1975, "bc6fc9e778a7825f"),
+    ]
+    .into_iter()
+    .map(|(n, c, d, t, h)| (n, c, d, t, h.to_owned()))
+    .collect();
+    assert_eq!(seen, expected);
+}
+
+/// The per-square substitution error of `ground` against `exact` (the same
+/// ground with no cap), as `GroundStats` measures it.
+fn square_errors(ground: &Ground, exact: &Ground) -> Vec<f64> {
+    let map = palette_map();
+    (0..SQUARES)
+        .map(|q| {
+            let own = &exact.tiles[usize::from(exact.squares[q])];
+            let used = &ground.tiles[usize::from(ground.squares[q])];
+            let mut sum = 0.0;
+            let mut n = 0;
+            for (&a, &b) in own.iter().zip(used) {
+                if a != 0 {
+                    let (la, lb) = (map.oklab(a), map.oklab(b));
+                    sum += (0..3).map(|k| (la[k] - lb[k]).powi(2)).sum::<f64>().sqrt();
+                    n += 1;
+                }
+            }
+            sum / f64::from(n.max(1))
+        })
+        .collect()
+}
+
+fn greedy(cap: usize, jobs: usize) -> TerrainOptions {
+    TerrainOptions {
+        library_cap: cap,
+        library_method: LibraryMethod::GreedyMerge,
+        jobs,
+        ..options()
+    }
+}
+
+#[test]
+fn the_greedy_merge_at_a_large_cap_is_deterministic_and_honours_the_cap() {
+    let world = textured_gradient_world();
+    let one = build(&world, &[], &greedy(4090, 1));
+    let four = build(&world, &[], &greedy(4090, 4));
+    assert_eq!(one.tiles, four.tiles);
+    assert_eq!(one.squares, four.squares);
+    assert_eq!(
+        one.stats.mean_substitution_error,
+        four.stats.mean_substitution_error
+    );
+    assert_eq!(
+        one.stats.worst_substitution_error,
+        four.stats.worst_substitution_error
+    );
+    assert_eq!(
+        one.stats.substituted_squares,
+        four.stats.substituted_squares
+    );
+    let again = build(&world, &[], &greedy(4090, 3));
+    assert_eq!(digest(&again), digest(&four));
+
+    let s = &four.stats;
+    assert!(s.distinct_tiles > 4090, "{s:?}");
+    assert!(four.tiles.len() <= 4090);
+    // The merge fills the cap; only the seam pass may leave a few unused.
+    assert!(four.tiles.len() > 4000, "{}", four.tiles.len());
+    assert_eq!(s.clusters, four.tiles.len());
+    assert_eq!(s.tiles_after, four.tiles.len());
+    assert!(s.substituted_squares >= s.distinct_tiles - 4090);
+    assert!(s.mean_substitution_error > 0.0);
+    assert!(s.mean_substitution_error <= s.worst_substitution_error);
+    let mut first = vec![usize::MAX; four.tiles.len()];
+    for (q, &e) in four.squares.iter().enumerate() {
+        first[usize::from(e)] = first[usize::from(e)].min(q);
+    }
+    assert!(first.windows(2).all(|w| w[0] < w[1]));
+    // The stats agree with an independent count.
+    let exact = build(
+        &world,
+        &[],
+        &TerrainOptions {
+            library_cap: SQUARES,
+            ..options()
+        },
+    );
+    let errors = square_errors(&four, &exact);
+    let mean = errors.iter().sum::<f64>() / SQUARES as f64;
+    assert!(
+        (mean - s.mean_substitution_error).abs() < 1e-6,
+        "{mean} vs {s:?}"
+    );
+    // A substitute always comes from the square's own phase class: squares
+    // four apart along s and t see the texture at the same offset.
+    let [ps, pt] = s.phase_period;
+    let class = |q: usize| ((99 - q % 100) % ps, (q / 100) % pt);
+    let mut owner_class = vec![None; four.tiles.len()];
+    for q in 0..SQUARES {
+        let slot = &mut owner_class[usize::from(four.squares[q])];
+        assert!(slot.is_none_or(|c| c == class(q)), "square {q}");
+        *slot = Some(class(q));
+    }
+}
+
+#[test]
+fn the_greedy_merge_has_lower_error_than_k_means() {
+    let world = textured_gradient_world();
+    for cap in [977, 4090] {
+        let kmeans = build(
+            &world,
+            &[],
+            &TerrainOptions {
+                library_cap: cap,
+                ..options()
+            },
+        );
+        let merged = build(&world, &[], &greedy(cap, 4));
+        assert!(
+            merged.stats.mean_substitution_error < kmeans.stats.mean_substitution_error,
+            "cap {cap}: {:?} vs {:?}",
+            merged.stats,
+            kmeans.stats
+        );
+        assert!(merged.tiles.len() <= cap);
+    }
+    // Below the distinct count nothing changes: no tile is substituted.
+    let roomy = build(&world, &[], &greedy(SQUARES, 4));
+    assert_eq!(roomy.stats.substituted_squares, 0);
+    assert_eq!(roomy.tiles.len(), roomy.stats.distinct_tiles);
+}
+
+#[test]
+fn the_greedy_merge_keeps_distinctive_overlay_tiles() {
+    // Bright marks baked over a few squares: each makes a tile unlike any
+    // other, so removing it would cost most, and the merge keeps it.
+    let world = textured_gradient_world();
+    let mark: Vec<u8> = (0..48 * 24)
+        .flat_map(|i| {
+            let v = if (i / 48 + i % 48) % 6 < 3 { 250 } else { 30 };
+            [v, 255 - v, 40, 255]
+        })
+        .collect();
+    let grid = HexGrid::default();
+    let marked: Vec<i32> = (0..24).map(|i| 1717 + i * 311).collect();
+    let overlays: Vec<Overlay> = marked
+        .iter()
+        .map(|&q| {
+            let corner = grid.square_corner(q, false).expect("corner");
+            Overlay {
+                origin: [corner[0] as i32 + 16, corner[1] as i32 + 6],
+                width: 48,
+                height: 24,
+                rgba: &mark,
+            }
+        })
+        .collect();
+    let exact = build(
+        &world,
+        &overlays,
+        &TerrainOptions {
+            library_cap: SQUARES,
+            ..options()
+        },
+    );
+    let mut under = vec![false; SQUARES];
+    for overlay in &overlays {
+        for y in 0..overlay.height as i32 {
+            for x in 0..overlay.width as i32 {
+                if let Some(q) =
+                    grid.pick_square([overlay.origin[0] + x, overlay.origin[1] + y], false)
+                {
+                    under[q as usize] = true;
+                }
+            }
+        }
+    }
+    let marked_error = |ground: &Ground| {
+        let errors = square_errors(ground, &exact);
+        let picked: Vec<f64> = (0..SQUARES)
+            .filter(|&q| under[q])
+            .map(|q| errors[q])
+            .collect();
+        picked.iter().sum::<f64>() / picked.len() as f64
+    };
+    let merged = build(&world, &overlays, &greedy(4090, 4));
+    let kmeans = build(
+        &world,
+        &overlays,
+        &TerrainOptions {
+            library_cap: 4090,
+            ..options()
+        },
+    );
+    // The squares a mark touches, slivers at the corners of the neighbours
+    // included (few pixels, but they show as a mark cut off at a tile
+    // edge), lose almost nothing: an order of magnitude less than the
+    // rest of the map, and below k-means.
+    let (m, k) = (marked_error(&merged), marked_error(&kmeans));
+    let overall = merged.stats.mean_substitution_error;
+    assert!(m < overall * 0.1, "under the marks {m}, overall {overall}");
+    assert!(m < k, "greedy {m} vs k-means {k}");
+    for &q in &marked {
+        let own = &exact.tiles[usize::from(exact.squares[q as usize])];
+        assert_eq!(
+            &merged.tiles[usize::from(merged.squares[q as usize])],
+            own,
+            "{q}"
+        );
+    }
+}
+
 #[test]
 fn missing_land_and_textures_are_counted_not_fatal() {
     let (a, lost) = (hash('a'), hash('f'));
@@ -615,10 +905,17 @@ fn missing_land_and_textures_are_counted_not_fatal() {
     assert!(s.fallback_pixels > 0, "{s:?}");
     assert!(s.missing_texture_pixels > 0);
     assert_eq!(s.missing_texture_layers, 2);
+    // The lost layer names a file; the absent base names nothing, and
+    // borrows its neighbour's texture.
+    assert_eq!(s.unnamed_texture_layers, 1);
+    assert_eq!(s.borrowed_base_layers, 1);
+    assert_eq!(
+        (s.defaulted_texture_layers, s.defaulted_texture_pixels),
+        (0, 0)
+    );
     assert_eq!((s.textures_loaded, s.textures_missing), (1, 1));
     assert_eq!((s.cells_with_land, s.cells_without_land), (15, 1));
-    // The missing tone defaults to the mean of the textures found: here the
-    // one texture's own colour.
+    // The missing blended layer is left out: the base shows through.
     let probe = Probe::new(&world, &options());
     let c = probe.at(&world, 500.0, 500.0);
     assert!(
@@ -633,6 +930,16 @@ fn missing_land_and_textures_are_counted_not_fatal() {
         },
     );
     assert_eq!(grey.at(&world, 500.0, 500.0), [128.0; 3]);
+    let flat = build(
+        &world,
+        &[],
+        &TerrainOptions {
+            missing_texture_rgb: Some([128, 128, 128]),
+            ..options()
+        },
+    );
+    assert_eq!(flat.stats.borrowed_base_layers, 0);
+    assert_eq!(flat.stats.missing_texture_pixels, s.missing_texture_pixels);
     let outside = probe.at(&world, -8000.0, -8000.0);
     assert_eq!(outside, DEFAULT_FALLBACK_RGB.map(f32::from));
 }
@@ -693,4 +1000,331 @@ fn options_are_validated() {
         );
     }
     assert!(options().validate().is_ok());
+}
+
+/// A texture of a hue with a little grain, so that tiles differ.
+fn grained(rgb: [u8; 3], seed: u32) -> Image {
+    let mut state = seed;
+    let mut rgba = Vec::with_capacity(8 * 8 * 4);
+    for _ in 0..64 {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let grain = (state >> 28) as u8;
+        rgba.extend_from_slice(&[rgb[0] + grain, rgb[1] + grain, rgb[2] + grain, 255]);
+    }
+    Image {
+        width: 8,
+        height: 8,
+        rgba,
+    }
+}
+
+fn defaulted(mut layer: LandLayer, reason: mir::LandDefault) -> LandLayer {
+    layer.defaulted = Some(reason);
+    layer
+}
+
+#[test]
+fn defaulted_layers_draw_their_texture_and_are_counted_apart() {
+    // Cell (0, 0) has the default texture as the base of quadrant 1 and as
+    // a blended layer over quadrant 0, exactly as an extract writes them.
+    let (a, d) = (hash('a'), hash('d'));
+    let make = |mark: bool| {
+        World::new(|cx, cy| {
+            if (cx, cy) != (0, 0) {
+                return Some(land(|_, _| 0.0, cx, cy, all_bases(&a)));
+            }
+            let mut layers = vec![base(0, &a), base(1, &d), base(2, &a), base(3, &a)];
+            layers.push(blended(0, 0, &d, |row, _| row as f32 / 16.0));
+            if mark {
+                layers[1] = defaulted(layers[1].clone(), mir::LandDefault::NoBaseLayer);
+                layers[4] = defaulted(layers[4].clone(), mir::LandDefault::NullTexture);
+            }
+            Some(land(|_, _| 0.0, cx, cy, layers))
+        })
+        .texture(&a, grained([150, 110, 70], 1))
+        .texture(&d, grained([90, 80, 60], 2))
+    };
+    let marked = build(&make(true), &[], &options());
+    let plain = build(&make(false), &[], &options());
+    // Drawn exactly as if the record had named the texture itself.
+    assert_eq!(marked.tiles, plain.tiles);
+    assert_eq!(marked.squares, plain.squares);
+    let s = &marked.stats;
+    assert_eq!(s.defaulted_texture_layers, 2);
+    assert!(s.defaulted_texture_pixels > 0, "{s:?}");
+    assert_eq!((s.missing_texture_layers, s.missing_texture_pixels), (0, 0));
+    assert_eq!(plain.stats.defaulted_texture_pixels, 0);
+    // Quadrant 1 of cell (0, 0) is the default texture's colour.
+    let world = make(true);
+    let c = Probe::new(&world, &options()).at(&world, 3000.0, 1000.0);
+    assert!(
+        (c[0] - 97.5).abs() < 8.0 && (c[2] - 67.5).abs() < 8.0,
+        "{c:?}"
+    );
+}
+
+#[test]
+fn a_hole_in_the_ground_borrows_the_nearest_base_and_is_still_counted() {
+    // Cell (0, 0) has no layer at all, as an old document of a record
+    // without base layers; everything else is red, and one far cell has a
+    // green blended layer, so the mean of the textures is not red.
+    let (r, g) = (hash('r'), hash('g'));
+    let world = World::new(|cx, cy| match (cx, cy) {
+        (0, 0) => Some(land(|_, _| 0.0, cx, cy, Vec::new())),
+        (-2, -2) => {
+            let mut layers = all_bases(&r);
+            layers.push(blended(0, 0, &g, |_, _| 1.0));
+            Some(land(|_, _| 0.0, cx, cy, layers))
+        }
+        _ => Some(land(|_, _| 0.0, cx, cy, all_bases(&r))),
+    })
+    .texture(&r, solid([200, 40, 40]))
+    .texture(&g, solid([40, 200, 40]));
+    let ground = build(&world, &[], &options());
+    let s = &ground.stats;
+    assert_eq!(s.missing_texture_layers, 4);
+    assert_eq!(s.unnamed_texture_layers, 4);
+    assert_eq!(s.borrowed_base_layers, 4);
+    assert!(s.missing_texture_pixels > 0);
+    let probe = Probe::new(&world, &options());
+    for (x, y) in [
+        (500.0, 500.0),
+        (3500.0, 500.0),
+        (500.0, 3500.0),
+        (3500.0, 3500.0),
+    ] {
+        assert_eq!(probe.at(&world, x, y), [200.0, 40.0, 40.0], "at {x}, {y}");
+    }
+    // The flat tone, when asked for, shows the hole.
+    let flat = Probe::new(
+        &world,
+        &TerrainOptions {
+            missing_texture_rgb: Some([0, 0, 255]),
+            ..options()
+        },
+    );
+    assert_eq!(flat.at(&world, 500.0, 500.0), [0.0, 0.0, 255.0]);
+    // With no texture anywhere to borrow, the base takes the mean colour.
+    let bare = World::new(|cx, cy| Some(land(|_, _| 0.0, cx, cy, Vec::new())));
+    let probe = Probe::new(&bare, &options());
+    assert_eq!(probe.at(&bare, 500.0, 500.0), [128.0; 3]);
+}
+
+#[test]
+fn a_missing_blended_layer_lets_the_layers_below_show_through() {
+    // Over a red base: a green layer, and a lost layer above it at full
+    // opacity in quadrant 0 only.
+    let (r, g, lost) = (hash('r'), hash('g'), hash('x'));
+    let world = World::new(|cx, cy| {
+        let mut layers = all_bases(&r);
+        layers.push(blended(0, 0, &g, |_, _| 0.5));
+        layers.push(blended(0, 1, &lost, |_, _| 1.0));
+        Some(land(|_, _| 0.0, cx, cy, layers))
+    })
+    .texture(&r, solid([200, 40, 40]))
+    .texture(&g, solid([40, 200, 40]));
+    let probe = Probe::new(&world, &options());
+    assert_eq!(probe.at(&world, 500.0, 500.0), [120.0, 120.0, 40.0]);
+    let ground = build(&world, &[], &options());
+    let s = &ground.stats;
+    assert_eq!(
+        (s.missing_texture_layers, s.unnamed_texture_layers),
+        (16, 0)
+    );
+    assert_eq!(s.textures_missing, 1);
+    assert!(s.missing_texture_pixels > 0);
+}
+
+/// No land anywhere, as in an interior cell, on flat ground.
+fn landless_world() -> World {
+    World {
+        land: MemoryLand::default(),
+        sampler: GroundSampler::flat(3456.0),
+    }
+}
+
+fn rgba_block(rgba: [u8; 4], width: u32, height: u32) -> Vec<u8> {
+    std::iter::repeat_n(rgba, (width * height) as usize)
+        .flatten()
+        .collect()
+}
+
+/// The squares any pixel of a screen rectangle belongs to.
+fn squares_under(origin: [i32; 2], width: i32, height: i32) -> std::collections::BTreeSet<i32> {
+    let grid = HexGrid::default();
+    let mut out = std::collections::BTreeSet::new();
+    for y in origin[1]..origin[1] + height {
+        for x in origin[0]..origin[0] + width {
+            if let Some(q) = grid.pick_square([x, y], false) {
+                out.insert(q);
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn no_land_and_one_overlay_composites_over_the_fallback() {
+    let world = landless_world();
+    let map = palette_map();
+    let plain = TerrainOptions {
+        dither_strength: 0.0,
+        ..options()
+    };
+    let blue = rgba_block([0, 0, 255, 255], 40, 20);
+    let overlays = [Overlay {
+        origin: [3900, 600],
+        width: 40,
+        height: 20,
+        rgba: &blue,
+    }];
+    let ground = build(&world, &overlays, &plain);
+    let s = &ground.stats;
+    assert_eq!((s.cells_with_land, s.textures_loaded), (0, 0));
+    assert_eq!(s.fallback_pixels, SQUARES as u64 * 1536);
+    assert_eq!(s.blank_squares, 0);
+    assert!(ground.blank_squares.is_empty());
+    assert_eq!(ground.blank_tile(), None);
+    let fallback = map.nearest(DEFAULT_FALLBACK_RGB);
+    let blue_index = map.nearest([0, 0, 255]);
+    let pixels = ground.compose_rect([3880, 580], 80, 60).expect("compose");
+    for y in 0..60 {
+        for x in 0..80 {
+            let inside = (20..60).contains(&x) && (20..40).contains(&y);
+            let expected = if inside { blue_index } else { fallback };
+            assert_eq!(pixels[y * 80 + x], expected, "({x}, {y})");
+        }
+    }
+}
+
+#[test]
+fn blank_ground_leaves_uncovered_squares_blank() {
+    let world = landless_world();
+    let map = palette_map();
+    let blank = TerrainOptions {
+        dither_strength: 0.0,
+        blank_without_land: true,
+        ..options()
+    };
+    let blue = rgba_block([0, 0, 255, 255], 40, 20);
+    let grey = rgba_block([200, 200, 200, 128], 30, 10);
+    let clear = rgba_block([255, 0, 0, 0], 40, 20);
+    let overlays = [
+        Overlay {
+            origin: [3900, 600],
+            width: 40,
+            height: 20,
+            rgba: &blue,
+        },
+        Overlay {
+            origin: [4300, 700],
+            width: 30,
+            height: 10,
+            rgba: &grey,
+        },
+        Overlay {
+            origin: [3000, 300],
+            width: 40,
+            height: 20,
+            rgba: &clear,
+        },
+    ];
+    let ground = build(&world, &overlays, &blank);
+    // Opaque over black, half-transparent over black, nothing.
+    let blue_index = map.nearest([0, 0, 255]);
+    let pixels = ground.compose_rect([3880, 580], 80, 60).expect("compose");
+    for y in 0..60 {
+        for x in 0..80 {
+            let inside = (20..60).contains(&x) && (20..40).contains(&y);
+            let expected = if inside { blue_index } else { 0 };
+            assert_eq!(pixels[y * 80 + x], expected, "({x}, {y})");
+        }
+    }
+    let half = ground.compose_rect([4300, 700], 30, 10).expect("compose");
+    assert!(half.iter().all(|&i| i == map.nearest([100, 100, 100])));
+    let clear_area = ground.compose_rect([3000, 300], 40, 20).expect("compose");
+    assert!(clear_area.iter().all(|&i| i == 0));
+    // Exactly the squares under a visible overlay are drawn.
+    let mut drawn = squares_under([3900, 600], 40, 20);
+    drawn.extend(squares_under([4300, 700], 30, 10));
+    assert_eq!(ground.blank_squares.len(), SQUARES);
+    assert_eq!(ground.stats.blank_squares, SQUARES - drawn.len());
+    let zero = ground.blank_tile().expect("a blank tile");
+    assert!(ground.tiles[usize::from(zero)].iter().all(|&i| i == 0));
+    for q in 0..SQUARES {
+        assert_eq!(ground.is_blank(q), !drawn.contains(&(q as i32)), "{q}");
+        assert_eq!(ground.squares[q] == zero, ground.is_blank(q), "{q}");
+    }
+    assert!(!ground.is_blank(SQUARES));
+}
+
+#[test]
+fn blank_ground_changes_nothing_where_there_is_land() {
+    let world = gradient_world();
+    let cap = TerrainOptions {
+        library_cap: 977,
+        ..options()
+    };
+    let before = build(&world, &[], &cap);
+    let after = build(
+        &world,
+        &[],
+        &TerrainOptions {
+            blank_without_land: true,
+            ..cap.clone()
+        },
+    );
+    assert_eq!(digest(&after), digest(&before));
+    assert_eq!(after.blank_squares, vec![false; SQUARES]);
+    assert_eq!(after.stats.blank_squares, 0);
+    assert_eq!(after.blank_tile(), None);
+}
+
+#[test]
+fn the_blank_tile_survives_reduction_and_is_never_a_substitute() {
+    // Land in the eastern half only, many distinct tiles, a tight cap.
+    let base = gradient_world();
+    let land = MemoryLand {
+        cells: base
+            .land
+            .cells
+            .into_iter()
+            .filter(|((cx, _), _)| *cx >= 0)
+            .collect(),
+        textures: base.land.textures,
+    };
+    let mut sampler = GroundSampler::flat(0.0);
+    for ((cx, cy), doc) in &land.cells {
+        sampler.insert(*cx, *cy, doc);
+    }
+    let world = World { land, sampler };
+    for method in [LibraryMethod::KMeans, LibraryMethod::GreedyMerge] {
+        let ground = build(
+            &world,
+            &[],
+            &TerrainOptions {
+                library_cap: 120,
+                library_method: method,
+                blank_without_land: true,
+                ..options()
+            },
+        );
+        assert!(ground.tiles.len() <= 120, "{}", ground.tiles.len());
+        let blank = ground.stats.blank_squares;
+        assert!(blank > 1000 && blank < SQUARES - 1000, "{blank}");
+        let zero = ground.blank_tile().expect("a blank tile");
+        for q in 0..SQUARES {
+            assert_eq!(
+                ground.squares[q] == zero,
+                ground.is_blank(q),
+                "{method:?} {q}"
+            );
+        }
+        let zeros = ground
+            .tiles
+            .iter()
+            .filter(|t| t.iter().all(|&i| i == 0))
+            .count();
+        assert_eq!(zeros, 1);
+    }
 }

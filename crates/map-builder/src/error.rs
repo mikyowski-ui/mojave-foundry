@@ -25,7 +25,8 @@ pub enum BuildError {
         /// The art directory, such as `scenery`.
         category: &'static str,
         cap: usize,
-        /// Entries of the base game's list.
+        /// Entries the list starts with: the base game's list, or the
+        /// reserved entries of a standalone one.
         base: usize,
         /// Entries the list would need.
         requested: usize,

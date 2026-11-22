@@ -2,9 +2,13 @@
 //! terrain, the synthetic palette, the CPU renderer.
 
 mod classes;
+mod interior;
+mod ladder;
+mod landmarks;
 mod overlays;
 mod slicing;
 mod town;
+mod visibility;
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -103,6 +107,10 @@ impl TestAssets {
             .with(
                 "huge",
                 mesh(&nif::fixture::box_mesh([5000.0, 5000.0, 400.0], WALL)),
+            )
+            .with(
+                "tower",
+                mesh(&nif::fixture::building([560.0, 420.0, 1400.0], WALL, ROOF)),
             )
     }
 }
@@ -223,6 +231,7 @@ pub(crate) fn reference(
         count: None,
         linked_ref: None,
         owner: None,
+        trigger_volume: false,
     }
 }
 

@@ -10,7 +10,7 @@ use crate::{ArtCategory, Role, SkipReason, estimate_with, strips};
 
 /// The canonical render of a reference, its indexed pixels and where it
 /// stands: ground point and offset to the drawn origin.
-fn expected(
+pub(super) fn expected(
     assets: &TestAssets,
     r: &Reference,
     ground: &GroundSampler,
@@ -42,7 +42,12 @@ fn expected(
 }
 
 /// The expected image of one reference on a screen big enough for it.
-fn expected_screen(canvas: &Canvas, indexed: &[u8], g: [i64; 2], offset: [i32; 2]) -> Screen {
+pub(super) fn expected_screen(
+    canvas: &Canvas,
+    indexed: &[u8],
+    g: [i64; 2],
+    offset: [i32; 2],
+) -> Screen {
     let left = g[0] + i64::from(offset[0]) + i64::from(canvas.origin[0]);
     let top = g[1] + i64::from(offset[1]) + i64::from(canvas.origin[1]);
     let mut screen = Screen::new(
@@ -59,7 +64,7 @@ fn expected_screen(canvas: &Canvas, indexed: &[u8], g: [i64; 2], offset: [i32; 2
     screen
 }
 
-fn composed(sliced: &Sliced, reference: &Reference, like: &Screen) -> Screen {
+pub(super) fn composed(sliced: &Sliced, reference: &Reference, like: &Screen) -> Screen {
     let mut screen = Screen::new(like.origin, like.width, like.height);
     let mine: Vec<&Placement> = sliced
         .placements
@@ -70,7 +75,7 @@ fn composed(sliced: &Sliced, reference: &Reference, like: &Screen) -> Screen {
     screen
 }
 
-fn house(id: u32, ground: &GroundSampler, xy: [f32; 2]) -> Reference {
+pub(super) fn house(id: u32, ground: &GroundSampler, xy: [f32; 2]) -> Reference {
     reference(
         id,
         "STAT",
@@ -83,7 +88,7 @@ fn house(id: u32, ground: &GroundSampler, xy: [f32; 2]) -> Reference {
     )
 }
 
-fn crate_ref(id: u32, ground: &GroundSampler, xy: [f32; 2], lift: f32) -> Reference {
+pub(super) fn crate_ref(id: u32, ground: &GroundSampler, xy: [f32; 2], lift: f32) -> Reference {
     reference(
         id,
         "STAT",
@@ -760,7 +765,14 @@ fn a_tight_budget_names_the_list_and_its_largest_contributors() {
         scenery: 10,
         items: 10,
     };
-    let error = run(&assets, &refs, &ground, &budget, &SlicerConfig::default()).unwrap_err();
+    let no_ladder = SlicerConfig {
+        ladder: crate::BudgetLadder {
+            enabled: false,
+            ..crate::BudgetLadder::default()
+        },
+        ..SlicerConfig::default()
+    };
+    let error = run(&assets, &refs, &ground, &budget, &no_ladder).unwrap_err();
     let SliceError::FidBudget {
         category,
         cap,

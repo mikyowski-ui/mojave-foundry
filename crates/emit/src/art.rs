@@ -5,6 +5,13 @@
 //! layer cannot append to a list: a layer's copy replaces the base copy
 //! whole. So an [`ArtList`] starts from the base game's list bytes, keeps
 //! them unchanged, and appends.
+//!
+//! **Standalone lists.** For a demonstration layer the owner approved
+//! (2026-11-22) a walls list and a floor-tile list that do not start from
+//! the base lists: [`ArtList::standalone`] keeps only the base entries the
+//! engine gives a meaning by position ([`standalone_reserved`]) and leaves
+//! the rest of the 4,096 to the layer. Stock maps then show the wrong art
+//! while such a layer is mounted.
 
 use crate::{EmitError, lst};
 use vault_formats::fid::{ALIASED_ANIMATIONS, ART_DIRECTORIES, CRITTER_CATEGORY, critter_suffix};
@@ -12,6 +19,29 @@ use vault_formats::{ArtCatalog, Fid, LstKind, LstTable};
 
 /// The most entries a FID can address: indexes 0 to 4,095.
 pub const FID_INDEX_CAP: usize = 1 << 12;
+
+/// `art/walls`.
+pub const WALL_CATEGORY: u8 = 3;
+/// `art/tiles`.
+pub const TILE_CATEGORY: u8 = 4;
+/// Floor and roof tile index 1 is the ordinary blank tile: a cleared tile
+/// pair is `(1, 1)` and roof index 1 is never drawn, while floor index 1
+/// is drawn like any other floor (SPEC-003 §2.8). Index 0 precedes it, so
+/// the first two positions are kept.
+pub const RESERVED_TILE_ENTRIES: usize = 2;
+
+/// How many leading base entries a standalone list of `category` keeps:
+/// [`RESERVED_TILE_ENTRIES`] for `art/tiles`, none for `art/walls` (the
+/// engine resolves a wall FID by its list index alone and gives no wall
+/// index a meaning of its own). `None` for every other list, which a
+/// layer may only extend.
+pub fn standalone_reserved(category: u8) -> Option<usize> {
+    match category {
+        WALL_CATEGORY => Some(0),
+        TILE_CATEGORY => Some(RESERVED_TILE_ENTRIES),
+        _ => None,
+    }
+}
 
 /// One category's art list: the base bytes plus appended names.
 #[derive(Debug, Clone)]
@@ -52,6 +82,49 @@ impl ArtList {
             bytes,
             names,
         })
+    }
+
+    /// Start from the first `keep` entries of the base list (all of them
+    /// when it has fewer), kept byte for byte, and drop the rest.
+    pub fn from_base_prefix(category: u8, base: &[u8], keep: usize) -> Result<Self, EmitError> {
+        directory(category)?;
+        let table = LstTable::parse(base, LstKind::Art)?;
+        let entries = &table.entries()[..keep.min(table.entries().len())];
+        // Each position's bytes in `base`: its read, plus one when a CRLF
+        // ended it (the reader turns CRLF into LF; a CR before an LF always
+        // goes that way).
+        let mut end = 0;
+        for entry in entries {
+            let mut length = entry.raw.len();
+            if entry.raw.ends_with(b"\n") && base.get(end + length - 1) == Some(&b'\r') {
+                length += 1;
+            }
+            end += length;
+        }
+        let prefix = base.get(..end).ok_or_else(|| EmitError::Lst {
+            line: entries.len(),
+            message: "the base list's kept entries run past its end".into(),
+        })?;
+        let kept = LstTable::parse(prefix, LstKind::Art)?;
+        if kept.entries() != entries {
+            return Err(EmitError::Lst {
+                line: entries.len(),
+                message: "the base list's first entries do not read back alone".into(),
+            });
+        }
+        Self::from_base(category, prefix)
+    }
+
+    /// A standalone list (see the module notes): the base entries
+    /// [`standalone_reserved`] names, then the layer's own. Refused for a
+    /// list that has no standalone form.
+    pub fn standalone(category: u8, base: &[u8]) -> Result<Self, EmitError> {
+        let name = directory(category)?;
+        let keep = standalone_reserved(category).ok_or_else(|| EmitError::Path {
+            path: format!("art/{name}/{name}.lst"),
+            message: "only the walls and tiles lists have a standalone form".into(),
+        })?;
+        Self::from_base_prefix(category, base, keep)
     }
 
     pub fn category(&self) -> u8 {

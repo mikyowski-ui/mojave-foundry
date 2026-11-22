@@ -52,13 +52,85 @@ pub struct SliceSpec {
     #[serde(default = "one")]
     pub interior_depth: u32,
     /// Centre of the map window in source units (`docs/contracts.md`
-    /// section 4). Defaults to the centre of the cell range.
+    /// section 4). Defaults to the centre of the cell range. On an interior
+    /// slice it is in the room's own coordinates, and defaults to the
+    /// centre of the chosen floor's navmesh.
     #[serde(default)]
     pub map_center: Option<[f32; 2]>,
+    /// Build this interior cell (its editor id) as a standalone demo map
+    /// instead of the exterior window. `x`, `y` and `worldspace` still say
+    /// what to extract: the room is reached through a door of those cells
+    /// (`interior_depth` at least 1). Needs `--standalone`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interior: Option<String>,
+    /// Interior only: the floor height (source units, the room's own
+    /// coordinates). Default: the largest navmesh storey's floor, or the
+    /// builder's dominant floor when the room has no storey.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floor_z: Option<f32>,
+    /// Interior only: place every person, including those the game data
+    /// starts disabled (by their own flag or by an enable parent).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub place_disabled: bool,
+    /// Interior only: people standing off the floor level are placed on
+    /// the nearest walkable hex instead of skipped.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub clamp_levels: bool,
+    /// Interior only: the slicer's ceiling cut above the floor (default
+    /// 210).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cut_height: Option<f32>,
+    /// Interior only: `[low, high]` above the floor in which up-facing
+    /// geometry is baked into the floor (default `[-16, 32]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floor_band: Option<[f32; 2]>,
+    /// Interior only: a reference reaching above the cut whose lowest point
+    /// is higher than this above the floor hangs from the ceiling and is
+    /// left out (default 160).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hang_clearance: Option<f32>,
+    /// Interior only: `[low, high]` around the floor (low at most 0, high
+    /// at least 0) whose navmesh is walkable (default `[-40, 100]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub walk_band: Option<[f32; 2]>,
+    /// Interior only: the source point `[x, y]` the player starts nearest.
+    /// Default: the room's first teleport door (lowest form key).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrance: Option<[f32; 2]>,
 }
 
 fn one() -> u32 {
     1
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+impl Default for SliceSpec {
+    /// An empty exterior slice: no name, no worldspace, no plugins (so not
+    /// valid as it stands), cell (0, 0), interior depth 1, every interior
+    /// setting off.
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            worldspace: String::new(),
+            plugins: Vec::new(),
+            x: [0, 0],
+            y: [0, 0],
+            interior_depth: one(),
+            map_center: None,
+            interior: None,
+            floor_z: None,
+            place_disabled: false,
+            clamp_levels: false,
+            cut_height: None,
+            floor_band: None,
+            hang_clearance: None,
+            walk_band: None,
+            entrance: None,
+        }
+    }
 }
 
 impl SliceSpec {
@@ -74,6 +146,7 @@ impl SliceSpec {
                 interior_depth: 1,
                 // The centre of exterior cell (-18, 0).
                 map_center: Some([-71_680.0, 2_048.0]),
+                ..Self::default()
             }),
             _ => None,
         }
@@ -139,10 +212,123 @@ impl SliceSpec {
         {
             return Err("map_center is not finite".to_owned());
         }
+        self.validate_interior()
+    }
+
+    fn validate_interior(&self) -> Result<(), String> {
+        let Some(id) = &self.interior else {
+            let set: Vec<&str> = [
+                ("floor_z", self.floor_z.is_some()),
+                ("place_disabled", self.place_disabled),
+                ("clamp_levels", self.clamp_levels),
+                ("cut_height", self.cut_height.is_some()),
+                ("floor_band", self.floor_band.is_some()),
+                ("hang_clearance", self.hang_clearance.is_some()),
+                ("walk_band", self.walk_band.is_some()),
+                ("entrance", self.entrance.is_some()),
+            ]
+            .into_iter()
+            .filter(|(_, on)| *on)
+            .map(|(key, _)| key)
+            .collect();
+            if set.is_empty() {
+                return Ok(());
+            }
+            return Err(format!(
+                "{} only apply to an interior slice (set interior = \"<editor id>\")",
+                set.join(", ")
+            ));
+        };
+        if id.is_empty()
+            || !id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(
+                "interior must be a cell editor id: letters, digits, '-' or '_'".to_owned(),
+            );
+        }
+        if self.interior_depth < 1 {
+            return Err(
+                "an interior slice needs interior_depth of at least 1: extract reaches the room \
+                 through a door of the cells"
+                    .to_owned(),
+            );
+        }
+        if self.floor_z.is_some_and(|z| !z.is_finite()) {
+            return Err("floor_z is not finite".to_owned());
+        }
+        if self
+            .entrance
+            .is_some_and(|p| !p.iter().all(|v| v.is_finite()))
+        {
+            return Err("entrance is not finite".to_owned());
+        }
+        let settings = self.interior_slice(0.0);
+        let cut = settings.cut_height;
+        if !(cut.is_finite() && cut > 0.0) {
+            return Err("cut_height must be a positive number".to_owned());
+        }
+        let [low, high] = settings.floor_band;
+        if !(low.is_finite() && high.is_finite() && low <= high && high < cut) {
+            return Err(
+                "floor_band must be [low, high] rising, with high under cut_height".to_owned(),
+            );
+        }
+        if self
+            .hang_clearance
+            .is_some_and(|h| !(h.is_finite() && h >= 0.0))
+        {
+            return Err("hang_clearance must be a number of at least 0".to_owned());
+        }
+        if let Some([low, high]) = self.walk_band
+            && !(low.is_finite() && high.is_finite() && low <= 0.0 && high >= 0.0)
+        {
+            return Err(
+                "walk_band must be [low, high] with low at most 0 and high at least 0".to_owned(),
+            );
+        }
         Ok(())
     }
 
-    /// The map window's centre in source units.
+    /// Whether this slice builds an interior room.
+    pub fn is_interior(&self) -> bool {
+        self.interior.is_some()
+    }
+
+    /// The slicer's interior settings for a floor at `floor_z`: the
+    /// defaults of `map_slicer::InteriorSlice::at`, overridden by the
+    /// slice's own.
+    pub fn interior_slice(&self, floor_z: f32) -> map_slicer::InteriorSlice {
+        let mut slice = map_slicer::InteriorSlice::at(floor_z);
+        if let Some(cut) = self.cut_height {
+            slice.cut_height = cut;
+        }
+        if let Some(band) = self.floor_band {
+            slice.floor_band = band;
+        }
+        if let Some(hang) = self.hang_clearance {
+            slice.hang_clearance = hang;
+        }
+        slice
+    }
+
+    /// The builder's interior settings for a floor at `floor_z` (the
+    /// entrance target is left to the caller).
+    pub fn interior_build(&self, floor_z: f32) -> map_builder::InteriorBuild {
+        let mut build = map_builder::InteriorBuild::new(floor_z);
+        if let Some([low, high]) = self.walk_band {
+            build.below = -low;
+            build.above = high;
+        }
+        build.clamp_levels = self.clamp_levels;
+        build
+    }
+
+    /// The map window's centre in source units. On an interior slice
+    /// without `map_center` this is the cell range's centre, which says
+    /// nothing about the room: the map stage takes the floor's navmesh
+    /// centre instead.
     pub fn center(&self) -> [f32; 2] {
         self.map_center.unwrap_or_else(|| {
             let mid = |r: [i32; 2]| (r[0] + r[1] + 1) as f32 * 0.5 * 4096.0;
@@ -183,6 +369,12 @@ pub struct Inputs {
     pub backend: foundry_render::Backend,
     /// Draw a one-pixel dark inner edge on sprites.
     pub outline: bool,
+    /// Standalone mode (owner decision, 2026-11-22, for demonstration
+    /// layers): the layer's wall and floor-tile lists replace Fallout 2's
+    /// instead of extending them, so nearly all 4,096 entries of each are
+    /// the map's. Stock maps draw the wrong walls and floors while such a
+    /// layer is mounted. Default `false`; only the map stage reads it.
+    pub standalone: bool,
 }
 
 impl Inputs {
@@ -205,6 +397,7 @@ impl Inputs {
             calibration: foundry_render::Calibration::default(),
             backend: foundry_render::Backend::Cpu,
             outline: false,
+            standalone: false,
         })
     }
 
@@ -217,6 +410,21 @@ impl Inputs {
         self.calibration = foundry_render::Calibration::from_toml(&text)
             .map_err(|e| ConvertError::stage("config", format!("{}: {e}", path.display())))?;
         Ok(self)
+    }
+
+    /// An interior slice builds a standalone demo map only: without
+    /// `--standalone` it is refused, before any stage runs.
+    pub fn check_mode(&self) -> Result<(), ConvertError> {
+        match &self.slice.interior {
+            Some(id) if !self.standalone => Err(ConvertError::Slice {
+                name: self.slice.name.clone(),
+                reason: format!(
+                    "interior {id} builds a standalone demo map (its own walls and tiles \
+                     lists); pass --standalone"
+                ),
+            }),
+            _ => Ok(()),
+        }
     }
 
     pub fn mir_dir(&self) -> PathBuf {
@@ -322,4 +530,153 @@ fn find_master(f2: &Path) -> Result<Option<PathBuf>, ConvertError> {
         return Err(error("neither master.dat nor data/color.pal is here"));
     }
     Ok(master)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ROOM: &str = r#"
+name = "room"
+worldspace = "TestWorld"
+plugins = ["Test.esm"]
+x = [-1, 1]
+y = [-1, 1]
+interior = "TestRoomInterior"
+"#;
+
+    #[test]
+    fn an_interior_slice_parses_with_defaults_and_round_trips() {
+        let spec = SliceSpec::from_toml(ROOM).expect("parses");
+        assert!(spec.is_interior());
+        assert_eq!(spec.interior.as_deref(), Some("TestRoomInterior"));
+        assert_eq!(spec.floor_z, None);
+        assert!(!spec.place_disabled && !spec.clamp_levels);
+        let slicer = spec.interior_slice(100.0);
+        assert_eq!(slicer, map_slicer::InteriorSlice::at(100.0));
+        let build = spec.interior_build(100.0);
+        assert_eq!(build, map_builder::InteriorBuild::new(100.0));
+        assert_eq!(SliceSpec::from_toml(&spec.to_toml()), Ok(spec));
+    }
+
+    #[test]
+    fn interior_settings_reach_the_slicer_and_the_builder() {
+        let text = format!(
+            "{ROOM}floor_z = 8128.0\nplace_disabled = true\nclamp_levels = true\n\
+             cut_height = 120.0\nfloor_band = [-80.0, 24.0]\nhang_clearance = 100.0\n\
+             walk_band = [-80.0, 60.0]\nentrance = [10.0, -20.0]\nmap_center = [5.0, 6.0]\n"
+        );
+        let spec = SliceSpec::from_toml(&text).expect("parses");
+        assert_eq!(spec.floor_z, Some(8128.0));
+        assert_eq!(spec.entrance, Some([10.0, -20.0]));
+        let slicer = spec.interior_slice(8128.0);
+        assert_eq!(slicer.cut_height, 120.0);
+        assert_eq!(slicer.floor_band, [-80.0, 24.0]);
+        assert_eq!(slicer.hang_clearance, 100.0);
+        let build = spec.interior_build(8128.0);
+        assert_eq!((build.below, build.above), (80.0, 60.0));
+        assert!(build.clamp_levels);
+        assert_eq!(build.entrance_near, None);
+        assert_eq!(SliceSpec::from_toml(&spec.to_toml()), Ok(spec));
+    }
+
+    #[test]
+    fn an_exterior_slice_writes_no_interior_keys() {
+        let spec = SliceSpec::preset("goodsprings").expect("a preset");
+        assert!(!spec.is_interior());
+        let text = spec.to_toml();
+        for key in [
+            "interior",
+            "floor_z",
+            "place_disabled",
+            "clamp_levels",
+            "cut_height",
+            "floor_band",
+            "hang_clearance",
+            "walk_band",
+            "entrance",
+        ] {
+            assert!(
+                !text.lines().any(|l| l.starts_with(&format!("{key} ="))),
+                "{key} in {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn bad_interior_settings_are_refused() {
+        let bad = [
+            ("x = [0, 0]\ny = [0, 0]\nfloor_z = 5.0\n", "only apply"),
+            (
+                "x = [0, 0]\ny = [0, 0]\nplace_disabled = true\n",
+                "only apply",
+            ),
+            (
+                "x = [0, 0]\ny = [0, 0]\ninterior = \"a room\"\n",
+                "editor id",
+            ),
+            ("x = [0, 0]\ny = [0, 0]\ninterior = \"\"\n", "editor id"),
+            (
+                "x = [0, 0]\ny = [0, 0]\ninterior = \"R\"\ninterior_depth = 0\n",
+                "interior_depth",
+            ),
+            (
+                "x = [0, 0]\ny = [0, 0]\ninterior = \"R\"\nfloor_z = nan\n",
+                "floor_z",
+            ),
+            (
+                "x = [0, 0]\ny = [0, 0]\ninterior = \"R\"\ncut_height = -1.0\n",
+                "cut_height",
+            ),
+            (
+                "x = [0, 0]\ny = [0, 0]\ninterior = \"R\"\ncut_height = 20.0\n",
+                "floor_band",
+            ),
+            (
+                "x = [0, 0]\ny = [0, 0]\ninterior = \"R\"\nfloor_band = [10.0, 0.0]\n",
+                "floor_band",
+            ),
+            (
+                "x = [0, 0]\ny = [0, 0]\ninterior = \"R\"\nwalk_band = [10.0, 40.0]\n",
+                "walk_band",
+            ),
+            (
+                "x = [0, 0]\ny = [0, 0]\ninterior = \"R\"\nhang_clearance = -3.0\n",
+                "hang_clearance",
+            ),
+            (
+                "x = [0, 0]\ny = [0, 0]\ninterior = \"R\"\nentrance = [inf, 0.0]\n",
+                "entrance",
+            ),
+        ];
+        for (body, expected) in bad {
+            let text = format!("name = \"r\"\nworldspace = \"W\"\nplugins = [\"T.esm\"]\n{body}");
+            let error = SliceSpec::from_toml(&text).expect_err(body);
+            assert!(error.contains(expected), "{body}: {error}");
+        }
+    }
+
+    #[test]
+    fn an_interior_run_needs_standalone() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut inputs = Inputs {
+            fnv_data: dir.path().to_owned(),
+            f2: dir.path().to_owned(),
+            f2_master: None,
+            out: dir.path().to_owned(),
+            slice: SliceSpec::from_toml(ROOM).expect("parses"),
+            jobs: 1,
+            calibration: foundry_render::Calibration::default(),
+            backend: foundry_render::Backend::Cpu,
+            outline: false,
+            standalone: false,
+        };
+        let error = inputs.check_mode().expect_err("refused").to_string();
+        assert!(error.contains("--standalone"), "{error}");
+        inputs.standalone = true;
+        assert!(inputs.check_mode().is_ok());
+        inputs.slice = SliceSpec::preset("goodsprings").expect("a preset");
+        inputs.standalone = false;
+        assert!(inputs.check_mode().is_ok());
+    }
 }

@@ -267,6 +267,14 @@ impl Land {
         self
     }
 
+    /// The quadrants, 0 to 3 in ascending order, that have no base layer
+    /// (`BTXT`). The engine draws its default land texture under such a
+    /// quadrant's blended layers, exactly as it does for a layer whose
+    /// texture is null; a record may store no `BTXT` at all.
+    pub fn quadrants_without_base(&self) -> impl Iterator<Item = u8> + '_ {
+        (0..4u8).filter(|q| !self.base_layers.iter().any(|b| b.quadrant == *q))
+    }
+
     /// The height at `(row, column)`, row 0 south and column 0 west.
     pub fn height(&self, row: usize, column: usize) -> Option<f32> {
         if row >= LAND_GRID || column >= LAND_GRID {
@@ -520,6 +528,7 @@ typed_record!(TextureSet, TXST);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::records::{Record, TypedRecord};
 
     fn vhgt(offset: f32, gradients: &[i8]) -> Vec<u8> {
         let mut data = offset.to_le_bytes().to_vec();
@@ -556,6 +565,42 @@ mod tests {
         // Row 3 starts from row 2's first vertex, not its last.
         assert_eq!(h[99], 96.0);
         assert_eq!(h[LAND_VERTICES - 1], 96.0);
+    }
+
+    #[test]
+    fn absent_base_layers_and_null_layer_textures_survive_decoding() {
+        // Three quadrants with a base, the north-west one without, and a
+        // blended layer whose land texture is null: both mean the engine's
+        // default land texture.
+        let mut land = Land::new(0x0100_0D00);
+        land.base_layers = [0u8, 1, 3]
+            .iter()
+            .map(|&quadrant| BaseLayer {
+                texture: FormId(0x0100_0A01),
+                quadrant,
+                layer: -1,
+            })
+            .collect();
+        land.alpha_layers = vec![AlphaLayer {
+            texture: FormId::NULL,
+            quadrant: 2,
+            layer: 0,
+            opacity: vec![AlphaPoint {
+                position: 18,
+                opacity: 0.5,
+            }],
+        }];
+        let Record::Land(decoded) = land.to_raw().decode() else {
+            panic!("not a land record");
+        };
+        assert_eq!(decoded, land);
+        assert!(decoded.unknown.is_empty());
+        assert_eq!(decoded.quadrants_without_base().collect::<Vec<_>>(), [2]);
+        assert!(decoded.alpha_layers[0].texture.is_null());
+        assert_eq!(
+            Land::new(1).quadrants_without_base().collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
     }
 
     #[test]

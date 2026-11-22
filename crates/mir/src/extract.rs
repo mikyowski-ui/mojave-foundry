@@ -220,7 +220,8 @@ pub fn extract(options: &ExtractOptions) -> Result<ExtractSummary, MirError> {
     }
     lap(&mut summary, "records.sqlite");
 
-    let built = cells::build(&index, &options.slice)?;
+    let default_land = crate::landscape::default_land_texture(&options.data_dir);
+    let built = cells::build(&index, &options.slice, &default_land.path)?;
     lap(&mut summary, "cells");
     let mut exteriors = built.exteriors;
     let mut interiors = built.interiors;
@@ -455,6 +456,7 @@ pub fn extract(options: &ExtractOptions) -> Result<ExtractSummary, MirError> {
         skeleton_info: skeletons.info,
         animation_info: animations.info,
         issues: built.issues,
+        default_land_texture: Some(default_land.path),
     };
     write_atomic(&out.join(MANIFEST), &json_bytes(&manifest, true)?)?;
 

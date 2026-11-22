@@ -1,0 +1,27 @@
+# The Ultra-Luxe casino: an interior demo room (owner brief, 2026-11-22).
+# Coordinates only: the Strip exterior cells (slices/strip.toml), through
+# whose doors extract reaches the room, and the room's cell editor id.
+# Run with --standalone; see README.md. Everyone the data places is placed.
+# One navmesh storey on three levels: the sunken gaming pit and central
+# bar (z ~7554 to 7568), its steps and tables (z ~7616 to 7632) and the
+# upper ring and side halls (z ~7680). The default floor (z 7680, walk
+# band -40 to 100) left the pit out: a black hole, 177 references below
+# the floor, and 15 of 21 people (Heck Gunderson among them) "on another
+# level". floor_z 7616 with the bands below covers all three levels: the
+# whole navmesh is walkable, the pit and ring floors are baked, everyone
+# stands. Ceiling cut 210 above z 7616 (z 7826, 146 over the ring), chosen
+# on engine frames at 274 (the default 210 over the ring), 210 and 150:
+# 210 opens the side rooms and keeps the paintings and the palms; at 150
+# the palms and the hall plants are cut through and the paintings go.
+name = "ultra-luxe"
+worldspace = "TheStripWorldNew"
+plugins = ["FalloutNV.esm"]
+x = [-4, 2]
+y = [-2, 3]
+interior_depth = 1
+interior = "ULCasino"
+place_disabled = true
+floor_z = 7616.0
+walk_band = [-80.0, 130.0]
+floor_band = [-70.0, 80.0]
+cut_height = 210.0

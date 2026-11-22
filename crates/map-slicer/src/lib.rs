@@ -3,15 +3,21 @@
 //! [`slice_statics`] takes the static references placed in one map window
 //! and decides what each becomes ([`classify`]):
 //!
-//! - **skipped**: deleted, disabled (also through an enable parent), not
-//!   scenery, without a mesh, an effect or marker by its model path, or an
-//!   empty render;
-//! - **ground flat**: under `flat_height` tall (roads, decals), flattened
-//!   onto the floor and returned as an RGBA overlay in map screen space;
-//! - **ground relief**: rocks and cliffs by model path, or anything above
-//!   `max_sliced_hexes` of floor; rendered in full relief as an overlay,
-//!   the hexes under it returned in `blocked_hexes`. Relief is floor art:
-//!   it never occludes a character. That is an accepted limit of this pass;
+//! - **skipped**: deleted, disabled (also through an enable parent), an
+//!   invisible trigger volume, not scenery, without a mesh, an effect or
+//!   marker by its model path, or an empty render;
+//! - **ground flat**: under `flat_height` tall (roads, decals), or a paved
+//!   slab by its model path under `slab_height` that is wide and solid
+//!   enough not to be a kerb; flattened onto the floor and returned as an
+//!   RGBA overlay in map screen space;
+//! - **ground relief**: rocks and cliffs by model path, and terrain pieces
+//!   (`terrain_patterns`) above `max_sliced_hexes`; rendered in full relief
+//!   as an overlay, the hexes under it returned in `blocked_hexes`. Relief
+//!   is floor art: it never occludes a character. That is an accepted
+//!   limit of this pass;
+//! - **landmark**: anything else above `max_sliced_hexes` of floor (a
+//!   casino tower, a hangar, a power plant): upright, in pieces in the
+//!   scenery list (see "Landmarks");
 //! - **sprite**: items, doors, containers, vegetation by model path,
 //!   scenery of at most `sprite_max_hexes` of floor, and sparse meshes
 //!   (wires spanning a huge box: triangle area under `sparse_ratio` of the
@@ -21,9 +27,16 @@
 //!   per-hex strips in the walls list.
 //!
 //! Defaults (tuned on a real desert town window, about 1,350 references):
-//! flat under 35 units; sprites up to 2 hexes and 150 units long; relief
-//! above 2,500 hexes; sparse below 0.15; strips under 48 pixels merged;
-//! interior row runs merged whole, perimeter row runs in threes.
+//! flat under 35 units, paved slabs under 48; sprites up to 2 hexes and 150
+//! units long; landmarks (or terrain relief) above 2,500 hexes, in pieces
+//! of at most 512 x 352 pixels, at most 160; sparse below 0.15; strips under 48
+//! pixels merged; interior row runs merged whole, perimeter row runs in
+//! threes.
+//!
+//! Model path patterns match path segments and word starts, not
+//! substrings: `rock` is a rock in `nv_rocks\` and `tst_rockcanyon06.nif`
+//! but not in `shamrock.nif`, and `!rocket` excludes rockets (the rules are
+//! in the `pattern` module and on [`SlicerConfig::skip_patterns`]).
 //!
 //! # Map screen space and anchoring
 //!
@@ -65,19 +78,101 @@
 //! to front. Recomposing every strip at its hex reproduces the object's
 //! render exactly.
 //!
+//! # Landmarks
+//!
+//! A landmark is rendered like a sliced object, and each pixel is owned by
+//! the hex its surface point stands over, as for strips. It is then placed
+//! as a few large [`Role::Scenery`] pieces, cut by three engine rules (the
+//! `landmark` module has the details, [`engine_view`] a model of the
+//! first):
+//!
+//! 1. **Drawn by hex, not by pixel.** The engine's 640 x 480 game view
+//!    draws an object only when its hex is among those a refresh visits,
+//!    a lattice over the 640 x 380 map view widened by about 320 pixels
+//!    each side and 240 above and below. So each piece is at most
+//!    `landmark_piece_max` across (512 x 352) and anchored at a hex whose
+//!    centre lies within `landmark_reach` of the piece's far edges: from
+//!    every view that shows one of its pixels, its hex is visited.
+//! 2. **Ordered by hex.** Flat objects first, then ascending hex number,
+//!    then list order. A pixel owned by hex `o` stands in front of a
+//!    walker on hex `H` when `o > H`. For every walkable hex whose walker
+//!    box (`walker_box`, 48 x 80) overlaps a piece, the piece is anchored
+//!    after every walker it has pixels in front of (more than
+//!    `landmark_sort_tolerance`), at the lowest such hex its window
+//!    holds: no walker is drawn over a wall, and as few as possible are
+//!    hidden by pixels that stand behind them. A piece whose window holds
+//!    no such hex is halved; a piece that hides a walker is cut at that
+//!    walker's hex number, so the pixels behind it leave. Both stop at
+//!    `landmark_max_pieces` (160). Pieces with one anchor share one frame.
+//! 3. **Where a walker may stand.** Hexes under the mesh above
+//!    `step_height`, and hexes owning a pixel of a surface above
+//!    `step_height`, are blocked: one sprite per piece cannot sort a
+//!    walker under a roof, in a wall or on a ledge. Open hexes stay open
+//!    and are sorted like any walker. After the cap, a hex whose walker
+//!    would still be drawn over pixels in front of it is sealed (blocked)
+//!    rather than left wrong; one still hidden is counted.
+//!
+//! [`LandmarkStats`] carries the tallies: pieces of the visibility cut,
+//! splits of each kind, walkers, walkers still hidden, sealed hexes.
+//! `landmark_walkers`, when the caller knows which hexes the map can make
+//! walkable at all, spares the pieces cut for walkers that cannot exist.
+//! Recomposing the pieces at their anchors reproduces the render exactly.
+//! A landmark that cannot be rendered (over `max_canvas_pixels`, a piece
+//! beyond the FRM limits, a render error) is baked as relief instead and
+//! listed in [`LandmarkStats::fallbacks`].
+//!
+//! # Interiors
+//!
+//! [`SlicerConfig::interior`] ([`InteriorSlice`]) slices an interior cell:
+//! every reference stands on one floor height whatever the terrain
+//! sampler says, up-facing triangles near the floor from every piece are
+//! baked into the ground overlays (composited first) and leave the strips,
+//! geometry above a ceiling cut is clipped away, and references above the
+//! cut, hanging from it or below the floor are skipped. The `interior`
+//! module has the rules; [`BudgetReport::interior`] the tallies. Off (the
+//! default), nothing changes.
+//!
 //! # Budget
 //!
 //! Art is deduplicated over the whole run by content (category, size,
-//! shift, pixels). [`Sliced::report`] carries the accounting; a demand above
-//! [`Budget`] is [`SliceError::FidBudget`]. [`estimate`] classifies and
-//! counts footprints without rendering, as a fast pre-check.
+//! shift, pixels). [`Sliced::report`] carries the accounting. When a list
+//! would overflow, the budget ladder ([`BudgetLadder`], on by default)
+//! climbs these steps in order, each only while a list is still over, and
+//! re-renders the window after each:
+//!
+//! 1. **Longer perimeter runs** (walls): `max_perimeter_run` becomes
+//!    `ladder.perimeter_run` (8). Exact for the engine's draw order; walls
+//!    come in wider pieces.
+//! 2. **Coarser strips** (walls): `min_strip_pixels` becomes
+//!    `ladder.min_strip_pixels` (192): more small pixel groups sort with a
+//!    neighbouring hex.
+//! 3. **Landmarks** (walls into scenery): the sliced models with the most
+//!    entries become landmarks, largest first, while the estimated bands
+//!    fit the scenery list's room, at most `ladder.max_landmarks` models.
+//! 4. **Demotion** (walls, scenery): the contributors with the fewest
+//!    entries of each list still over are baked into the ground as relief:
+//!    sliced models for walls, scenery sprites and landmarks for scenery.
+//!    Doors, containers and items are never demoted.
+//!
+//! Steps 3 and 4 pick from the last run's numbers and re-run, up to
+//! `ladder.max_rounds` times each. Every step taken, with the entries
+//! before and after, is in [`BudgetReport::ladder`]. Only when the last
+//! step still does not fit (or the items list is over) is the run a
+//! [`SliceError::FidBudget`], whose report carries the steps. A run that
+//! fits at once is returned exactly as without the ladder. [`estimate`]
+//! classifies and counts footprints without rendering, as a fast
+//! pre-check; it does not climb the ladder.
 
 mod classify;
 mod config;
+pub mod engine_view;
 mod error;
 mod floor;
 mod hex;
+mod interior;
+mod landmark;
 mod overlay;
+mod pattern;
 mod render;
 mod report;
 mod slice;
@@ -87,10 +182,14 @@ mod strips;
 mod tests;
 
 pub use classify::{Class, ClassKind, Footprint, MeshFacts, SkipReason, classify};
-pub use config::{Budget, SlicerConfig};
+pub use config::{Budget, BudgetLadder, SlicerConfig};
 pub use error::SliceError;
+pub use interior::InteriorSlice;
 pub use render::{Assets, MirAssets};
-pub use report::{BudgetReport, CategoryUse, ClassCount, Contributor, Spread, StripStats};
+pub use report::{
+    BudgetReport, CategoryUse, ClassCount, Contributor, InteriorStats, LadderKind, LadderStep,
+    LandmarkFallback, LandmarkStats, Spread, StripStats,
+};
 pub use slice::{estimate, estimate_with, slice_statics, slice_with};
 
 /// The art lists the slicer fills.
@@ -128,7 +227,7 @@ impl ArtCategory {
 pub enum Role {
     /// One strip of a sliced object (walls list).
     WallStrip,
-    /// A scenery sprite.
+    /// A scenery sprite, or one band of a landmark.
     Scenery,
     /// A door (scenery list).
     Door,
@@ -167,7 +266,7 @@ pub struct Placement {
     pub hex: i32,
     /// The object's own pixel offset, added after the FRM shift: the
     /// sub-hex position of a sprite, the height above the terrain of a
-    /// strip.
+    /// strip or a landmark band.
     pub displacement: [i32; 2],
     pub role: Role,
     /// The reference's form key.
@@ -205,10 +304,11 @@ pub struct Sliced {
     pub art: Vec<ArtImage>,
     /// Sorted by hex (the engine's draw order), then reference, then art.
     pub placements: Vec<Placement>,
-    /// Flat overlays first, then relief; composite in this order.
+    /// Flat overlays first, then relief; composite in this order. In
+    /// interior mode the baked floor comes before both.
     pub overlays: Vec<BakedOverlay>,
-    /// Hexes to block without an object of their own: under relief, and
-    /// the non-anchor hexes of merged interior runs. Sorted.
+    /// Hexes to block without an object of their own: under relief and
+    /// landmarks, and the non-anchor hexes of merged runs. Sorted.
     pub blocked_hexes: Vec<i32>,
     /// Sorted by reference.
     pub skipped: Vec<Skipped>,

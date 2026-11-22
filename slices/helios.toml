@@ -1,0 +1,10 @@
+# HELIOS One: a proof-of-concept window (owner brief, 2026-11-22).
+# Coordinates only: exterior cell ranges and a map centre in source units.
+# Run with --standalone; see README.md.
+name = "helios"
+worldspace = "WastelandNV"
+plugins = ["FalloutNV.esm"]
+x = [2, 7]
+y = [-4, 1]
+interior_depth = 1
+map_center = [21500.0, -4000.0]

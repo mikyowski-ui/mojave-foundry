@@ -13,9 +13,10 @@ use crate::error::MirError;
 use crate::finite;
 use crate::index::{Entry, Index, Key};
 use crate::model::{
-    CellDoc, CellLocation, CellRef, EnableParentDoc, InteriorEntry, Issue, LandDoc, LandLayer,
-    LayerOpacity, LockDoc, NavDoorLinkDoc, NavExternalLinkDoc, NavTriangleDoc, NavmeshDoc,
-    RefFlags, RefGroup, RefKind, Reference, SCHEMA_VERSION, Slice, TeleportDoc, Transform, cell_of,
+    CellDoc, CellLocation, CellRef, EnableParentDoc, InteriorEntry, Issue, LandDefault, LandDoc,
+    LandLayer, LayerOpacity, LockDoc, NavDoorLinkDoc, NavExternalLinkDoc, NavTriangleDoc,
+    NavmeshDoc, RefFlags, RefGroup, RefKind, Reference, SCHEMA_VERSION, Slice, TeleportDoc,
+    Transform, cell_of,
 };
 use crate::paths::{FormKey, normalize_mesh_path, normalize_texture_path};
 
@@ -55,6 +56,8 @@ struct BaseInfo {
 
 #[derive(Debug, Clone, Default)]
 struct LandTextureInfo {
+    /// The form is a land texture record that decodes.
+    found: bool,
     editor_id: Option<String>,
     texture: Option<String>,
 }
@@ -73,12 +76,27 @@ struct Builder<'i, 'a> {
     cells: BTreeMap<Key, Option<CellInfo>>,
     bases: BTreeMap<Key, BaseInfo>,
     land_textures: BTreeMap<Key, LandTextureInfo>,
+    /// The engine's default land texture, normalised.
+    default_land_texture: String,
     worlds: BTreeMap<Key, String>,
     issues: Vec<Issue>,
 }
 
 fn is_placed(sig: fnv_esm::Sig) -> bool {
     sig == sigs::REFR || sig == sigs::ACHR || sig == sigs::ACRE
+}
+
+/// Base record types whose references become trigger volumes when they
+/// carry a primitive: activators and talking activators.
+const TRIGGER_BASES: &[&str] = &["ACTI", "TACT"];
+
+/// Whether a reference is an invisible trigger or activator volume: a
+/// primitive (`XPRM`) on a reference to an activator. The same base placed
+/// without a primitive is an ordinary, visible activator, and a primitive
+/// on a marker (`STAT` room, collision and multibound markers), an
+/// acoustic space or a sound is not a trigger.
+fn is_trigger_volume(placed: &PlacedRef, base_sig: Option<&str>) -> bool {
+    placed.primitive.is_some() && base_sig.is_some_and(|sig| TRIGGER_BASES.contains(&sig))
 }
 
 /// A file stem for an interior: the lowercase editor id with anything but
@@ -100,7 +118,7 @@ pub(crate) fn interior_id(editor_id: Option<&str>, form: &FormKey) -> String {
 }
 
 impl<'i, 'a> Builder<'i, 'a> {
-    fn new(index: &'i Index<'a>) -> Self {
+    fn new(index: &'i Index<'a>, default_land_texture: &str) -> Self {
         let mut children: BTreeMap<Key, Vec<usize>> = BTreeMap::new();
         for (position, entry) in index.entries().iter().enumerate() {
             let sig = entry.sig();
@@ -116,6 +134,7 @@ impl<'i, 'a> Builder<'i, 'a> {
             cells: BTreeMap::new(),
             bases: BTreeMap::new(),
             land_textures: BTreeMap::new(),
+            default_land_texture: default_land_texture.to_owned(),
             worlds: BTreeMap::new(),
             issues: Vec::new(),
         }
@@ -215,6 +234,7 @@ impl<'i, 'a> Builder<'i, 'a> {
         if let Some(entry) = index.get(key).copied()
             && let Some(Record::LandTexture(ltex)) = self.decode(&entry)
         {
+            info.found = true;
             info.editor_id = ltex.common.editor_id.clone();
             let set = ltex
                 .texture_set
@@ -231,6 +251,43 @@ impl<'i, 'a> Builder<'i, 'a> {
         }
         self.land_textures.insert(key, info.clone());
         (Some(key), info)
+    }
+
+    /// The land texture of a layer, with the default land texture standing
+    /// in, and the reason, when the layer gives no usable one: a null form,
+    /// a form that is not a land texture of the plugin list, or a land
+    /// texture with no diffuse texture.
+    fn layer_texture(
+        &mut self,
+        entry: &Entry<'a>,
+        form: FormId,
+    ) -> (Option<Key>, LandTextureInfo, Option<LandDefault>) {
+        let (key, mut info) = self.land_texture(entry.plugin, form);
+        let reason = if form.is_null() {
+            Some(LandDefault::NullTexture)
+        } else if !info.found {
+            self.issue(
+                entry,
+                "a land layer names a form that is not a land texture of the plugin list; \
+                 the default land texture stands in",
+            );
+            Some(LandDefault::UnknownTexture)
+        } else if info.texture.is_none() {
+            self.issue(
+                entry,
+                format!(
+                    "the land texture {} has no diffuse texture; the default land texture stands in",
+                    key.map_or_else(String::new, |k| self.index.form_key(k).to_string())
+                ),
+            );
+            Some(LandDefault::NoTextureSet)
+        } else {
+            None
+        };
+        if reason.is_some() {
+            info.texture = Some(self.default_land_texture.clone());
+        }
+        (key, info, reason)
     }
 
     /// Where a cell is, for a teleport destination or a document. A door
@@ -302,6 +359,7 @@ impl<'i, 'a> Builder<'i, 'a> {
         }
         let key = |f: Option<FormId>| f.and_then(|f| index.form(plugin, f));
         let flags = placed.common.meta.flags;
+        let trigger_volume = is_trigger_volume(placed, base.as_ref().map(|b| b.sig.as_str()));
         let reference = Reference {
             form: index.form_key(entry.key),
             editor_id: placed.common.editor_id.clone(),
@@ -337,6 +395,7 @@ impl<'i, 'a> Builder<'i, 'a> {
             count: placed.count,
             linked_ref: key(placed.linked_ref),
             owner: key(placed.owner),
+            trigger_volume,
         };
         Some(Built {
             reference,
@@ -377,7 +436,7 @@ impl<'i, 'a> Builder<'i, 'a> {
         }
         let mut layers: Vec<(usize, LandLayer)> = Vec::new();
         for base in &land.base_layers {
-            let (key, info) = self.land_texture(entry.plugin, base.texture);
+            let (key, info, defaulted) = self.layer_texture(entry, base.texture);
             layers.push((
                 layers.len(),
                 LandLayer {
@@ -388,11 +447,29 @@ impl<'i, 'a> Builder<'i, 'a> {
                     texture: info.texture,
                     texture_hash: None,
                     opacity: Vec::new(),
+                    defaulted,
+                },
+            ));
+        }
+        // A quadrant that stores no base layer is drawn with the default
+        // land texture under its blended layers.
+        for quadrant in land.quadrants_without_base() {
+            layers.push((
+                layers.len(),
+                LandLayer {
+                    quadrant,
+                    layer: -1,
+                    land_texture: None,
+                    land_texture_editor_id: None,
+                    texture: Some(self.default_land_texture.clone()),
+                    texture_hash: None,
+                    opacity: Vec::new(),
+                    defaulted: Some(LandDefault::NoBaseLayer),
                 },
             ));
         }
         for alpha in &land.alpha_layers {
-            let (key, info) = self.land_texture(entry.plugin, alpha.texture);
+            let (key, info, defaulted) = self.layer_texture(entry, alpha.texture);
             let opacity: Vec<LayerOpacity> = alpha
                 .opacity
                 .iter()
@@ -418,6 +495,7 @@ impl<'i, 'a> Builder<'i, 'a> {
                     texture: info.texture,
                     texture_hash: None,
                     opacity,
+                    defaulted,
                 },
             ));
         }
@@ -539,8 +617,14 @@ impl<'i, 'a> Builder<'i, 'a> {
 }
 
 /// Builds the documents of the slice.
-pub(crate) fn build(index: &Index<'_>, slice: &Slice) -> Result<CellBuild, MirError> {
-    let mut builder = Builder::new(index);
+/// `default_land_texture` is the normalised path that stands in for a land
+/// layer with no usable land texture.
+pub(crate) fn build(
+    index: &Index<'_>,
+    slice: &Slice,
+    default_land_texture: &str,
+) -> Result<CellBuild, MirError> {
+    let mut builder = Builder::new(index, default_land_texture);
     let wanted = slice.worldspace.trim();
     let world = index
         .entries()
@@ -690,4 +774,27 @@ pub(crate) fn build(index: &Index<'_>, slice: &Slice) -> Result<CellBuild, MirEr
         interiors,
         issues,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fnv_esm::Primitive;
+
+    #[test]
+    fn only_a_primitive_on_an_activator_is_a_trigger_volume() {
+        let plain = PlacedRef::new(PlacedKind::Object, 0x900u32, 0x850u32, [0.0; 3], [0.0; 3]);
+        let volume = plain.clone().with_primitive(Primitive {
+            bounds: [64.0; 3],
+            shape: Primitive::SHAPE_BOX,
+            ..Primitive::default()
+        });
+        assert!(is_trigger_volume(&volume, Some("ACTI")));
+        assert!(is_trigger_volume(&volume, Some("TACT")));
+        assert!(!is_trigger_volume(&plain, Some("ACTI")));
+        for marker in ["STAT", "ASPC", "SOUN"] {
+            assert!(!is_trigger_volume(&volume, Some(marker)));
+        }
+        assert!(!is_trigger_volume(&volume, None));
+    }
 }

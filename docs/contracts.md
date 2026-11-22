@@ -416,9 +416,27 @@ standing in for the interior it opens on, and back to that same door.
 - A sliced object blocks the hexes within its bounding footprint, except
   those in `SlicerConfig::open_hexes`, which also never merge into a run.
   The map stage fills them from `map_builder::walk::standable_hexes` (the
-  navmesh and the slope limit, in cells that have a navmesh), keeping
-  only hexes within 6 steps of a teleporting door: opened everywhere, the
-  strips that can no longer merge overflow the walls list.
+  navmesh and the slope limit, in cells that have a navmesh). A run that
+  extends the base lists keeps only hexes within 6 steps of a teleporting
+  door (`DOOR_APPROACH`): opened everywhere, the strips that can no longer
+  merge overflow its walls list. A standalone run opens every standable
+  hex (`mojave_convert::map::OpenPolicy`); its budget ladder pays for the
+  extra strips. `map-report.md`'s `## Open hexes` gives the policy and the
+  counts.
+- The map stage hands the slicer the references whose origin lies in the
+  window. A standalone run also hands it every static (`STAT`, `SCOL`)
+  whose origin lies outside but whose placed bounding footprint overlaps
+  the window: left out, a control tower or a hotel wing straddling the
+  edge leaves the ground under it bare (at Nellis painted black in the
+  source). The slicer drops their pixels off the map.
+- `SlicerConfig::landmark_walkers` is every hex `map_builder::walk::verdicts`
+  calls walkable with nothing blocked (navmesh and slope, and slope alone
+  in cells without a navmesh), in both modes.
+- `BuildOptions::protected_hexes` is every hex of the slicer's merged strip
+  runs (`Placement::run`, first to last hex of its row). The slicer does
+  not report a landmark's blocked core apart from relief in
+  `Sliced::blocked_hexes`, so that core is left to the builder's own
+  test (`cover::Cover::stands_on`).
 - Walking surfaces of a sliced object near an open hex (facing up, 8 to
   80 units above the terrain) are not strip pixels. They are placed as
   `Role::FloorPiece`: scenery art with `FLAT | NONBLOCKING |
@@ -428,6 +446,150 @@ standing in for the interior it opens on, and back to that same door.
   translucency bit on the object exempts it, and `FLAT` alone does not.
 - A base prototype list does not always name its files by position; a new
   prototype whose conventional name is taken gets `mfNNNNNN.pro`.
+
+As built for the demonstration maps (2026-11-22):
+
+- **Standalone mode** (owner decision, 2026-11-22, for demonstration
+  layers only): `map_builder::BuildOptions::standalone`, set by
+  `mojave-convert map --standalone` and `all --standalone`. The layer's
+  `art/walls/walls.lst` starts empty and `art/tiles/tiles.lst` starts with
+  its two reserved entries only, so about 4,096 and 4,094 entries are the
+  map's. Every other art list, the prototype lists and the message files
+  are extended as before. Stock maps draw the wrong walls and floors while
+  such a layer is mounted. `verify_layer` accepts the two replaced lists
+  and names them in `VerifyReport::replaced_art_lists`; any other list
+  that drops base entries is still refused.
+- **Budgets.** `map_builder::art_budget(base_files, standalone)` gives, per
+  art list, the entries kept, free, and the builder's own share
+  (`available()` is the caller's). A standalone run gives the slicer and
+  the terrain library exactly `available()`. A run without the flag keeps
+  the numbers it always had (free entries less 8, tiles capped at 2,000),
+  computed from the same `art_budget`; a unit test pins the equality, and
+  the real Goodsprings layer is byte-identical. The mode is part of the map
+  stage's cache key only when set, so earlier keys stay valid.
+- **Terrain method.** `TerrainOptions::library_method`: standalone runs use
+  `LibraryMethod::GreedyMerge` (lower error than k-means at every cap
+  measured); other runs keep the default `KMeans`, and with it their bytes.
+- **Floor tile 1** is verified against the engine's rules: a cleared tile
+  pair is `(1, 1)` and roof index 1 is never drawn, while floor index 1 is
+  drawn like any other floor. Entries 0 and 1 are what a standalone tile
+  list keeps (`emit::RESERVED_TILE_ENTRIES`).
+- **Landmarks.** A mesh above `max_sliced_hexes` (2,500) that matches no
+  relief or terrain pattern is a landmark, `ClassKind::Landmark`: rendered
+  upright and placed as scenery **pieces** (not bands) of at most 512 x 352
+  pixels, at most 160 per landmark. The engine's 640 x 480 view draws an
+  object only when its anchor hex is within a margin around the screen,
+  so each piece is anchored near its own pixels, at a hex late enough in
+  the draw order that no walker is drawn over a wall; hexes where that
+  cannot hold are sealed. `LandmarkStats` counts `pieces`, `tiles` (pieces
+  of the visibility cut), `visibility_splits`, `sorting_splits`,
+  `walkers`, `hidden_walkers`, `sealed_hexes` and `unresolved_pieces`;
+  `map-report.md`'s `## Landmarks` lists them. A landmark that cannot be
+  drawn upright falls back to relief (`LandmarkStats::fallbacks`).
+- **Default land texture.** Land with no base layer, or a layer naming no
+  texture, draws with the game's default land texture (`mir`,
+  `map-terrain`); `GroundStats` counts `defaulted_texture_pixels`,
+  `defaulted_texture_layers`, `unnamed_texture_layers` and
+  `borrowed_base_layers`, summarised in `map-report.md`'s `## Ground`. It
+  changed 46 of the real Goodsprings map's 10,000 squares (15 squares
+  re-pointed, 6 tile images redrawn), and nothing else in its layer
+  (`out/baseline-goodsprings-2.sha`).
+- **Reach.** `map_builder` reports the entrance (`BuildReport::entrance`:
+  hex, how a figure there is drawn, whether it is in the largest
+  component, steps from the window centre), the written map's components
+  (`components`, with `unreachable_exits()` and `stranded_returns()`),
+  passages opened to islands holding an exit, a return or a critter
+  (`passages`, `opened_hexes`), islands left with the reason
+  (`islands_left`), and each exit's `grid_steps`. `map-report.md` has
+  `## Entrance`, `## Components`, `## Passages` and `## Islands left`, and
+  each exit line gives its grid steps and hexes.
+- **Budget ladder** (`SlicerConfig::ladder`, on by default; steps taken in
+  `BudgetReport::ladder`): when a list would overflow, (1) perimeter runs
+  merge up to 8 hexes, (2) strips under 192 pixels join a neighbour, (3)
+  the largest sliced models become landmarks, (4) the smallest
+  contributors are baked into the ground. Each step re-renders the window;
+  a run that fits at once is untouched. `map_slicer::estimate` is the fast
+  pre-check (`mojave-convert estimate`) and never climbs the ladder.
+- **Pattern rules.** Model path patterns match path segments and word
+  starts, not substrings: `dir\` a whole directory, `\name` a segment
+  start, `*name` anywhere, a plain `name` at a word start (also after the
+  name prefixes `nv` and `scol`), `!text` an exclusion. So `rock` matches
+  `nv_rocks\` but not `shamrock.nif`, and `!rocket` keeps rockets upright.
+- **Trigger volumes.** A reference whose base is an invisible trigger or
+  activator volume (`mir::Reference::trigger_volume`) is skipped,
+  `SkipReason::TriggerVolume`; `map-report.md` lists them.
+- **Report and features.** `map-report.md` gains `## Art lists` (mode,
+  budget given, per list replaced, base, kept, added, free before and
+  after), `## Budget ladder`, `## Landmarks` and `## Trigger volumes
+  skipped`. Beside it, `map-features.json` lists the map's largest
+  landmarks and wall-strip objects: the four largest landmarks first, then
+  all by placed pixels (`mojave_convert::map::rank_features`, which
+  `shots` also applies to a file it reads), with the hex under the centre of their drawn extent (or, when
+  that centre is off the grid, as for a tower cut by the map's edge, the
+  hex of the piece nearest it); `mojave-convert shots --auto` aims at
+  them, and takes a model a second time only when every other model has
+  had its turn. Neither file is in the layer. The map stage's cache key
+  is `map-8` (it was `map-7` before interior slices).
+
+### 9.5 Interiors (2026-11-22)
+
+An interior slice (`SliceSpec::interior`, the cell's editor id) builds one
+interior cell as a standalone demo map: one layer, one map, one storey,
+no exits. `mojave-convert` refuses it without `--standalone`
+(`Inputs::check_mode`, before extract). The chain, in `map.rs`
+(`interior_scene`):
+
+- **Cells and references.** The one interior document
+  (`Mir::interior`), every reference whose origin lies in the window (and
+  statics whose footprint reaches in). `x`, `y` and `worldspace` only say
+  what to extract; an unextracted room is an error naming the interiors
+  that were extracted.
+- **Floor.** `floor_z` from the slice, else `mir::storeys(&doc)[0]` (the
+  largest storey), else `map_builder::dominant_floor_z`. The ground is
+  `GroundSampler::flat(floor_z)`.
+- **Window.** Centred on `map_center` (room coordinates), else
+  `map_builder::navmesh_centre` of the floor band, else the centre of the
+  references' origins.
+- **Slicer.** `SlicerConfig::interior = SliceSpec::interior_slice(floor_z)`
+  (`InteriorSlice::at` with `cut_height`, `floor_band`, `hang_clearance`
+  overridden); `open_hexes` is every hex `walk::standable_hexes` gives
+  with the interior build options (`OpenPolicy::Everywhere`);
+  `landmark_walkers` as outdoors.
+- **Terrain.** `build_ground_from(&MemoryLand::default(), ...)` with
+  `blank_without_land`: the room's coordinates must never read the
+  worldspace's land. Every square `Ground::is_blank` reports becomes
+  `map_builder::BLANK_SQUARE` in `GroundTiles::squares`.
+- **Builder.** `BuildOptions::interior = SliceSpec::interior_build(floor_z)`
+  (`walk_band` `[low, high]` as `below = -low`, `above = high`;
+  `clamp_levels`), `entrance_near` = the slice's `entrance`, else the
+  position of the room's teleport door with the lowest form key; the
+  builder's interiors map (for exits) is not filled.
+- **People.** `critter_inputs`: with `place_disabled` the reference's
+  `initially_disabled` flag and its enable parent are ignored (deleted
+  references never place); several references to one actor each get a
+  placement; an actor with fewer than 1 hit point is left out as dead in
+  the data (an exterior still lifts it to 1); creatures are left out and
+  reported; a name several placements share gets an article in the
+  description ("You see a Powder Ganger."). Everyone left out comes back
+  as `PersonSkip` (name, reference, reason).
+- **Report and features.** `map-report.md` opens with `## Interior`:
+  cell, floor z and its source, walk band, window centre, entrance target,
+  every storey, cut settings and `BudgetReport::interior` tallies,
+  `BuildReport::interior_summary()`, people placed (name, reference, hex)
+  and left out (with the builder's skips). `map-features.json` gains
+  `interior` (the editor id) and `people` (name, reference, hex, ranked
+  by `rank_people`: names of their own first); both are absent on an
+  exterior map, whose file is unchanged.
+- **Shots.** On a map whose features name a room, `--auto` aims at the
+  entrance, then the people (`people_features`, kind `person`, the name as
+  the model), then the walls; a person's viewpoint needs only
+  `PERSON_SPREAD` (1) step from the others, the rest `INTERIOR_SPREAD`
+  (5) unless `--spread` is given, and the wide view is captured at
+  `INTERIOR_WIDE_ZOOM` (0.75, a frame about 1138 x 507) unless
+  `--wide-zoom` is given. The engine draws the wide view at its own pixel
+  scale whatever the zoom: 0.5 gives 1707 x 760 pixels, 1.0 854 x 380.
+- **Cache.** The slice's TOML (every new key) is in the key; an exterior
+  slice serialises none of them.
 
 ## 10. Characters (M4)
 

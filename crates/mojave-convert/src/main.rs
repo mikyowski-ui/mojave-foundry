@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand};
 use foundry_render::Backend;
 use mojave_convert::{
-    ConvertError, Inputs, SliceSpec, critters, gallery, map, pipeline, probe, sprites,
+    ConvertError, Inputs, SliceSpec, critters, gallery, map, pipeline, probe, shots, sprites,
 };
 
 #[derive(Parser)]
@@ -51,7 +51,23 @@ struct Common {
     outline: bool,
 }
 
+/// How the map stage treats Fallout 2's art lists.
+#[derive(Args)]
+struct Mode {
+    /// Replace Fallout 2's wall and floor-tile lists instead of extending
+    /// them (about 4,090 entries each, for demonstration maps). Stock maps
+    /// draw the wrong walls and floors while such a layer is mounted.
+    #[arg(long)]
+    standalone: bool,
+}
+
 impl Common {
+    fn inputs_in(&self, mode: &Mode) -> Result<Inputs, ConvertError> {
+        let mut inputs = self.inputs()?;
+        inputs.standalone = mode.standalone;
+        Ok(inputs)
+    }
+
     fn inputs(&self) -> Result<Inputs, ConvertError> {
         let slice = SliceSpec::resolve(&self.slice)?;
         let jobs = self
@@ -93,9 +109,46 @@ enum Command {
         preview: Option<String>,
     },
     /// Build the slice's Fallout 2 map and the mod layer that carries it.
-    Map(Common),
+    Map {
+        #[command(flatten)]
+        common: Common,
+        #[command(flatten)]
+        mode: Mode,
+    },
     /// Run every stage: extract, sprites, critters, map, gallery.
-    All(Common),
+    All {
+        #[command(flatten)]
+        common: Common,
+        #[command(flatten)]
+        mode: Mode,
+    },
+    /// After extract: the slicer's pre-check of the map window against the
+    /// art budget of the chosen mode, in seconds, rendering nothing.
+    Estimate {
+        #[command(flatten)]
+        common: Common,
+        #[command(flatten)]
+        mode: Mode,
+    },
+    /// Screenshots of a converted map, taken by the engine itself, headless.
+    Shots(ShotsArgs),
+    /// A contact page of PNG files, each under its label, scaled to fit.
+    Contact {
+        /// The page to write.
+        #[arg(long)]
+        out: PathBuf,
+        /// A title line.
+        #[arg(long)]
+        title: Option<String>,
+        /// Pictures to a row.
+        #[arg(long, default_value_t = 4)]
+        columns: u32,
+        /// Largest picture area per cell, `WIDTHxHEIGHT` pixels.
+        #[arg(long, default_value = "480x270")]
+        cell: String,
+        /// `LABEL=FILE.png`, or a file alone (labelled by its name).
+        pictures: Vec<String>,
+    },
     /// Write contact sheets of the rendered sprites.
     Gallery {
         #[command(flatten)]
@@ -107,6 +160,50 @@ enum Command {
     /// Read-only checks of the parsers against real files. Prints tallies only.
     #[command(subcommand)]
     Probe(Probe),
+}
+
+#[derive(Args)]
+struct ShotsArgs {
+    /// A vault-platform executable.
+    #[arg(long)]
+    engine: PathBuf,
+    /// The Fallout 2 install directory (holding master.dat and critter.dat).
+    #[arg(long)]
+    f2: PathBuf,
+    /// The --out directory of a converted slice (holding mods/mojave).
+    /// Shots go to <out>/shots/.
+    #[arg(long)]
+    out: PathBuf,
+    /// A hex to walk to and photograph (repeatable). An unreachable hex is
+    /// replaced by the reachable hex nearest it.
+    #[arg(long, value_name = "HEX")]
+    at: Vec<i32>,
+    /// Pick up to N viewpoints that show the map off: the entry, then the
+    /// reachable hexes nearest its largest landmarks and buildings (on an
+    /// interior demo, nearest its people first).
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    auto: usize,
+    /// The map's file name under maps/ (default: the map stage's exterior
+    /// map).
+    #[arg(long)]
+    map: Option<String>,
+    /// Steps per walk command; the engine's route search gives up on long
+    /// ones.
+    #[arg(long, default_value_t = 15)]
+    hop: usize,
+    /// Fewest hex steps between two automatic viewpoints (default 30, or
+    /// 5 on an interior demo).
+    #[arg(long)]
+    spread: Option<i32>,
+    /// The wide view's zoom (default 0.5, or 0.75 on an interior demo).
+    #[arg(long)]
+    wide_zoom: Option<f32>,
+    /// Engine processes at once.
+    #[arg(long, default_value_t = 2)]
+    jobs: usize,
+    /// Seconds an engine run may take before it is stopped.
+    #[arg(long, default_value_t = 600)]
+    timeout: u64,
 }
 
 #[derive(Subcommand)]
@@ -189,16 +286,16 @@ fn run(cli: Cli) -> Result<(), String> {
             println!("output: {}", inputs.critters_dir().display());
             Ok(())
         }
-        Command::Map(common) => {
-            let inputs = common.inputs().map_err(|e| e.to_string())?;
+        Command::Map { common, mode } => {
+            let inputs = common.inputs_in(&mode).map_err(|e| e.to_string())?;
             let summary = map::map(&inputs).map_err(|e| e.to_string())?;
             println!("map: {summary:#?}");
             println!("layer: {}", inputs.mod_dir().display());
             println!("report: {}", inputs.out.join("map-report.md").display());
             Ok(())
         }
-        Command::All(common) => {
-            let inputs = common.inputs().map_err(|e| e.to_string())?;
+        Command::All { common, mode } => {
+            let inputs = common.inputs_in(&mode).map_err(|e| e.to_string())?;
             let summary = pipeline::all(&inputs).map_err(|e| e.to_string())?;
             println!("sprites: {:?}", summary.sprites);
             println!("critters: {:?}", summary.critters);
@@ -206,6 +303,85 @@ fn run(cli: Cli) -> Result<(), String> {
             println!("gallery: {:?}", summary.gallery);
             println!("report: {}", inputs.mir_dir().join("report.md").display());
             println!("layer: {}", inputs.mod_dir().display());
+            Ok(())
+        }
+        Command::Estimate { common, mode } => {
+            let started = std::time::Instant::now();
+            let inputs = common.inputs_in(&mode).map_err(|e| e.to_string())?;
+            let summary = map::estimate(&inputs).map_err(|e| e.to_string())?;
+            println!("{summary}");
+            println!("\nDetail:\n{}", summary.report);
+            println!("time: {:.1} s", started.elapsed().as_secs_f64());
+            Ok(())
+        }
+        Command::Shots(args) => {
+            let options = shots::ShotsOptions {
+                engine: args.engine,
+                f2: args.f2,
+                out: args.out,
+                map: args.map,
+                at: args.at,
+                auto: args.auto,
+                hop: args.hop.max(1),
+                spread: args.spread,
+                wide_zoom: args.wide_zoom,
+                jobs: args.jobs,
+                timeout: std::time::Duration::from_secs(args.timeout),
+            };
+            let summary = shots::shots(&options).map_err(|e| e.to_string())?;
+            for shot in &summary.shots {
+                println!(
+                    "{:02} {:<4} hex {:>5} ({:>3} steps) arrived {:<3} camera {:<4} {} {}",
+                    shot.viewpoint,
+                    shot.view,
+                    shot.hex,
+                    shot.steps,
+                    if shot.arrived { "yes" } else { "no" },
+                    if shot.camera_followed { "on" } else { "held" },
+                    if shot.file.is_empty() {
+                        "-"
+                    } else {
+                        &shot.file
+                    },
+                    shot.error.as_deref().unwrap_or("")
+                );
+            }
+            println!(
+                "shots: {} viewpoints of {}; index {}",
+                summary.viewpoints,
+                summary.map,
+                summary.dir.join("index.json").display()
+            );
+            Ok(())
+        }
+        Command::Contact {
+            out,
+            title,
+            columns,
+            cell,
+            pictures,
+        } => {
+            let max_cell = cell
+                .split_once('x')
+                .and_then(|(w, h)| Some([w.parse().ok()?, h.parse().ok()?]))
+                .ok_or_else(|| format!("--cell {cell}: expected WIDTHxHEIGHT"))?;
+            let entries: Vec<(String, PathBuf)> = pictures
+                .iter()
+                .map(|p| match p.split_once('=') {
+                    Some((label, file)) => (label.to_owned(), PathBuf::from(file)),
+                    None => {
+                        let path = PathBuf::from(p);
+                        let label = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        (label, path)
+                    }
+                })
+                .collect();
+            shots::contact_page(&entries, title.as_deref(), columns, max_cell, &out)
+                .map_err(|e| e.to_string())?;
+            println!("contact: {}", out.display());
             Ok(())
         }
         Command::Gallery { common, filter } => {

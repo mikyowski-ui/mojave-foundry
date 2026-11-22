@@ -12,9 +12,13 @@ use sha2::{Digest, Sha256};
 use crate::classify::{Footprint, MeshFacts};
 use crate::floor;
 use crate::hex::{self, Plane};
+use crate::interior::{self, Split};
+use crate::landmark;
 use crate::overlay::{self, GroundPiece};
 use crate::render::{self, Assets, CanvasError, MirAssets};
-use crate::report::{BudgetReport, Contributor, Spread};
+use crate::report::{
+    BudgetReport, Contributor, InteriorStats, LadderKind, LadderStep, LandmarkFallback, Spread,
+};
 use crate::strips;
 use crate::{
     ArtCategory, ArtImage, Budget, Class, ClassKind, Placement, Role, SkipReason, Skipped,
@@ -44,7 +48,10 @@ pub fn slice_statics(
 /// Counts what [`slice_statics`] would need without rendering anything:
 /// references are classified and sliced objects counted by the hexes their
 /// footprint covers (perimeter hexes plus one per interior run when runs are
-/// merged). Meshes are read for their bounds and triangle area.
+/// merged), landmarks by the pieces of their drawn extent's visibility cut
+/// (sorting cuts are not foreseen, so a real run costs more). Meshes
+/// are read for their bounds and triangle area. The budget ladder is not
+/// climbed.
 pub fn estimate(
     mir: &Mir,
     references: &[Reference],
@@ -66,9 +73,26 @@ pub(crate) struct RenderKey {
     pub(crate) mesh: String,
     rotation: [i64; 3],
     scale: i64,
+    /// Interior mode, for a render that is split and cut: the origin's
+    /// height above the floor, rounded to a unit. `None` otherwise.
+    lift: Option<i64>,
 }
 
 impl RenderKey {
+    /// The key of a render split at the floor and cut at the ceiling, its
+    /// origin `lift` units above the floor.
+    pub(crate) fn lifted(self, lift: f32) -> Self {
+        RenderKey {
+            lift: Some(f64::from(lift).round() as i64),
+            ..self
+        }
+    }
+
+    /// The rounded lift of a split render.
+    pub(crate) fn lift(&self) -> Option<f32> {
+        self.lift.map(|v| v as f32)
+    }
+
     pub(crate) fn of(reference: &Reference, config: &SlicerConfig) -> Option<Self> {
         let q = |v: f32, step: f32| (f64::from(v) / f64::from(step)).round() as i64;
         Some(RenderKey {
@@ -78,6 +102,7 @@ impl RenderKey {
                 .rotation
                 .map(|a| q(a, config.rotation_quantum)),
             scale: q(reference.transform.scale, config.scale_quantum),
+            lift: None,
         })
     }
 
@@ -162,14 +187,27 @@ fn prepare<'r>(
 /// Where a reference stands in map screen space: its ground point rounded
 /// to a pixel, the rounded offset from there to its origin (its height),
 /// and the terrain height under it.
+#[cfg(test)]
 pub(crate) fn standing(
     projection: &Projection,
     window: &MapWindow,
     sampler: &GroundSampler,
     reference: &Reference,
 ) -> Option<([i64; 2], [i32; 2], f32)> {
+    standing_on(projection, window, sampler, None, reference)
+}
+
+/// [`standing`], on the common floor height `floor` when one is given
+/// (interior mode) instead of the terrain.
+pub(crate) fn standing_on(
+    projection: &Projection,
+    window: &MapWindow,
+    sampler: &GroundSampler,
+    floor: Option<f32>,
+    reference: &Reference,
+) -> Option<([i64; 2], [i32; 2], f32)> {
     let [x, y, z] = reference.transform.position;
-    let ground_z = sampler.height(x, y).unwrap_or(z);
+    let ground_z = floor.unwrap_or_else(|| sampler.height(x, y).unwrap_or(z));
     let anchor = [window.x_west, window.y_north, ground_z];
     let g = projection.screen(projection.tile_from_source(anchor, [x, y, ground_z]));
     let p = projection.screen(projection.tile_from_source(anchor, [x, y, z]));
@@ -252,6 +290,19 @@ impl ArtStore {
     }
 }
 
+/// The model a skipped reference is listed under: its model path; for a
+/// trigger volume whose base has none (the usual case: the volume is a
+/// primitive), `base <editor id>` when the base has one.
+fn skipped_model(r: &Reference, reason: &SkipReason) -> Option<String> {
+    match (&r.model, reason) {
+        (Some(model), _) => Some(model.clone()),
+        (None, SkipReason::TriggerVolume) => {
+            r.base_editor_id.as_ref().map(|id| format!("base {id}"))
+        }
+        (None, _) => None,
+    }
+}
+
 /// A skip found after classification moves its reference out of its class.
 fn demote(report: &mut BudgetReport, kind: ClassKind) {
     report.class_mut(kind).references -= 1;
@@ -259,7 +310,7 @@ fn demote(report: &mut BudgetReport, kind: ClassKind) {
 }
 
 /// Distance from a point to a convex polygon (0 inside).
-fn distance_to_polygon(polygon: &[[f64; 2]], p: [f64; 2]) -> f64 {
+pub(crate) fn distance_to_polygon(polygon: &[[f64; 2]], p: [f64; 2]) -> f64 {
     let n = polygon.len();
     if n == 0 {
         return f64::INFINITY;
@@ -296,10 +347,20 @@ fn distance_to_polygon(polygon: &[[f64; 2]], p: [f64; 2]) -> f64 {
         .fold(f64::INFINITY, f64::min)
 }
 
+/// Whether a reference of this class is split at the floor and cut at the
+/// ceiling indoors: everything rendered upright but doors, containers and
+/// carried items, which are drawn whole.
+fn splits(class: &Class) -> bool {
+    !matches!(
+        class,
+        Class::Sprite(Role::Item | Role::Door | Role::Container)
+    )
+}
+
 /// A strip blocks when its hex centre is within this many floor squares of
 /// the object's footprint: about half a hex, so a thin fence still blocks
 /// the hexes it crosses while eaves over open ground do not.
-const BLOCK_REACH: f64 = 0.3;
+pub(crate) const BLOCK_REACH: f64 = 0.3;
 
 /// [`slice_statics`] over any [`Assets`].
 #[allow(clippy::too_many_arguments)]
@@ -319,31 +380,351 @@ pub fn slice_with(
         Plane::new(projection, window.x_west, window.y_north).ok_or(SliceError::Projection)?;
     let tile_units = projection.tile_units();
     let prepared = prepare(assets, references, tile_units, config);
+    let inputs = Inputs {
+        assets,
+        window,
+        sampler,
+        projection,
+        map,
+        budget,
+        plane: &plane,
+    };
+    let first = run_once(&inputs, renderer, &prepared, &prepared.classes, config)?;
+    let done = if first.sliced.report.fits() || !config.ladder.enabled {
+        first
+    } else {
+        climb(&inputs, renderer, &prepared, config, first)?
+    };
+    done.sliced.report.check()?;
+    Ok(done.sliced)
+}
+
+/// What every run of one window shares.
+struct Inputs<'a> {
+    assets: &'a dyn Assets,
+    window: &'a MapWindow,
+    sampler: &'a GroundSampler,
+    projection: &'a Projection,
+    map: &'a PaletteMap,
+    budget: &'a Budget,
+    plane: &'a Plane,
+}
+
+/// One run's result, with every contributor (the report keeps the top).
+struct Run {
+    sliced: Sliced,
+    contributors: Vec<Contributor>,
+}
+
+impl Run {
+    fn used(&self) -> [usize; 3] {
+        self.sliced.report.used()
+    }
+
+    /// How far a list is over its free entries (negative: room left).
+    fn over(&self, category: ArtCategory) -> i64 {
+        -self.sliced.report.category(category).headroom()
+    }
+}
+
+/// The model key contributors are counted under.
+fn model_of(reference: &Reference) -> String {
+    reference.model.clone().unwrap_or_default()
+}
+
+/// Scenery entries a reference would cost as a landmark: its bounding
+/// box's drawn extent in pieces of the visibility cut (an estimate; sorting
+/// may cut more, whole-hex copies share art).
+fn landmark_estimate(
+    prepared: &Prepared<'_>,
+    i: usize,
+    projection: &Projection,
+    config: &SlicerConfig,
+) -> usize {
+    let r = prepared.refs[i];
+    let Some(Some(Ok((_, facts)))) = r.mesh.as_ref().map(|h| prepared.meshes.get(h)) else {
+        return 1;
+    };
+    let Some(bounds) = facts.bounds else {
+        return 1;
+    };
+    let m = r.transform.matrix();
+    let anchor = r.transform.position;
+    let mut b = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
+    for corner in 0..8 {
+        let local = [
+            bounds[corner & 1][0],
+            bounds[(corner >> 1) & 1][1],
+            bounds[(corner >> 2) & 1][2],
+        ];
+        let p = [0, 1, 2].map(|row| {
+            m[row][0] * local[0] + m[row][1] * local[1] + m[row][2] * local[2] + m[row][3]
+        });
+        let s = projection.screen(projection.tile_from_source(anchor, p));
+        let (x, y) = (f64::from(s[0]), f64::from(s[1]));
+        b = [b[0].min(x), b[1].min(y), b[2].max(x), b[3].max(y)];
+    }
+    if !b.iter().all(|v| v.is_finite()) {
+        return 1;
+    }
+    landmark::estimate([b[2] - b[0], b[3] - b[1]], &landmark::Limits::of(config))
+}
+
+/// The budget ladder (crate documentation, "Budget"): the steps in order,
+/// each only while a list is still over, re-running after each.
+fn climb(
+    inputs: &Inputs<'_>,
+    renderer: &mut dyn Renderer,
+    prepared: &Prepared<'_>,
+    config: &SlicerConfig,
+    first: Run,
+) -> Result<Run, SliceError> {
+    let ladder = &config.ladder;
+    let mut config = config.clone();
+    let mut classes = prepared.classes.clone();
+    let mut run = first;
+    let mut steps = Vec::new();
+    let models: Vec<String> = prepared.refs.iter().map(|r| model_of(r)).collect();
+
+    // 1 and 2: thresholds that only coarsen strips.
+    if run.over(ArtCategory::Walls) > 0 && config.max_perimeter_run < ladder.perimeter_run {
+        let before = run.used();
+        let change = format!(
+            "max_perimeter_run {} -> {}",
+            config.max_perimeter_run, ladder.perimeter_run
+        );
+        config.max_perimeter_run = ladder.perimeter_run;
+        run = run_once(inputs, renderer, prepared, &classes, &config)?;
+        steps.push(LadderStep {
+            kind: LadderKind::LongerRuns,
+            change,
+            models: Vec::new(),
+            references: 0,
+            before,
+            after: run.used(),
+        });
+    }
+    if run.over(ArtCategory::Walls) > 0 && config.min_strip_pixels < ladder.min_strip_pixels {
+        let before = run.used();
+        let change = format!(
+            "min_strip_pixels {} -> {}",
+            config.min_strip_pixels, ladder.min_strip_pixels
+        );
+        config.min_strip_pixels = ladder.min_strip_pixels;
+        run = run_once(inputs, renderer, prepared, &classes, &config)?;
+        steps.push(LadderStep {
+            kind: LadderKind::CoarserStrips,
+            change,
+            models: Vec::new(),
+            references: 0,
+            before,
+            after: run.used(),
+        });
+    }
+
+    // 3: the largest sliced models become landmarks, as long as the
+    // scenery list has room for their pieces.
+    if run.over(ArtCategory::Walls) > 0 && config.landmarks && ladder.max_landmarks > 0 {
+        let before = run.used();
+        let mut promoted: BTreeSet<String> = BTreeSet::new();
+        let mut moved = 0;
+        for _ in 0..ladder.max_rounds {
+            let mut need = run.over(ArtCategory::Walls);
+            let mut room = -run.over(ArtCategory::Scenery);
+            let mut candidates: Vec<&Contributor> = run
+                .contributors
+                .iter()
+                .filter(|c| c.category == ArtCategory::Walls && c.class == ClassKind::Sliced)
+                .filter(|c| !promoted.contains(&c.model))
+                .collect();
+            candidates.sort_by(|a, b| b.entries.cmp(&a.entries).then(a.model.cmp(&b.model)));
+            let mut picked: Vec<(String, Vec<usize>)> = Vec::new();
+            for c in candidates {
+                if need <= 0 || promoted.len() + picked.len() >= ladder.max_landmarks {
+                    break;
+                }
+                let members: Vec<usize> = (0..classes.len())
+                    .filter(|&i| classes[i] == Class::Sliced && models[i] == c.model)
+                    .collect();
+                let cost: usize = members
+                    .iter()
+                    .map(|&i| landmark_estimate(prepared, i, inputs.projection, &config))
+                    .sum();
+                if members.is_empty() || cost >= c.entries || cost as i64 > room {
+                    continue;
+                }
+                need -= (c.entries - cost) as i64;
+                room -= cost as i64;
+                picked.push((c.model.clone(), members));
+            }
+            if picked.is_empty() {
+                break;
+            }
+            for (model, members) in picked {
+                for i in members {
+                    classes[i] = Class::Landmark;
+                    moved += 1;
+                }
+                promoted.insert(model);
+            }
+            run = run_once(inputs, renderer, prepared, &classes, &config)?;
+            if run.over(ArtCategory::Walls) <= 0 {
+                break;
+            }
+        }
+        if !promoted.is_empty() {
+            steps.push(LadderStep {
+                kind: LadderKind::Landmarks,
+                change: format!("{} models", promoted.len()),
+                models: promoted.into_iter().collect(),
+                references: moved,
+                before,
+                after: run.used(),
+            });
+        }
+    }
+
+    // 4: the smallest contributors of each list still over go to the
+    // ground. Doors, containers and items never do.
+    if !run.sliced.report.fits() && ladder.demote {
+        let before = run.used();
+        let mut demoted: BTreeSet<String> = BTreeSet::new();
+        let mut moved = 0;
+        for _ in 0..ladder.max_rounds {
+            let mut picked: Vec<(String, Vec<usize>)> = Vec::new();
+            for category in [ArtCategory::Walls, ArtCategory::Scenery] {
+                let mut need = run.over(category);
+                if need <= 0 {
+                    continue;
+                }
+                let demotable = |class: &Class| match category {
+                    ArtCategory::Walls => *class == Class::Sliced,
+                    _ => matches!(class, Class::Sprite(Role::Scenery) | Class::Landmark),
+                };
+                let mut candidates: Vec<&Contributor> = run
+                    .contributors
+                    .iter()
+                    .filter(|c| c.category == category && c.entries > 0)
+                    .filter(|c| match category {
+                        ArtCategory::Walls => c.class == ClassKind::Sliced,
+                        _ => matches!(c.class, ClassKind::Sprite | ClassKind::Landmark),
+                    })
+                    .filter(|c| !demoted.contains(&c.model))
+                    .collect();
+                candidates.sort_by(|a, b| a.entries.cmp(&b.entries).then(a.model.cmp(&b.model)));
+                for c in candidates {
+                    if need <= 0 {
+                        break;
+                    }
+                    if picked.iter().any(|(m, _)| *m == c.model) {
+                        continue;
+                    }
+                    let members: Vec<usize> = (0..classes.len())
+                        .filter(|&i| demotable(&classes[i]) && models[i] == c.model)
+                        .collect();
+                    if members.is_empty() {
+                        continue;
+                    }
+                    need -= c.entries as i64;
+                    picked.push((c.model.clone(), members));
+                }
+            }
+            if picked.is_empty() {
+                break;
+            }
+            for (model, members) in picked {
+                for i in members {
+                    classes[i] = Class::GroundRelief;
+                    moved += 1;
+                }
+                demoted.insert(model);
+            }
+            run = run_once(inputs, renderer, prepared, &classes, &config)?;
+            if run.sliced.report.fits() {
+                break;
+            }
+        }
+        if !demoted.is_empty() {
+            steps.push(LadderStep {
+                kind: LadderKind::Demoted,
+                change: format!("{} models to ground relief", demoted.len()),
+                models: demoted.into_iter().collect(),
+                references: moved,
+                before,
+                after: run.used(),
+            });
+        }
+    }
+    run.sliced.report.ladder = steps;
+    Ok(run)
+}
+
+/// One pass over the window with the given classes: render, cut,
+/// deduplicate, account. The budget is not checked here.
+fn run_once(
+    inputs: &Inputs<'_>,
+    renderer: &mut dyn Renderer,
+    prepared: &Prepared<'_>,
+    classes: &[Class],
+    config: &SlicerConfig,
+) -> Result<Run, SliceError> {
+    let Inputs {
+        assets,
+        window,
+        sampler,
+        projection,
+        map,
+        budget,
+        plane,
+    } = *inputs;
+    // Interior mode (the `interior` module): no land, every height comes
+    // from the floor.
+    let interior = config.interior.as_ref();
+    let no_land = GroundSampler::default();
+    let sampler = if interior.is_some() {
+        &no_land
+    } else {
+        sampler
+    };
+    let floor_z = interior.map(|i| i.floor_z);
+    let mut indoor = interior.map(InteriorStats::new);
+    // Floor meshes split off renders, and (floor mesh, reference) to bake.
+    let mut floor_meshes: Vec<StaticMesh> = Vec::new();
+    let mut floor_bake: Vec<(usize, usize)> = Vec::new();
     let mut report = BudgetReport::new(false, budget);
     let mut skipped = Vec::new();
     let mut placements = Vec::new();
     let mut store = ArtStore::default();
     let mut blocked = BTreeSet::new();
+    let mut fallbacks: Vec<LandmarkFallback> = Vec::new();
     let skip = |skipped: &mut Vec<Skipped>, r: &Reference, reason: SkipReason| {
         skipped.push(Skipped {
             reference: r.form.to_string(),
-            model: r.model.clone(),
+            model: skipped_model(r, &reason),
             reason,
         });
     };
 
-    // Group the sprite and sliced references by render.
+    // Group the sprite, sliced and landmark references by render.
     let mut groups: BTreeMap<RenderKey, Vec<usize>> = BTreeMap::new();
     let mut flat = Vec::new();
     let mut relief = Vec::new();
-    for (i, (r, class)) in prepared.refs.iter().zip(&prepared.classes).enumerate() {
+    for (i, (r, class)) in prepared.refs.iter().zip(classes).enumerate() {
         report.class_mut(class.kind()).references += 1;
         match class {
             Class::Skip(reason) => skip(&mut skipped, r, reason.clone()),
             Class::GroundFlat => flat.push(i),
             Class::GroundRelief => relief.push(i),
-            Class::Sprite(_) | Class::Sliced => match RenderKey::of(r, config) {
-                Some(key) => groups.entry(key).or_default().push(i),
+            Class::Sprite(_) | Class::Sliced | Class::Landmark => match RenderKey::of(r, config) {
+                Some(key) => {
+                    let key = match interior {
+                        Some(indoors) if splits(class) => {
+                            key.lifted(r.transform.position[2] - indoors.floor_z)
+                        }
+                        _ => key,
+                    };
+                    groups.entry(key).or_default().push(i)
+                }
                 None => skip(&mut skipped, r, SkipReason::NoMesh),
             },
         }
@@ -352,18 +733,104 @@ pub fn slice_with(
     let textures = assets.textures();
     let near_open = floor::around(&config.open_hexes, config.floor_reach);
     let mut strip_runs = 0usize;
+    // A landmark that cannot be drawn upright is baked as relief instead.
+    let mut fall_back =
+        |i: usize, reason: String, report: &mut BudgetReport, relief: &mut Vec<usize>| {
+            let r = prepared.refs[i];
+            report.class_mut(ClassKind::Landmark).references -= 1;
+            report.class_mut(ClassKind::GroundRelief).references += 1;
+            relief.push(i);
+            fallbacks.push(LandmarkFallback {
+                reference: r.form.to_string(),
+                model: model_of(r),
+                reason,
+            });
+        };
     for (key, members) in &groups {
         let Some(Ok((mesh, _))) = prepared.meshes.get(&key.mesh) else {
             continue;
         };
-        let first_kind = prepared.classes[members[0]].kind();
-        let fail_all =
-            |reason: SkipReason, skipped: &mut Vec<Skipped>, report: &mut BudgetReport| {
-                for &i in members {
-                    skip(skipped, prepared.refs[i], reason.clone());
-                    demote(report, prepared.classes[i].kind());
+        let first_kind = classes[members[0]].kind();
+        // Indoors: the floor leaves for the bake, the rest is cut at the
+        // ceiling, and only that is rendered upright.
+        let mut split = match (key.lift(), interior) {
+            (Some(lift), Some(indoors)) => Some(interior::split(
+                mesh,
+                &key.matrix(config),
+                lift,
+                indoors,
+                config.floor_min_up,
+            )),
+            _ => None,
+        };
+        let floor_index = split.as_mut().and_then(|s| s.floor.take()).map(|f| {
+            floor_meshes.push(f);
+            floor_meshes.len() - 1
+        });
+        let clipped = split.as_ref().is_some_and(|s| s.cut_triangles > 0);
+        if let (Some(s), Some(t)) = (&split, &mut indoor) {
+            t.cut_triangles += s.cut_triangles;
+            t.ceiling_triangles += s.ceiling_triangles;
+        }
+        // A placed member gives its floor to the bake.
+        let placed =
+            |i: usize, indoor: &mut Option<InteriorStats>, bake: &mut Vec<(usize, usize)>| {
+                if let Some(f) = floor_index {
+                    bake.push((f, i));
+                }
+                if let Some(t) = indoor
+                    && clipped
+                {
+                    t.clipped_references += 1;
                 }
             };
+        // Members left with nothing upright: their floor is baked (when
+        // they stand on the map); without one, nothing is under the cut.
+        let floor_only = |skipped: &mut Vec<Skipped>,
+                          report: &mut BudgetReport,
+                          indoor: &mut Option<InteriorStats>,
+                          bake: &mut Vec<(usize, usize)>| {
+            for &i in members {
+                let r = prepared.refs[i];
+                if floor_index.is_none() {
+                    skip(skipped, r, SkipReason::AboveCut);
+                    demote(report, classes[i].kind());
+                } else if standing_on(projection, window, sampler, floor_z, r).is_none() {
+                    skip(skipped, r, SkipReason::OutsideMap);
+                    demote(report, classes[i].kind());
+                } else {
+                    placed(i, indoor, bake);
+                    if let Some(t) = indoor {
+                        t.floor_only += 1;
+                    }
+                }
+            }
+        };
+        let mesh: &StaticMesh = match &split {
+            None => mesh,
+            Some(Split {
+                walls: Some(walls), ..
+            }) => walls,
+            Some(_) => {
+                floor_only(&mut skipped, &mut report, &mut indoor, &mut floor_bake);
+                continue;
+            }
+        };
+        // Landmarks fall back to relief when `relief_ok`; the rest skip.
+        let mut fail_all = |reason: SkipReason,
+                            relief_ok: bool,
+                            skipped: &mut Vec<Skipped>,
+                            report: &mut BudgetReport,
+                            relief: &mut Vec<usize>| {
+            for &i in members {
+                if relief_ok && classes[i] == Class::Landmark {
+                    fall_back(i, reason.to_string(), report, relief);
+                } else {
+                    skip(skipped, prepared.refs[i], reason.clone());
+                    demote(report, classes[i].kind());
+                }
+            }
+        };
         let canvas = match render::render_canonical(
             renderer,
             projection,
@@ -374,25 +841,53 @@ pub fn slice_with(
             config.max_canvas_pixels,
         ) {
             Ok(Some(canvas)) => canvas,
+            Ok(None) if floor_index.is_some() => {
+                floor_only(&mut skipped, &mut report, &mut indoor, &mut floor_bake);
+                continue;
+            }
             Ok(None) => {
-                fail_all(SkipReason::NoGeometry, &mut skipped, &mut report);
+                fail_all(
+                    SkipReason::NoGeometry,
+                    false,
+                    &mut skipped,
+                    &mut report,
+                    &mut relief,
+                );
                 continue;
             }
             Err(CanvasError::TooLarge) => {
-                fail_all(SkipReason::TooLarge, &mut skipped, &mut report);
+                fail_all(
+                    SkipReason::TooLarge,
+                    true,
+                    &mut skipped,
+                    &mut report,
+                    &mut relief,
+                );
                 continue;
             }
             Err(CanvasError::Render(e)) => {
                 fail_all(
                     SkipReason::Failed(format!("render: {e}")),
+                    true,
                     &mut skipped,
                     &mut report,
+                    &mut relief,
                 );
                 continue;
             }
         };
         if !(0..canvas.width as usize * canvas.height as usize).any(|i| canvas.opaque(i)) {
-            fail_all(SkipReason::EmptyRender, &mut skipped, &mut report);
+            if floor_index.is_some() {
+                floor_only(&mut skipped, &mut report, &mut indoor, &mut floor_bake);
+                continue;
+            }
+            fail_all(
+                SkipReason::EmptyRender,
+                false,
+                &mut skipped,
+                &mut report,
+                &mut relief,
+            );
             continue;
         }
         let indexed = match quantize::quantize(
@@ -406,8 +901,10 @@ pub fn slice_with(
             Err(e) => {
                 fail_all(
                     SkipReason::Failed(format!("quantize: {e}")),
+                    true,
                     &mut skipped,
                     &mut report,
+                    &mut relief,
                 );
                 continue;
             }
@@ -417,9 +914,11 @@ pub fn slice_with(
 
         for &i in members {
             let r = prepared.refs[i];
-            let class = &prepared.classes[i];
-            let model = r.model.clone().unwrap_or_default();
-            let Some((ground, offset, ground_z)) = standing(projection, window, sampler, r) else {
+            let class = &classes[i];
+            let model = model_of(r);
+            let Some((ground, offset, ground_z)) =
+                standing_on(projection, window, sampler, floor_z, r)
+            else {
                 skip(&mut skipped, r, SkipReason::OutsideMap);
                 demote(&mut report, class.kind());
                 continue;
@@ -473,6 +972,86 @@ pub fn slice_with(
                         blocking: role.blocking(),
                         run: None,
                     });
+                    placed(i, &mut indoor, &mut floor_bake);
+                }
+                Class::Landmark => {
+                    // Its footprint blocks (see the `landmark` module),
+                    // except where the source lets an actor stand.
+                    let mut under = BTreeSet::new();
+                    if interior.is_some() {
+                        interior::blocked_by_walls(
+                            plane,
+                            mesh,
+                            &r.transform.matrix(),
+                            ground_z,
+                            config.step_height,
+                            BLOCK_REACH,
+                            &mut under,
+                        );
+                    } else {
+                        overlay::blocked_under(
+                            plane,
+                            sampler,
+                            mesh,
+                            &r.transform.matrix(),
+                            ground_z,
+                            config.step_height,
+                            &mut under,
+                        );
+                    }
+                    let input = landmark::Input {
+                        canvas: &canvas,
+                        indexed: &indexed,
+                        ground,
+                        offset,
+                        lift: r.transform.position[2] - ground_z,
+                        projection,
+                        under: &under,
+                        open: &config.open_hexes,
+                        walkable: config.landmark_walkers.as_ref(),
+                        step_height: config.step_height,
+                    };
+                    let cut = match landmark::cut(&input, &landmark::Limits::of(config)) {
+                        Ok(cut) => cut,
+                        Err(e) => {
+                            fall_back(i, format!("pieces: {e}"), &mut report, &mut relief);
+                            continue;
+                        }
+                    };
+                    if cut.strips.is_empty() {
+                        skip(&mut skipped, r, SkipReason::OutsideMap);
+                        demote(&mut report, class.kind());
+                        continue;
+                    }
+                    report.strips.dropped_pixels += cut.dropped;
+                    report.landmarks.add(&cut.stats);
+                    let mut under = cut.blocked;
+                    store.note_reference(ArtCategory::Scenery, &model, ClassKind::Landmark);
+                    for piece in &cut.strips {
+                        let (art, new) = store.add(
+                            ArtCategory::Scenery,
+                            &piece.frame,
+                            &model,
+                            ClassKind::Landmark,
+                        );
+                        if new {
+                            report.class_mut(ClassKind::Landmark).entries += 1;
+                        }
+                        let blocking = under.remove(&piece.hex);
+                        placements.push(Placement {
+                            art,
+                            hex: piece.hex,
+                            displacement: offset,
+                            role: Role::Scenery,
+                            reference: r.form.to_string(),
+                            blocking,
+                            run: None,
+                        });
+                        report.landmarks.pieces += 1;
+                    }
+                    blocked.extend(under);
+                    report.landmarks.references += 1;
+                    placed(i, &mut indoor, &mut floor_bake);
                 }
                 Class::Sliced => {
                     let polygon: Vec<[f64; 2]> = prepared
@@ -492,12 +1071,14 @@ pub fn slice_with(
                                 .is_some_and(|c| distance_to_polygon(&polygon, c) <= BLOCK_REACH)
                     };
                     // Walking surfaces by an open hex leave the strips (see
-                    // the `floor` module).
-                    let has_open = config.open_hexes.iter().any(|&h| {
-                        plane
-                            .hex_tile(h)
-                            .is_some_and(|c| distance_to_polygon(&polygon, c) <= BLOCK_REACH)
-                    });
+                    // the `floor` module). Indoors the floor is baked
+                    // instead, and higher surfaces stay with the object.
+                    let has_open = interior.is_none()
+                        && config.open_hexes.iter().any(|&h| {
+                            plane
+                                .hex_tile(h)
+                                .is_some_and(|c| distance_to_polygon(&polygon, c) <= BLOCK_REACH)
+                        });
                     let floors = if has_open {
                         floor::pieces(
                             renderer,
@@ -547,8 +1128,17 @@ pub fn slice_with(
                     };
                     report.strips.dropped_pixels += cut.dropped;
                     if cut.strips.is_empty() && floor_pieces.is_empty() {
-                        skip(&mut skipped, r, SkipReason::OutsideMap);
-                        demote(&mut report, class.kind());
+                        if floor_index.is_some() {
+                            // Indoors, its walls are off the map but its
+                            // floor may not be.
+                            placed(i, &mut indoor, &mut floor_bake);
+                            if let Some(t) = &mut indoor {
+                                t.floor_only += 1;
+                            }
+                        } else {
+                            skip(&mut skipped, r, SkipReason::OutsideMap);
+                            demote(&mut report, class.kind());
+                        }
                         continue;
                     }
                     report.strips.merged_tiny += cut.merged_tiny;
@@ -607,16 +1197,98 @@ pub fn slice_with(
                         });
                         report.strips.floor_pieces += 1;
                     }
+                    placed(i, &mut indoor, &mut floor_bake);
                 }
                 _ => {}
             }
         }
     }
     report.strips.runs = strip_runs;
+    // Fallbacks join the relief in reference order.
+    relief.sort_unstable();
+    fallbacks.sort();
+    report.landmarks.fallbacks = fallbacks;
 
-    // Ground overlays.
+    // Indoors, relief is split and cut like everything else: its walls in
+    // relief, its floor to the bake.
+    let mut relief_walls: BTreeMap<usize, StaticMesh> = BTreeMap::new();
+    if let Some(indoors) = interior {
+        relief.retain(|&i| {
+            let r = prepared.refs[i];
+            let Some(Some(Ok((mesh, _)))) = r.mesh.as_ref().map(|h| prepared.meshes.get(h)) else {
+                return true;
+            };
+            let Some(key) = RenderKey::of(r, config) else {
+                return true;
+            };
+            let lift = r.transform.position[2] - indoors.floor_z;
+            let s = interior::split(
+                mesh,
+                &key.matrix(config),
+                lift,
+                indoors,
+                config.floor_min_up,
+            );
+            if let Some(t) = &mut indoor {
+                t.cut_triangles += s.cut_triangles;
+                t.ceiling_triangles += s.ceiling_triangles;
+                t.clipped_references += usize::from(s.cut_triangles > 0);
+                t.floor_only += usize::from(s.walls.is_none() && s.floor.is_some());
+            }
+            if s.walls.is_none() && s.floor.is_none() {
+                skip(&mut skipped, r, SkipReason::AboveCut);
+                demote(&mut report, ClassKind::GroundRelief);
+                return false;
+            }
+            if let Some(f) = s.floor {
+                floor_meshes.push(f);
+                floor_bake.push((floor_meshes.len() - 1, i));
+            }
+            match s.walls {
+                Some(walls) => {
+                    relief_walls.insert(i, walls);
+                    true
+                }
+                None => false,
+            }
+        });
+    }
+
+    // Ground overlays: the interior floor, then flat, then relief.
     let anchor = [window.x_west, window.y_north, 0.0];
     let mut overlays = Vec::new();
+    if let (Some(floor), Some(t)) = (floor_z, &mut indoor)
+        && !floor_bake.is_empty()
+    {
+        floor_bake.sort_unstable_by_key(|&(_, i)| i);
+        let mut hexes = BTreeSet::new();
+        let mut pieces = Vec::with_capacity(floor_bake.len());
+        for &(f, i) in &floor_bake {
+            let mesh = &floor_meshes[f];
+            let placed = prepared.refs[i].transform.matrix();
+            t.floor_area += interior::floor_cover(plane, mesh, &placed, &mut hexes);
+            t.floor_triangles += mesh
+                .primitives
+                .iter()
+                .map(|p| p.indices.len() / 3)
+                .sum::<usize>();
+            let mut transform = placed;
+            transform[2][3] -= floor;
+            pieces.push(GroundPiece { mesh, transform });
+        }
+        let baked = overlay::bake(
+            renderer,
+            projection,
+            anchor,
+            &pieces,
+            textures,
+            config.render_tile,
+        )?;
+        t.floor_references = floor_bake.len();
+        t.floor_overlays = baked.len();
+        t.floor_hexes = hexes.into_iter().collect();
+        overlays.extend(baked);
+    }
     for (members, flatten) in [(&flat, true), (&relief, false)] {
         let mut pieces = Vec::new();
         for &i in members {
@@ -624,15 +1296,33 @@ pub fn slice_with(
             let Some(Some(Ok((mesh, _)))) = r.mesh.as_ref().map(|h| prepared.meshes.get(h)) else {
                 continue;
             };
+            let mesh = match relief_walls.get(&i) {
+                Some(walls) if !flatten => walls,
+                _ => mesh,
+            };
             let [x, y, z] = r.transform.position;
-            let ground_z = sampler.height(x, y).unwrap_or(z);
+            let ground_z = floor_z.unwrap_or_else(|| sampler.height(x, y).unwrap_or(z));
             let mut transform = r.transform.matrix();
             transform[2][3] -= ground_z;
             if flatten {
                 transform[2] = transform[2].map(|v| v * config.flatten);
+            } else if interior.is_some() {
+                // Indoors relief is cut walls: they block by their outline,
+                // except where the source lets an actor stand.
+                let mut walls = BTreeSet::new();
+                interior::blocked_by_walls(
+                    plane,
+                    mesh,
+                    &r.transform.matrix(),
+                    ground_z,
+                    config.step_height,
+                    BLOCK_REACH,
+                    &mut walls,
+                );
+                blocked.extend(walls.difference(&config.open_hexes));
             } else {
                 overlay::blocked_under(
-                    &plane,
+                    plane,
                     sampler,
                     mesh,
                     &r.transform.matrix(),
@@ -669,9 +1359,14 @@ pub fn slice_with(
     for s in &skipped {
         *report.skips.entry(s.reason.label().to_owned()).or_insert(0) += 1;
     }
+    if let Some(t) = &mut indoor {
+        t.count_skips(&report.skips);
+    }
+    report.interior = indoor;
     report.overlays = overlays.len();
     report.blocked_hexes = blocked.len();
-    report.set_contributors(store.contributors(), config.top_contributors);
+    let contributors = store.contributors();
+    report.set_contributors(contributors.clone(), config.top_contributors);
 
     placements.sort_by(|a, b| {
         a.hex
@@ -680,14 +1375,16 @@ pub fn slice_with(
             .then(a.art.cmp(&b.art))
     });
     skipped.sort();
-    report.check()?;
-    Ok(Sliced {
-        art: store.art,
-        placements,
-        overlays,
-        blocked_hexes: blocked.into_iter().collect(),
-        skipped,
-        report,
+    Ok(Run {
+        sliced: Sliced {
+            art: store.art,
+            placements,
+            overlays,
+            blocked_hexes: blocked.into_iter().collect(),
+            skipped,
+            report,
+        },
+        contributors,
     })
 }
 
@@ -711,7 +1408,7 @@ pub fn estimate_with(
     let mut renders: BTreeMap<ClassKind, BTreeSet<RenderKey>> = BTreeMap::new();
     let mut contributions: BTreeMap<(ArtCategory, String, ClassKind), (usize, usize)> =
         BTreeMap::new();
-    for (r, class) in prepared.refs.iter().zip(&prepared.classes) {
+    for (i, (r, class)) in prepared.refs.iter().zip(&prepared.classes).enumerate() {
         let kind = class.kind();
         report.class_mut(kind).references += 1;
         let model = r.model.clone().unwrap_or_default();
@@ -737,6 +1434,22 @@ pub fn estimate_with(
                     report.category_mut(role.category()).used += 1;
                 }
             }
+            Class::Landmark => {
+                let Some(key) = RenderKey::of(r, config) else {
+                    continue;
+                };
+                renders.entry(kind).or_default().insert(key);
+                let n = landmark_estimate(&prepared, i, projection, config);
+                let c = contributions
+                    .entry((ArtCategory::Scenery, model, kind))
+                    .or_default();
+                c.0 += 1;
+                c.1 += n;
+                report.class_mut(kind).entries += n;
+                report.category_mut(ArtCategory::Scenery).used += n;
+                report.landmarks.references += 1;
+                report.landmarks.pieces += n;
+            }
             Class::Sliced => {
                 let Some(key) = RenderKey::of(r, config) else {
                     continue;
@@ -759,7 +1472,12 @@ pub fn estimate_with(
                     let hex_units = f64::from(tile_units) / 2.0;
                     (footprint.longest_side() / hex_units).ceil().max(1.0) as usize
                 } else {
-                    estimate_strips(&hexes, config.merge_interior_runs, config.max_perimeter_run)
+                    estimate_strips(
+                        &hexes,
+                        config.merge_interior_runs,
+                        config.max_perimeter_run,
+                        config.interior.is_some(),
+                    )
                 };
                 let c = contributions
                     .entry((ArtCategory::Walls, model, kind))
@@ -789,13 +1507,24 @@ pub fn estimate_with(
         .collect();
     report.set_contributors(all, config.top_contributors);
     report.strips.distinct = report.category(ArtCategory::Walls).used;
+    report.interior = config.interior.as_ref().map(|settings| {
+        let mut stats = InteriorStats::new(settings);
+        stats.count_skips(&report.skips);
+        stats
+    });
     Ok(report)
 }
 
 /// Strips a footprint would give: row runs of interior hexes count once
 /// (when merged), row runs of perimeter hexes once per piece of at most
-/// `max_run`.
-fn estimate_strips(hexes: &[i32], merge_interior: bool, max_run: usize) -> usize {
+/// `max_run`. With `floor_baked` (interior mode) interior hexes are floor
+/// and count nothing.
+fn estimate_strips(
+    hexes: &[i32],
+    merge_interior: bool,
+    max_run: usize,
+    floor_baked: bool,
+) -> usize {
     let set: BTreeSet<i32> = hexes.iter().copied().collect();
     let interior = |h: i32| {
         hex::neighbours(h)
@@ -817,6 +1546,7 @@ fn estimate_strips(hexes: &[i32], merge_interior: bool, max_run: usize) -> usize
         }
         let len = j - i + 1;
         count += match (kinds[i], merge_interior) {
+            (true, _) if floor_baked => 0,
             (true, true) => 1,
             (true, false) => len,
             (false, _) => len.div_ceil(max_run.max(1)),

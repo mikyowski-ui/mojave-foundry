@@ -102,6 +102,156 @@ pub struct StripStats {
     pub height: Spread,
 }
 
+/// What the landmarks of a run came to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LandmarkStats {
+    /// References placed as landmarks.
+    pub references: usize,
+    /// Piece placements (scenery list).
+    pub pieces: usize,
+    /// Pieces the visibility cut alone made (each at most
+    /// `landmark_piece_max` across).
+    pub tiles: usize,
+    /// Pieces halved because no hex was both drawn whenever the piece is in
+    /// view and late enough to draw it over every walker behind it.
+    pub visibility_splits: usize,
+    /// Pieces cut because they hid a walker standing in front of some of
+    /// their pixels.
+    pub sorting_splits: usize,
+    /// Walkable hexes whose walker box overlaps a landmark.
+    pub walkers: usize,
+    /// Of those, walkers still hidden by pixels that stand behind them
+    /// (`landmark_max_pieces` reached).
+    pub hidden_walkers: usize,
+    /// Hexes outside the footprint blocked because a piece would draw under
+    /// a walker there pixels that stand in front of it.
+    pub sealed_hexes: usize,
+    /// Pieces left without an anchor late enough for all their walkers.
+    pub unresolved_pieces: usize,
+    /// Landmarks that could not be rendered upright (too large for
+    /// `max_canvas_pixels`, a piece beyond the FRM limits, a render error)
+    /// and were baked into the ground as relief instead. Sorted.
+    pub fallbacks: Vec<LandmarkFallback>,
+}
+
+impl LandmarkStats {
+    pub(crate) fn add(&mut self, stats: &crate::landmark::PieceStats) {
+        self.tiles += stats.tiles;
+        self.visibility_splits += stats.visibility_splits;
+        self.sorting_splits += stats.sorting_splits;
+        self.walkers += stats.walkers;
+        self.hidden_walkers += stats.hidden;
+        self.sealed_hexes += stats.sealed;
+        self.unresolved_pieces += stats.unresolved;
+    }
+}
+
+/// What interior mode ([`crate::SlicerConfig::interior`]) did in a run.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct InteriorStats {
+    /// The settings the run used.
+    pub settings: crate::InteriorSlice,
+    /// Placed references that gave floor triangles to the bake.
+    pub floor_references: usize,
+    /// Of those, references that were nothing but floor: no strip, sprite
+    /// or piece of their own.
+    pub floor_only: usize,
+    /// Floor triangles baked (over every placed reference).
+    pub floor_triangles: usize,
+    /// Baked floor area on the ground plane, square source units
+    /// (overlapping pieces count twice).
+    pub floor_area: f64,
+    /// Hexes whose centre lies under a baked floor triangle, sorted.
+    pub floor_hexes: Vec<i32>,
+    /// Ground overlays of the floor bake (the first of
+    /// [`crate::Sliced::overlays`]).
+    pub floor_overlays: usize,
+    /// Placed references with geometry clipped at the cut.
+    pub clipped_references: usize,
+    /// Triangles wholly or partly above the cut (per distinct render).
+    pub cut_triangles: usize,
+    /// One-sided down-facing triangles above the floor band dropped (per
+    /// distinct render).
+    pub ceiling_triangles: usize,
+    /// References skipped as wholly above the cut.
+    pub above_cut: usize,
+    /// References skipped as hanging from the ceiling.
+    pub hanging: usize,
+    /// References skipped as wholly below the floor band.
+    pub below_floor: usize,
+}
+
+impl InteriorStats {
+    pub(crate) fn new(settings: &crate::InteriorSlice) -> Self {
+        InteriorStats {
+            settings: settings.clone(),
+            ..InteriorStats::default()
+        }
+    }
+
+    /// Counts the interior skips of `skips` (by reason label).
+    pub(crate) fn count_skips(&mut self, skips: &BTreeMap<String, usize>) {
+        let n = |reason: crate::SkipReason| skips.get(reason.label()).copied().unwrap_or(0);
+        self.above_cut = n(crate::SkipReason::AboveCut);
+        self.hanging = n(crate::SkipReason::Hanging);
+        self.below_floor = n(crate::SkipReason::BelowFloor);
+    }
+}
+
+/// A landmark baked into the ground instead, and why.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LandmarkFallback {
+    pub reference: String,
+    pub model: String,
+    pub reason: String,
+}
+
+/// One step of the budget ladder ([`crate::BudgetLadder`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LadderKind {
+    /// Perimeter runs merged over more hexes.
+    LongerRuns,
+    /// More small strips joined to a neighbour.
+    CoarserStrips,
+    /// The largest sliced models placed as landmarks.
+    Landmarks,
+    /// The smallest contributors baked into the ground.
+    Demoted,
+}
+
+impl LadderKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            LadderKind::LongerRuns => "longer perimeter runs",
+            LadderKind::CoarserStrips => "coarser strips",
+            LadderKind::Landmarks => "largest sliced models as landmarks",
+            LadderKind::Demoted => "smallest contributors to the ground",
+        }
+    }
+}
+
+/// A ladder step taken and what it saved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LadderStep {
+    pub kind: LadderKind,
+    /// The threshold it changed, or the number of models it moved.
+    pub change: String,
+    /// Models it reclassified, sorted; empty for a threshold step.
+    pub models: Vec<String>,
+    /// References it reclassified.
+    pub references: usize,
+    /// Entries used in walls, scenery and items before and after it.
+    pub before: [usize; 3],
+    pub after: [usize; 3],
+}
+
+impl LadderStep {
+    /// Entries saved per list (negative: the list grew).
+    pub fn saved(&self) -> [i64; 3] {
+        std::array::from_fn(|i| self.before[i] as i64 - self.after[i] as i64)
+    }
+}
+
 /// The accounting of one run: per class, per art list, the largest
 /// contributors and how the strips came out. Filled on success and carried
 /// by [`crate::SliceError::FidBudget`] on overflow.
@@ -119,6 +269,12 @@ pub struct BudgetReport {
     pub skips: BTreeMap<String, usize>,
     pub overlays: usize,
     pub blocked_hexes: usize,
+    pub landmarks: LandmarkStats,
+    /// Budget ladder steps taken, in order; empty when the run fit at once.
+    pub ladder: Vec<LadderStep>,
+    /// Interior mode's tallies; `None` when it is off. An estimate fills
+    /// the settings and skips only.
+    pub interior: Option<InteriorStats>,
 }
 
 impl BudgetReport {
@@ -144,6 +300,9 @@ impl BudgetReport {
             skips: BTreeMap::new(),
             overlays: 0,
             blocked_hexes: 0,
+            landmarks: LandmarkStats::default(),
+            ladder: Vec::new(),
+            interior: None,
         }
     }
 
@@ -158,6 +317,11 @@ impl BudgetReport {
 
     pub(crate) fn class_mut(&mut self, kind: ClassKind) -> &mut ClassCount {
         self.classes.entry(kind).or_default()
+    }
+
+    /// Entries used in walls, scenery and items.
+    pub fn used(&self) -> [usize; 3] {
+        self.categories.map(|c| c.used)
     }
 
     /// The first list whose demand exceeds its free entries.
@@ -244,6 +408,11 @@ impl fmt::Display for BudgetReport {
             "class", "refs", "renders", "entries"
         );
         for (kind, count) in &self.classes {
+            // A class that did not occur and did not exist in the first
+            // pass leaves the table as it was.
+            if *kind == ClassKind::Landmark && *count == ClassCount::default() {
+                continue;
+            }
             let _ = writeln!(
                 out,
                 "  {:<13}  {:>6}  {:>7}  {:>7}",
@@ -287,6 +456,102 @@ impl fmt::Display for BudgetReport {
             "Overlays: {} pieces; blocked hexes: {}",
             self.overlays, self.blocked_hexes
         );
+        if let Some(i) = &self.interior {
+            let s = &i.settings;
+            let _ = writeln!(
+                out,
+                "Interior: floor at z {}, cut {} above it (z {}), floor band {} to {}, \
+                 hanging above {}",
+                s.floor_z,
+                s.cut_height,
+                s.cut_z(),
+                s.floor_band[0],
+                s.floor_band[1],
+                s.hang_clearance
+            );
+            let _ = writeln!(
+                out,
+                "  floor baked: {} triangles from {} references ({} floor only), {} hexes, \
+                 {:.0} square units, {} overlays",
+                i.floor_triangles,
+                i.floor_references,
+                i.floor_only,
+                i.floor_hexes.len(),
+                i.floor_area,
+                i.floor_overlays
+            );
+            let _ = writeln!(
+                out,
+                "  cut: {} references clipped, {} triangles over the cut, {} ceiling triangles \
+                 dropped; skipped {} above the cut, {} hanging, {} below the floor",
+                i.clipped_references,
+                i.cut_triangles,
+                i.ceiling_triangles,
+                i.above_cut,
+                i.hanging,
+                i.below_floor
+            );
+        }
+        let l = &self.landmarks;
+        if l.references > 0 || !l.fallbacks.is_empty() {
+            let _ = writeln!(
+                out,
+                "Landmarks: {} placed in {} pieces (scenery list), {} baked as relief instead",
+                l.references,
+                l.pieces,
+                l.fallbacks.len()
+            );
+            if l.references > 0 {
+                let _ = writeln!(
+                    out,
+                    "  {} tiles, {} visibility splits, {} sorting splits, {} unresolved; \
+                     {} walkers beside them, {} still hidden behind a piece, {} hexes sealed",
+                    l.tiles,
+                    l.visibility_splits,
+                    l.sorting_splits,
+                    l.unresolved_pieces,
+                    l.walkers,
+                    l.hidden_walkers,
+                    l.sealed_hexes
+                );
+            }
+            for fb in &l.fallbacks {
+                let _ = writeln!(
+                    out,
+                    "  relief instead: {} {} ({})",
+                    fb.reference, fb.model, fb.reason
+                );
+            }
+        }
+        if !self.ladder.is_empty() {
+            let _ = writeln!(out, "Budget ladder:");
+            for (n, step) in self.ladder.iter().enumerate() {
+                let _ = writeln!(
+                    out,
+                    "  {}. {} ({}): walls {} -> {}, scenery {} -> {}, items {} -> {}{}",
+                    n + 1,
+                    step.kind.name(),
+                    step.change,
+                    step.before[0],
+                    step.after[0],
+                    step.before[1],
+                    step.after[1],
+                    step.before[2],
+                    step.after[2],
+                    if step.references > 0 {
+                        format!("; {} references", step.references)
+                    } else {
+                        String::new()
+                    }
+                );
+                for model in step.models.iter().take(8) {
+                    let _ = writeln!(out, "       {model}");
+                }
+                if step.models.len() > 8 {
+                    let _ = writeln!(out, "       and {} more", step.models.len() - 8);
+                }
+            }
+        }
         if !self.skips.is_empty() {
             let _ = writeln!(out, "Skipped:");
             for (reason, n) in &self.skips {

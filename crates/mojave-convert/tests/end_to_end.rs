@@ -296,3 +296,91 @@ fn the_binary_runs_all_from_a_slice_file() {
     assert!(!missing.status.success());
     assert!(String::from_utf8_lossy(&missing.stderr).contains("--f2"));
 }
+
+#[test]
+fn a_standalone_run_builds_a_layer_and_keys_its_cache_by_mode() {
+    let fixture = common::fixture();
+    let mut inputs = fixture.inputs("out-standalone", 2);
+    inputs.standalone = true;
+
+    // The pre-check runs after extract and renders nothing.
+    pipeline::extract(&inputs).expect("extract");
+    let estimate = map::estimate(&inputs).expect("estimate");
+    assert!(estimate.report.estimated);
+    assert!(estimate.budgets.standalone);
+    assert_eq!(estimate.budgets.slicer.walls, 4096);
+    assert!(estimate.references > 0);
+    assert!(estimate.to_string().contains("standalone"), "{estimate}");
+
+    let summary = pipeline::all(&inputs).expect("all stages, standalone");
+    assert!(!summary.map.reused);
+    let counts = parse_layer(&inputs.mod_dir());
+    assert!(counts["map"] >= 2, "{counts:?}");
+    let report = std::fs::read_to_string(inputs.out.join("map-report.md")).expect("report");
+    for section in [
+        "## Art lists",
+        "## Budget ladder",
+        "## Landmarks",
+        "## Trigger volumes skipped",
+    ] {
+        assert!(report.contains(section), "no {section}");
+    }
+    assert!(report.contains("Mode: standalone"));
+    assert!(report.contains("| walls | yes |"), "{report}");
+    let features = map::MapFeatures::read(&inputs.out).expect("map-features.json");
+    assert_eq!(features.map_file, summary.map.map_file);
+    assert!(
+        features.features.iter().any(|f| f.kind == "walls"),
+        "the building is a feature: {features:?}"
+    );
+
+    // Same mode again: reused. The other mode: rebuilt.
+    assert!(map::map(&inputs).expect("again").reused);
+    let mut extending = inputs.clone();
+    extending.standalone = false;
+    assert!(!map::map(&extending).expect("extending").reused);
+    let report = std::fs::read_to_string(inputs.out.join("map-report.md")).expect("report");
+    assert!(report.contains("Mode: extending"));
+    assert!(report.contains("| walls | no |"), "{report}");
+}
+
+#[test]
+fn the_binary_estimates_and_takes_the_standalone_flag() {
+    let fixture = common::fixture();
+    let slice_path = fixture.root.path().join("slice.toml");
+    std::fs::write(&slice_path, fixture.slice.to_toml()).expect("slice file");
+    let out = fixture.root.path().join("out-bin-standalone");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_mojave-convert"))
+            .args(args)
+            .arg("--fnv")
+            .arg(&fixture.fnv)
+            .arg("--f2")
+            .arg(&fixture.f2)
+            .arg("--out")
+            .arg(&out)
+            .arg("--slice")
+            .arg(&slice_path)
+            .output()
+            .expect("the binary runs")
+    };
+    for args in [
+        &["extract"][..],
+        &["estimate", "--standalone"],
+        &["estimate"],
+        &["all", "--standalone"],
+    ] {
+        let output = run(args);
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if args[0] == "estimate" {
+            let text = String::from_utf8_lossy(&output.stdout);
+            assert!(text.contains("demand") && text.contains("time:"), "{text}");
+        }
+    }
+    // The flag belongs to the map stages only.
+    assert!(!run(&["sprites", "--standalone"]).status.success());
+}

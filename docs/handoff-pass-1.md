@@ -433,7 +433,7 @@ player, hat on; autoplay ran 2,000 ticks clean; no new warnings.
 The owner played the build with townsfolk and called it a good stopping
 point. State at the stop:
 
-- Gates green: 534 tests, clippy and format clean. Nothing is committed.
+- Gates green: 534 tests, clippy and format clean. This state was first committed on 2026-11-20 (`9d9d50d`).
 - The real output is under `out/goodsprings/` (git-ignored); play it with
   `scripts/play.sh <engine> <fallout2-dir> out/goodsprings`. The engine
   copy used for checks is a release build of `vault-engine` at `df2bf4c`
@@ -471,3 +471,228 @@ Next work, in the order it pays off:
 5. The older backlog in section 4: trees, untextured surfaces, occluding
    rocks, cut-off islands, more map windows, a world-map entry.
 
+## 9. Demonstration maps, second pass (2026-11-22)
+
+Four proof-of-concept areas were converted again with `--standalone`
+after the landmark, default-texture and islands work in `map-slicer`,
+`mir`/`map-terrain` and `map-builder` was wired into `mojave-convert`.
+Output is under `out/poc/{helios,strip,primm,nellis}/` (git-ignored),
+the chosen frames under `out/poc/best/`. Everything ran headless, one area
+after another, against the release engine under `target/engine-head/`.
+
+**Wired in (`mojave-convert`).** `map-report.md` gained `## Open hexes`,
+`## Entrance`, `## Components`, `## Passages` and `## Islands left`, a
+`## Ground` summary with the default-texture counts, every landmark tally,
+and each exit's grid steps. `SlicerConfig::landmark_walkers` is every hex
+`walk::verdicts` calls walkable with nothing blocked;
+`BuildOptions::protected_hexes` is every hex of the slicer's merged runs
+(the slicer does not report a landmark's blocked core apart from relief,
+so that is left to the builder). A standalone run opens every standable
+hex and also takes statics whose origin is outside the window but whose
+footprint reaches in; a run without the flag is unchanged. The map
+stage's key is `map-7`. `map-features.json` leads with the four largest
+landmarks and never drops one whose centre is off the grid; `shots --auto`
+takes a model twice only after every other. `mojave-convert contact` lays
+PNGs out on a labelled page.
+
+**Windows.** Nellis moved to `(32000, 145800)`, cells x 5..10, y 32..38.
+The Strip moved from `(0, 3000)` to `(-1200, 3100)`, cells x -4..2: the
+Tops' west hotel and casino wings, whose origins lay outside the old
+window, are now on the map; the old east strip (x 5,800 to 7,000: 16
+minor references, palms, planters, wall pieces) is lost. A window's north
+edge gives a tall building `32 * t` pixels of headroom (t: its distance
+from that edge in floor squares), whatever its x, so Gomorrah's and the
+Lucky 38's tops cannot fit in any window that also holds Vault 21 (12,300
+units further south). A trial 500 units further north
+(`out/poc/strip-north/`) kept the same eight relief fallbacks and lost
+every exit, so the chosen centre stands. HELIOS One and Primm are as
+before.
+
+| | HELIOS One | Strip | Primm | Nellis |
+|---|---|---|---|---|
+| references in the window | 735 | 1,323 | 1,379 | 571 |
+| walls added (of 4,096) | 3,154 | 3,929 | 3,714 | 3,115 |
+| scenery added | 619 | 1,780 | 1,909 | 1,049 |
+| floor tiles | 4,089 | 4,079 | 4,081 | 4,078 |
+| budget ladder steps | 2 | 3 | 3 | 2 |
+| landmarks: references, pieces | 1, 156 | 39, 956 | 61, 1,459 | 1, 158 |
+| landmarks baked as relief instead | 0 | 8 | 4 | 1 |
+| doors converted | 4 of 5 | 16 of 17 | 10 of 10 | 14 of 14 |
+| reachable from the entrance | 28,966 of 28,998 (99.9 %) | 5,221 of 17,925 (29.1 %) | 24,521 of 28,142 (87.1 %) | 23,372 of 23,501 (99.5 %) |
+| exits unreachable | 0 | 3 | 0 | 0 |
+| autoplay, 2,000 ticks | clean, 1,939 audits | **failed** at tick 967 | clean | clean, 1,938 audits |
+| `all` (s) | 73 | 246 (sprites cached) | 188 | 163 |
+
+First pass, for comparison (same order): reachable unknown, 2,743 of
+15,120 (18 %), 15,499 of 23,392 (66 %), 17,918 of 20,591 (87 %, the same
+Nellis window); doors 3 of 5, 11 of 17, 9 of 10, 14 of 14; every Strip
+exit was unreachable.
+
+**Open hexes everywhere** (standalone), measured against the same build
+with only the hexes near doors open (`out/poc/neardoors/`): reachable
+share 55.8 to 99.9 % (HELIOS), 73.5 to 87.1 % (Primm), 86.1 to 99.5 %
+(Nellis); on the Strip 0 to 13 of 16 exits reachable, 5,117 to 5,221
+hexes. Walls added: HELIOS 3,465 to 3,154 and Nellis 3,068 to 3,115 (the
+open run climbs two ladder steps, the other none), Strip 3,872 to 3,929,
+Primm 3,807 to 3,714. Landmark pieces grow (Strip 324 to 956, Primm 127
+to 1,459), since more walkers must be sorted and the ladder promotes more
+models.
+
+**What works.**
+- Landmarks draw in the 640 x 480 game view: the HELIOS power plant, the
+  Lucky 38's base and the Nellis hangar, all missing from the first pass's
+  game frames.
+- The Strip's ground is textured (100 land layers drew with the default
+  land texture; the first pass showed flat colour).
+- The Nellis black patch is gone: it lay under the far end of the control
+  tower, whose origin is 2,200 units south of the window, so the map
+  stage never handed it to the slicer (the slicer was not the cause; the
+  runway connectors are classified as paved slabs and drawn flat). The
+  tower is now on the map as wall strips.
+- HELIOS and Nellis are almost wholly reachable, autoplay is clean there,
+  and all exits but three on the Strip are reachable.
+
+**What does not, most visible first.**
+1. *Tall landmarks baked flat.* A landmark with any piece beyond the
+   engine's reach above the map is baked whole as relief
+   (`no hex near piece`): Gomorrah, the Lucky 38's top and lights, the
+   Ultra-Luxe front and the monorail platform (Strip), the El Diablo
+   coaster (Primm), the north hangar (Nellis). They lie on the ground as
+   noise and the player walks over them. `map-slicer` (`landmark.rs`).
+2. *The player stands on roofs.* Opening every standable hex opens the
+   navmesh inside open-fronted buildings (hangars, arcades) and under
+   roofs; the player is drawn over a flat roof (Strip entry), or walks
+   under a landmark roof inside the see-through circle (Nellis hangar,
+   HELIOS plant), and crates placed inside a hangar draw over its roof.
+   `mojave-convert` policy and `map-slicer` (pieces do not sort against
+   sprites).
+3. *The Strip splits into islands*: 43 components, the entrance's holds
+   29 %; the largest island (2,637 hexes, two exits) needs an 8-hex
+   passage where the limit is 6; the Lucky 38 door has no walkable
+   neighbour. `map-builder`.
+4. *Autoplay fails on the Strip*: `AuditMismatch` at tick 967 entering
+   `STRI_011.SAV` ("the locals differ"), after 67 clean transitions;
+   repeatable. Engine or `map-builder` stub maps, undiagnosed.
+5. The game view's camera stops short near the map's edges, so several
+   game frames repeat one view (HELIOS 3 to 7). Known since the first
+   pass.
+
+**Deliverables.** `out/poc/best/<area>-1..4.png` (three wide frames and one
+640 x 480 frame per area) and `out/poc/best/contact.png`. The real
+Goodsprings layer, rebuilt without `--standalone`, differs from
+`out/baseline-goodsprings.sha` in six tile images and the floor words of
+15 squares of `maps/goodspri.map` only (46 squares drawn differently);
+`out/baseline-goodsprings-2.sha` holds its new checksums.
+
+## 10. Interiors (2026-11-22)
+
+`mojave-convert` builds a New Vegas interior cell as a standalone,
+walkable demo map with its people standing in it, on the enablers added
+the same day (`GroundSampler::flat` and `mir::storeys`;
+`TerrainOptions::blank_without_land`; `SlicerConfig::interior`;
+`BuildOptions::interior`). Each room is its own layer with its own
+`--out`, built `--standalone`: one storey, doors drawn but leading
+nowhere, no interior lighting, no creatures. The pilot is the Prospector
+Saloon; the slices for Vikki & Vance, the Ultra-Luxe and the Tops are
+written and parse, but are not built yet. The interfaces are in
+`docs/contracts.md` 9.5, the slice keys in `README.md`.
+
+**Converter changes.** New slice keys `interior`, `floor_z`,
+`map_center` (room coordinates), `entrance`, `place_disabled`,
+`clamp_levels`, `cut_height`, `floor_band`, `hang_clearance`,
+`walk_band`, validated (interior-only keys on an exterior slice are an
+error). An interior slice without `--standalone` stops before extract.
+`map-report.md` opens with `## Interior`; `map-features.json` gains the
+room and a ranked `people` list; `shots --auto` aims at the entrance, the
+people, then the walls, with interior defaults for `--spread` (5; people
+1) and the new `--wide-zoom` (0.75). Exterior output is unchanged: the
+Goodsprings layer rebuilt with default options matches
+`out/baseline-goodsprings-2.sha` (6,866 of 6,866 files). Map stage key
+`map-8`.
+
+**Saloon numbers** (`out/interiors/saloon/`, `slices/saloon.toml`, cut
+150):
+
+| | |
+|---|---|
+| references in the room | 461; 120 left out by the slicer (45 above the cut, 24 with no mesh, 23 effects and markers, 13 empty renders, 7 statics starting disabled, the rest minor) |
+| floor | z 3456.9, the one navmesh storey (z 3450 to 3473) |
+| walls added (of 4,096) | 263 |
+| scenery, items added | 110, 89 |
+| floor tiles | 116 distinct (117 in the library with the blank tile) |
+| floor baked | 2,892 triangles from 92 references, 324 hexes |
+| people placed | 8 of 8: Sunny Smiles, Trudy, Joe Cobb, Goodsprings Settler, four Powder Gangers (six of them start disabled in the data) |
+| left out | Cheyenne (a creature: not rendered) |
+| walkable, reachable from the entrance | 207 walkable; 199 reachable (the rest hold the 8 people), one component |
+| doors | 4 teleport doors drawn, none converted |
+| autoplay, 2,000 ticks | clean, 557 actions, 0 refusals |
+| `all` | 40 s from an empty `--out` (extract included), 785 MB peak |
+| `shots`, 14 viewpoints | 8 s, every viewpoint arrived |
+
+**Ceiling cut.** Three builds of the same room compared on engine frames
+(`out/interiors/best/saloon-cuts.png`; builds under
+`out/interiors/saloon-cut210/` and `saloon-cut120/`): at the default 210
+the partitions between bar and pool room stand full height and hide the
+pool table and two people; at 120 everything opens up (the restrooms'
+fittings show) but the jukebox is cut through; 150 keeps the jukebox and
+opens the room. The saloon slice uses 150. The other rooms keep the
+default for now: compare 150 there too.
+
+**Best frames.** `out/interiors/best/saloon-1.png` (wide view, the whole
+room and all eight people, the player by the pool table),
+`saloon-2.png` (wide, from beside the Settler at the bar), `saloon-3.png`
+(640 x 480 game view, the whole room, eight people), `saloon-4.png`
+(game view by Sunny Smiles and two Powder Gangers, pool table and
+jukebox), and `saloon-contact.png`.
+
+**Recipe for another room** (the frozen binary is
+`out/bin/mojave-convert-int`; one conversion at a time):
+
+```
+B=out/bin/mojave-convert-int
+E=target/engine-head/target/release/vault-platform
+F2=<your Fallout 2 folder>
+FNV="<your Fallout New Vegas folder>"
+O=out/interiors/<room>
+$B all --standalone --slice slices/<room>.toml --jobs 3 --fnv "$FNV" --f2 $F2 --out $O
+$B estimate --standalone --slice slices/<room>.toml --fnv "$FNV" --f2 $F2 --out $O   # optional
+printf 'layers = ["mods/mojave"]\n' > $O/load_order.toml
+$E --autoplay-headless --game-profile fallout2 --master-dat $F2/master.dat --critter-dat $F2/critter.dat \
+   --mod-list $O/load_order.toml --preview-map maps/<map>.map --ticks 2000 --autoplay-output $O/engine-check/autoplay
+$B probe walk $O/mods/mojave <map>.map --hop 15
+$B shots --engine $E --f2 $F2 --out $O --auto 8
+$B shots --engine $E --f2 $F2 --out $O --at <hex> --at <hex> ...   # one per person
+```
+
+`<map>` is the slice name cut to eight characters (`saloon`, `vikki-va`,
+`ultra-lu`, `tops`); the people's hexes are in `map-report.md`
+(`## Interior`, "People placed") and `map-features.json`. `shots` writes
+over `<out>/shots/` each run, so copy it away before a second run. Read
+the report's `## Interior` first: the floor, the storeys found, who was
+left out and why. For the Tops, check the clamped people (the builder
+lines "from another level") and whether the sunken area reads.
+
+**What looks wrong, by owner.**
+1. `map-slicer`: one cut for everything. A lower cut that clears
+   partitions also cuts tall furniture (the jukebox at 120); room shells
+   and free-standing objects would want separate cuts
+   (`out/interiors/best/saloon-cuts.png`).
+2. `map-slicer`, data-faithful: the back office (south) is crossed by log
+   beams (`camplog03`, 95 to 110 units up) and the studs of the shack
+   walls, which read as clutter at every cut
+   (`out/interiors/saloon/shots/saloon-12-game.png`).
+3. Unclear: inside the see-through circle in the back hall by the stairs
+   the floor is very dark; the floor bake or the hall's own dark floor
+   (`out/interiors/saloon/shots/saloon-09-wide.png`).
+4. `mojave-convert`: a generic name used once reads "You see Goodsprings
+   Settler." (only names shared by several people take an article).
+5. Critter stage / `map-builder`: creatures are not rendered (Cheyenne).
+6. Not seen as a problem here: ceiling clutter over the floor (none at
+   150), floor seams, people inside furniture, the camera stopping short
+   (the room sits in the middle of the grid), walls hiding the player (the
+   see-through circle works in the back hall). People are lit like
+   outdoors and read a little dark against the dark room.
+
+**Not verified.** Look-at text in a window (only the message files were
+read: `pro_crit.msg` names all five appearances); the three other rooms;
+a window build of the engine (all runs headless).

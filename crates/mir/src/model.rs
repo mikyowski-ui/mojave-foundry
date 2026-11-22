@@ -310,6 +310,38 @@ pub struct LandLayer {
     /// listed is fully transparent. Empty for a base layer.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub opacity: Vec<LayerOpacity>,
+    /// Set when the record gives this layer no usable land texture and the
+    /// engine's default land texture stands in: `texture` is then that
+    /// default ([`crate::Manifest::default_land_texture`]). `None` for a
+    /// layer that names its own texture, and in every document written
+    /// before this field existed (such documents also lack the base layer
+    /// of a quadrant that stores none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defaulted: Option<LandDefault>,
+}
+
+impl LandLayer {
+    /// Whether the engine's default land texture stands in for this layer.
+    pub fn is_defaulted(&self) -> bool {
+        self.defaulted.is_some()
+    }
+}
+
+/// Why a land layer is drawn with the engine's default land texture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LandDefault {
+    /// The quadrant stores no base layer (`BTXT`); this base layer stands
+    /// for the one the engine draws.
+    NoBaseLayer,
+    /// The layer's land texture is null.
+    NullTexture,
+    /// The layer names a form that is not a land texture of the plugin
+    /// list.
+    UnknownTexture,
+    /// The land texture names no texture set, or one without a diffuse
+    /// texture.
+    NoTextureSet,
 }
 
 /// Opacity of a blended layer at one vertex of its quadrant.
@@ -460,6 +492,19 @@ pub struct Reference {
     /// The owner (an NPC or a faction).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<FormKey>,
+    /// The reference is an invisible trigger or activator volume: a
+    /// primitive (`XPRM`) on a reference to an activator (`ACTI`, `TACT`).
+    /// Its base's model, if any, is an editor stand-in and is not drawn;
+    /// the same base placed without a primitive is a visible activator.
+    /// Primitives on markers, acoustic spaces and sounds do not set it.
+    /// Absent from the JSON when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub trigger_volume: bool,
+}
+
+/// Serde helper: skip a `false` flag.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// One triangle of a navigation mesh.
@@ -879,6 +924,12 @@ pub struct Manifest {
     /// decode at all are listed in `records.sqlite` (`bad_records`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub issues: Vec<Issue>,
+    /// The engine's default land texture, normalised, as this extract
+    /// resolved it ([`crate::default_land_texture`]): what a land layer
+    /// with [`LandLayer::defaulted`] set draws. `None` in a manifest
+    /// written before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_land_texture: Option<String>,
 }
 
 impl Manifest {
@@ -1036,5 +1087,20 @@ mod tests {
         assert_eq!(cell_of(&[0.0, 0.0, 0.0]), (0, 0));
         assert_eq!(cell_of(&[4095.9, -0.1, 0.0]), (0, -1));
         assert_eq!(cell_of(&[-4096.0, 8192.0, 0.0]), (-1, 2));
+    }
+
+    /// A document written before `trigger_volume` existed reads as false,
+    /// and a false flag writes the same bytes as before.
+    #[test]
+    fn trigger_volume_is_optional_in_json() {
+        let old = r#"{"form":"a.esm:000900","kind":"object","group":"temporary","base":"a.esm:000850","transform":{"position":[1.0,2.0,3.0],"rotation":[0.0,0.0,0.5],"scale":1.0},"flags":{"persistent":false,"initially_disabled":false,"deleted":false}}"#;
+        let mut reference: Reference = serde_json::from_str(old).unwrap();
+        assert!(!reference.trigger_volume);
+        assert_eq!(serde_json::to_string(&reference).unwrap(), old);
+        reference.trigger_volume = true;
+        let flagged = serde_json::to_string(&reference).unwrap();
+        assert!(flagged.ends_with(r#","trigger_volume":true}"#));
+        let back: Reference = serde_json::from_str(&flagged).unwrap();
+        assert_eq!(back, reference);
     }
 }

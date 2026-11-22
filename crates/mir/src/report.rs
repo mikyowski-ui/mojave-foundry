@@ -5,7 +5,7 @@ use std::fmt::Write as _;
 
 use crate::error::MirError;
 use crate::model::{
-    ActorDoc, ActorKind, AssetEntry, AssetStatus, CELL_UNITS, CellDoc, PartRole, RefKind,
+    ActorDoc, ActorKind, AssetEntry, AssetStatus, CELL_UNITS, CellDoc, PartRole, RefKind, Reference,
 };
 use crate::reader::{Mir, Records};
 
@@ -227,6 +227,7 @@ fn budget<'d>(
     for doc in docs {
         for r in &doc.references {
             if r.flags.deleted
+                || r.trigger_volume
                 || !r
                     .base_kind
                     .as_deref()
@@ -758,15 +759,25 @@ pub fn report(mir: &Mir, params: &ReportParams) -> Result<String, MirError> {
         .flat_map(|d| &d.references)
         .filter(|r| r.teleport.is_some())
         .count();
+    let triggers: Vec<&Reference> = exteriors
+        .iter()
+        .chain(&interiors)
+        .flat_map(|d| &d.references)
+        .filter(|r| r.trigger_volume)
+        .collect();
+    let stand_ins = triggers.iter().filter(|r| r.model.is_some()).count();
     let _ = writeln!(
         out,
-        "- exterior cells: {} ({} with land)\n- interior cells: {}\n- navmeshes: {} with {} triangles\n- teleport doors: {}\n",
+        "- exterior cells: {} ({} with land)\n- interior cells: {}\n- navmeshes: {} with {} triangles\n- teleport doors: {}\n- trigger volumes: {} ({} with a stand-in model, not drawn){}\n",
         exteriors.len(),
         with_land,
         interiors.len(),
         navmeshes,
         triangles,
-        teleports
+        teleports,
+        triggers.len(),
+        stand_ins,
+        default_land_line(manifest, &exteriors),
     );
     if !manifest.interiors.is_empty() {
         let rows: Vec<Vec<String>> = manifest
@@ -1100,6 +1111,54 @@ pub fn report(mir: &Mir, params: &ReportParams) -> Result<String, MirError> {
     let coarse = budget(mir, exteriors.iter(), tile, Some((centre, half)), 60.0);
     write_coarse(&mut out, &coarse);
     Ok(out)
+}
+
+/// The report line on land layers drawn with the default land texture,
+/// with a leading line break; empty when there are none, so that a report
+/// without them reads as before.
+fn default_land_line(manifest: &crate::model::Manifest, exteriors: &[CellDoc]) -> String {
+    let layers: Vec<&crate::model::LandLayer> = exteriors
+        .iter()
+        .filter_map(|d| d.land.as_ref())
+        .flat_map(|l| &l.layers)
+        .collect();
+    let mut reasons: BTreeMap<crate::model::LandDefault, usize> = BTreeMap::new();
+    for reason in layers.iter().filter_map(|l| l.defaulted) {
+        *reasons.entry(reason).or_default() += 1;
+    }
+    let total: usize = reasons.values().sum();
+    if total == 0 {
+        return String::new();
+    }
+    let missing = layers
+        .iter()
+        .filter(|l| l.is_defaulted() && l.texture_hash.is_none())
+        .count();
+    let parts: Vec<String> = reasons
+        .iter()
+        .map(|(reason, n)| {
+            let what = match reason {
+                crate::model::LandDefault::NoBaseLayer => "quadrants without a base layer",
+                crate::model::LandDefault::NullTexture => "null land textures",
+                crate::model::LandDefault::UnknownTexture => "forms that are not land textures",
+                crate::model::LandDefault::NoTextureSet => {
+                    "land textures without a diffuse texture"
+                }
+            };
+            format!("{n} {what}")
+        })
+        .collect();
+    format!(
+        "\n- land layers drawn with the default land texture `{}`: {total} of {} ({}){}",
+        manifest.default_land_texture.as_deref().unwrap_or("?"),
+        layers.len(),
+        parts.join(", "),
+        if missing > 0 {
+            format!("; the texture is missing, so {missing} of them have none")
+        } else {
+            String::new()
+        },
+    )
 }
 
 #[cfg(test)]

@@ -9,7 +9,9 @@
 //! - [`FormatWriters`] / [`LocalWriters`]: the file writers, behind one
 //!   trait so the upstream writers can replace them in one file.
 //! - [`frm`]: sprite placement ([`sprite_shift`], [`crop_to_content`]).
-//! - [`ArtList`]: art list entries under the 4,096-entry FID budget.
+//! - [`ArtList`]: art list entries under the 4,096-entry FID budget;
+//!   [`ArtList::standalone`] for a walls or tiles list that does not
+//!   start from the base list.
 //! - [`critter`]: critter animations ([`critter_frm`], [`still_frm`]);
 //!   [`CritterList`] for `art/critters/critters.lst`;
 //!   [`proto::critter_prototype`] and [`map::critter_object`] for the
@@ -32,7 +34,10 @@ pub mod msg;
 pub mod proto;
 mod writers;
 
-pub use art::{ArtList, CRITTER_LIST_PATH, CritterArt, CritterList, FID_INDEX_CAP, critter_fid};
+pub use art::{
+    ArtList, CRITTER_LIST_PATH, CritterArt, CritterList, FID_INDEX_CAP, RESERVED_TILE_ENTRIES,
+    TILE_CATEGORY, WALL_CATEGORY, critter_fid, standalone_reserved,
+};
 pub use critter::{CritterFrames, HEX_STEPS, RenderedFrame, critter_frm, still_frm};
 pub use error::EmitError;
 pub use frm::{
