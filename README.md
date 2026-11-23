@@ -1,11 +1,31 @@
 # mojave-foundry
 
-An offline pipeline that converts your own Fallout: New Vegas install into a
-Fallout 2 format mod layer for [`vault-engine`]: sprites rendered from the
-3D meshes, hex maps built from the exterior cells, and the tables that tie
-them together.
+> *What if New Vegas had shipped in 1998?*
+
+An offline pipeline that melts down your own Fallout: New Vegas install and
+recasts it as a Fallout 2 format mod layer for [`vault-engine`]. The 3D
+world goes in one end; 256-colour isometric sprites, hex maps and prototype
+tables come out the other, and the Courier gets to walk the Strip the way
+the Chosen One would have seen it.
 
 [`vault-engine`]: https://github.com/mikyowski-ui/vault-engine
+
+What the foundry pours today:
+
+- **Towns and landmarks.** Goodsprings, the Strip at the Lucky 38, Primm,
+  HELIOS One and Nellis, each sliced from the real cells into walls,
+  scenery and floor tiles that fit Fallout 2's art lists.
+- **Rooms you can walk into.** The Prospector Saloon, Vikki & Vance, the
+  Ultra-Luxe and the Tops, floors baked from the room kits, ceilings cut
+  away, and everyone in the cell's data standing where they belong.
+- **People.** Named residents posed from the game's own skeletons and
+  animations and rendered into six-direction sprite sets: stand, fidget,
+  walk.
+- **Proof.** Every layer is loaded in the engine headless, walked by its
+  autoplay bot, and photographed (`mojave-convert shots`).
+
+What it does not pour yet: faces, creatures and robots, working doors
+between rooms and towns, scripts, quests, or anything you could call a game.
 
 ## Rules of use
 
