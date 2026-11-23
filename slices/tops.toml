@@ -1,7 +1,7 @@
 # The Tops casino: an interior demo room (owner brief, 2026-11-22).
 # Coordinates only: the Strip exterior cells (slices/strip.toml), through
 # whose doors extract reaches the room, and the room's cell editor id.
-# Run with --standalone; see README.md. Everyone the data places is placed.
+# Run with --standalone; see docs/running.md. Everyone the data places is placed.
 # The navmesh is one storey by gap splitting, joined by stairs: a main floor
 # near z 8128, a sunken gaming area near 8064 and an upper level near 8448
 # (a mezzanine over part of the main floor: the cashier's cage, the Aces

@@ -1,7 +1,7 @@
 # Vikki & Vance casino: an interior demo room (owner brief, 2026-11-22).
 # Coordinates only: the Primm exterior cells (slices/primm.toml), through
 # whose doors extract reaches the room, and the room's cell editor id.
-# Run with --standalone; see README.md. Everyone the data places is placed.
+# Run with --standalone; see docs/running.md. Everyone the data places is placed.
 # Floor and window centre: the defaults (the main casino floor, z 7296).
 # The gaming pit is 64 units lower (z 7232), on the same navmesh storey:
 # walk_band and floor_band reach down 80 so the pit is walkable, its

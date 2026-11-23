@@ -1,7 +1,7 @@
 # The Ultra-Luxe casino: an interior demo room (owner brief, 2026-11-22).
 # Coordinates only: the Strip exterior cells (slices/strip.toml), through
 # whose doors extract reaches the room, and the room's cell editor id.
-# Run with --standalone; see README.md. Everyone the data places is placed.
+# Run with --standalone; see docs/running.md. Everyone the data places is placed.
 # One navmesh storey on three levels: the sunken gaming pit and central
 # bar (z ~7554 to 7568), its steps and tables (z ~7616 to 7632) and the
 # upper ring and side halls (z ~7680). The default floor (z 7680, walk

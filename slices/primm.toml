@@ -1,6 +1,6 @@
 # Primm: a proof-of-concept window (owner brief, 2026-11-22).
 # Coordinates only: exterior cell ranges and a map centre in source units.
-# Run with --standalone; see README.md.
+# Run with --standalone; see docs/running.md.
 name = "primm"
 worldspace = "WastelandNV"
 plugins = ["FalloutNV.esm"]

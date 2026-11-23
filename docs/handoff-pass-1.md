@@ -595,7 +595,7 @@ the same day (`GroundSampler::flat` and `mir::storeys`;
 nowhere, no interior lighting, no creatures. The pilot is the Prospector
 Saloon; the slices for Vikki & Vance, the Ultra-Luxe and the Tops are
 written and parse, but are not built yet. The interfaces are in
-`docs/contracts.md` 9.5, the slice keys in `README.md`.
+`docs/contracts.md` 9.5, the slice keys in `docs/running.md`.
 
 **Converter changes.** New slice keys `interior`, `floor_z`,
 `map_center` (room coordinates), `entrance`, `place_disabled`,

@@ -1,6 +1,6 @@
 # Nellis Air Force Base: a proof-of-concept window (owner brief, 2026-11-22).
 # Coordinates only: exterior cell ranges and a map centre in source units.
-# Run with --standalone; see README.md.
+# Run with --standalone; see docs/running.md.
 # Centre moved west and north (2026-11-22) to the one the first run found
 # better: the huts and the whole north hangar. Cells: the window's plus one.
 name = "nellis"
