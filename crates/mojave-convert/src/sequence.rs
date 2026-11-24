@@ -311,9 +311,29 @@ impl WalkthroughOptions {
 
 /// The hops of a walk, each with `ticks_per_step * steps + slack` ticks
 /// (or its own, for [`Walk::Walks`]).
+/// Ticks a hop that crosses an exit grid gets on top of its walk: the
+/// engine saves the map and loads the other.
+pub const CROSSING_TICKS: u64 = 40;
+
 pub fn walk_hops(
     walk: &Walk,
     map: &crate::route::WalkMap,
+    hop: usize,
+    ticks_per_step: u64,
+    slack: u64,
+) -> Result<Vec<Hop>, String> {
+    walk_hops_in(walk, map, None, hop, ticks_per_step, slack)
+}
+
+/// [`walk_hops`] over a written layer: a `Through` hex that is an exit
+/// grid of the current map and elevation ends the walk there (the hop is
+/// marked [`Hop::lands`] with the grid's arrival hex), and the walk goes on
+/// from that arrival on the grid's map and elevation, read from
+/// `layer_dir`.
+pub fn walk_hops_in(
+    walk: &Walk,
+    map: &crate::route::WalkMap,
+    layer_dir: Option<&std::path::Path>,
     hop: usize,
     ticks_per_step: u64,
     slack: u64,
@@ -322,13 +342,15 @@ pub fn walk_hops(
     let distance = |a: i32, b: i32| {
         HexGrid::lattice_distance(a, b).map_err(|e| format!("hexes {a} and {b}: {e}"))
     };
-    let exits: Vec<i32> = map.exits.iter().map(|e| e.hex).collect();
     let mut hops = Vec::new();
     match walk {
         Walk::Through(points) => {
+            let mut current = map.clone();
             let mut from = map.entry;
             for &point in points {
-                let route = map
+                let exits: Vec<i32> = current.exits.iter().map(|e| e.hex).collect();
+                let crossing = current.exits.iter().find(|e| e.hex == point).copied();
+                let route = current
                     .route_between(from, point)
                     .ok_or_else(|| format!("no route from hex {from} toward hex {point}"))?;
                 if route.destination != point {
@@ -337,8 +359,28 @@ pub fn walk_hops(
                         route.destination
                     );
                 }
-                hops.extend(route_hops(&route, hop, &exits, ticks));
+                let mut legs = route_hops(&route, hop, &exits, ticks);
                 from = route.destination;
+                if let (Some(exit), Some(dir), true) =
+                    (crossing, layer_dir, route.destination == point)
+                {
+                    if let Some(last) = legs.last_mut() {
+                        last.lands = Some(exit.to_hex);
+                        last.ticks += CROSSING_TICKS;
+                    }
+                    let file = map_file_of(dir, exit.to_map)?;
+                    current = crate::route::WalkMap::load_elevation(
+                        dir,
+                        &file,
+                        exit.to_elevation.clamp(0, 2) as usize,
+                    )?;
+                    eprintln!(
+                        "walkthrough: hex {point} is an exit grid: on to {file} elevation {} hex {}",
+                        exit.to_elevation, exit.to_hex
+                    );
+                    from = exit.to_hex;
+                }
+                hops.extend(legs);
             }
         }
         Walk::Path(path) => {
@@ -356,6 +398,7 @@ pub fn walk_hops(
                     steps,
                     ticks: ticks(steps),
                     path: pair.to_vec(),
+                    lands: None,
                 });
             }
         }
@@ -368,12 +411,25 @@ pub fn walk_hops(
                     steps,
                     ticks: after,
                     path: vec![from, hex],
+                    lands: None,
                 });
                 from = hex;
             }
         }
     }
     Ok(hops)
+}
+
+/// The file name (under `maps/`) of map number `number` of the layer.
+fn map_file_of(layer_dir: &std::path::Path, number: i32) -> Result<String, String> {
+    let layer = map_builder::read_layer(layer_dir).map_err(|e| e.to_string())?;
+    layer
+        .manifest()
+        .maps
+        .iter()
+        .find(|m| m.number as i32 == number)
+        .map(|m| m.file.clone())
+        .ok_or_else(|| format!("map number {number} is not a map of the layer"))
 }
 
 /// The ticks frames are cut at: from `first` every `every` ticks to
@@ -437,6 +493,9 @@ struct HopRecord {
     hex: i32,
     steps: usize,
     ticks: u64,
+    /// The arrival hex of the exit grid the hop ends on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lands: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -469,17 +528,19 @@ pub fn walkthrough(options: &WalkthroughOptions) -> Result<WalkthroughSummary, C
         options.map.as_deref(),
         options.timeout,
     )?;
-    let interior = crate::map::MapFeatures::read(&options.out)
-        .is_ok_and(|f| f.interior.is_some() && f.map_file.trim_start_matches("maps/") == setup.map);
+    let interior = crate::map::MapFeatures::read_for(&options.out, &setup.map)
+        .is_ok_and(|f| f.interior.is_some());
     let wide_zoom = options.wide_zoom.unwrap_or(if interior {
         crate::shots::INTERIOR_WIDE_ZOOM
     } else {
         crate::shots::DEFAULT_WIDE_ZOOM
     });
     let hop = framed_hop(options.hop, &options.framing, wide_zoom);
-    let hops = walk_hops(
+    let layer_dir = options.out.join("mods").join(crate::map::LAYER_ID);
+    let hops = walk_hops_in(
         &options.walk,
         &setup.walk_map,
+        Some(&layer_dir),
         hop,
         options.ticks_per_step,
         options.slack,
@@ -678,6 +739,7 @@ pub fn walkthrough(options: &WalkthroughOptions) -> Result<WalkthroughSummary, C
                 hex: h.hex,
                 steps: h.steps,
                 ticks: h.ticks,
+                lands: h.lands,
             })
             .collect(),
         views: &views,
@@ -733,6 +795,138 @@ pub fn walkthrough_cli(args: &WalkthroughArgs) -> Result<(), String> {
         summary.map,
         summary.dir.join("index.json").display()
     );
+    Ok(())
+}
+
+/// `replay-frames`: films a recorded engine run (an autoplay bundle's
+/// `inputs.jsonl`, or any replay log) by replaying growing prefixes of it
+/// and keeping the last frame of each: what the run showed at those
+/// commands. Writes `<dest>/frame-NNNN.png`, `contact.png` (every
+/// `contact`-th frame) and `run.gif`.
+#[derive(clap::Args, Debug)]
+pub struct ReplayFramesArgs {
+    /// A vault-platform executable.
+    #[arg(long)]
+    pub engine: PathBuf,
+    /// The Fallout 2 install directory.
+    #[arg(long)]
+    pub f2: PathBuf,
+    /// The --out directory of the converted slice (holding mods/mojave).
+    #[arg(long)]
+    pub out: PathBuf,
+    /// The replay log to film.
+    #[arg(long)]
+    pub log: PathBuf,
+    /// The map's file name under maps/ (default: the layer's first map).
+    #[arg(long)]
+    pub map: Option<String>,
+    /// The first command filmed (1-based line of the log).
+    #[arg(long, default_value_t = 1)]
+    pub from: usize,
+    /// The last command filmed (default: the log's last).
+    #[arg(long)]
+    pub to: Option<usize>,
+    /// Commands between two frames.
+    #[arg(long, default_value_t = 20)]
+    pub every: usize,
+    /// Where the frames go (default `<out>/replay-frames/`).
+    #[arg(long)]
+    pub dest: Option<PathBuf>,
+    /// GIF frame time, hundredths of a second.
+    #[arg(long, default_value_t = 12)]
+    pub delay: u16,
+    /// Engine processes at once.
+    #[arg(long, default_value_t = 2)]
+    pub jobs: usize,
+}
+
+/// Runs [`ReplayFramesArgs`].
+pub fn replay_frames_cli(args: &ReplayFramesArgs) -> Result<(), String> {
+    let setup = crate::shots::setup(
+        &args.engine,
+        &args.f2,
+        &args.out,
+        args.map.as_deref(),
+        std::time::Duration::from_secs(600),
+    )
+    .map_err(|e| e.to_string())?;
+    let text = std::fs::read_to_string(&args.log).map_err(|e| format!("--log: {e}"))?;
+    let lines: Vec<&str> = text.lines().collect();
+    let last = args.to.unwrap_or(lines.len()).min(lines.len());
+    let first = args.from.clamp(1, last.max(1));
+    let mut cuts: Vec<usize> = (first..=last).step_by(args.every.max(1)).collect();
+    if cuts.last() != Some(&last) {
+        cuts.push(last);
+    }
+    let dest = args
+        .dest
+        .clone()
+        .unwrap_or_else(|| args.out.join("replay-frames"));
+    let work = dest.join("work");
+    std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+    let engine = &setup.engine;
+    let film = |cut: usize| -> Result<crate::shots::Frame, String> {
+        let log = work.join(format!("log-{cut:05}.jsonl"));
+        let mut body = lines[..cut].join("\n");
+        body.push('\n');
+        std::fs::write(&log, body).map_err(|e| e.to_string())?;
+        engine.run(&log, cut, &work, &format!("frame-{cut:05}"))
+    };
+    let jobs = args.jobs.max(1);
+    let mut frames: Vec<(usize, Result<crate::shots::Frame, String>)> = Vec::new();
+    for chunk in cuts.chunks(jobs) {
+        let results: Vec<(usize, Result<crate::shots::Frame, String>)> =
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = chunk
+                    .iter()
+                    .map(|&cut| scope.spawn(move || (cut, film(cut))))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap_or((0, Err("a worker panicked".to_owned()))))
+                    .collect()
+            });
+        frames.extend(results);
+    }
+    let mut kept: Vec<(usize, crate::shots::Frame)> = Vec::new();
+    for (cut, frame) in frames {
+        match frame {
+            Ok(frame) => kept.push((cut, frame)),
+            Err(e) => eprintln!("command {cut}: {e}"),
+        }
+    }
+    let mut entries = Vec::new();
+    for (cut, frame) in &kept {
+        let mut rgba = Vec::with_capacity(frame.rgb.len() / 3 * 4);
+        for px in frame.rgb.chunks(3) {
+            rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
+        }
+        let png = foundry_gallery::encode_png(&rgba, frame.width, frame.height)
+            .map_err(|e| e.to_string())?;
+        let path = dest.join(format!("frame-{cut:05}.png"));
+        std::fs::write(&path, png).map_err(|e| e.to_string())?;
+        entries.push((format!("command {cut}"), path));
+    }
+    let step = entries.len().div_ceil(16).max(1);
+    let contact: Vec<(String, PathBuf)> = entries.iter().step_by(step).cloned().collect();
+    if !contact.is_empty() {
+        crate::shots::contact_page(
+            &contact,
+            Some("replay frames"),
+            4,
+            [480, 320],
+            &dest.join("contact.png"),
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    let refs: Vec<&crate::shots::Frame> = kept.iter().map(|(_, f)| f).collect();
+    if !refs.is_empty() {
+        let delays = vec![args.delay.max(2); refs.len()];
+        let (gif, stats) = gif::encode(&refs, &delays, 0)?;
+        std::fs::write(dest.join("run.gif"), gif).map_err(|e| e.to_string())?;
+        println!("replay-frames: {} frames, gif {stats:?}", refs.len());
+    }
+    println!("replay-frames: {}", dest.display());
     Ok(())
 }
 

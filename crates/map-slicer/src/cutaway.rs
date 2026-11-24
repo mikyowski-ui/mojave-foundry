@@ -35,8 +35,123 @@ pub(crate) struct Trimmed {
     pub pixels_removed: u64,
     /// Strips left without a pixel: their hexes still block.
     pub emptied: Vec<i32>,
+    /// The hexes of every strip cut.
+    pub cut_hexes: Vec<i32>,
     pub covered_before: BTreeSet<i32>,
     pub covered_after: BTreeSet<i32>,
+}
+
+/// The height above the foot of the surface each canvas pixel shows
+/// (`lift` is the origin's height above the foot).
+fn height_of(canvas: &Canvas, projection: &Projection, lift: f32, i: usize) -> Option<f64> {
+    let w = canvas.width as usize;
+    let d = canvas.depth[i];
+    if !d.is_finite() {
+        return None;
+    }
+    let q = [
+        canvas.origin[0] as f32 + (i % w) as f32 + 0.5,
+        canvas.origin[1] as f32 + (i / w) as f32 + 0.5,
+    ];
+    let local = projection.unproject(q, d);
+    Some(f64::from(local[2]) * f64::from(projection.storey_units()) + f64::from(lift))
+}
+
+/// Column by column, from the bottom up: the first pixel higher than
+/// `limit` and everything drawn above it. Returns (kept, cleared).
+fn crop_columns(
+    canvas: &Canvas,
+    pixels: &[usize],
+    projection: &Projection,
+    lift: f32,
+    limit: f64,
+) -> (Vec<usize>, Vec<usize>) {
+    let w = canvas.width as usize;
+    let mut columns: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for &i in pixels {
+        columns.entry(i % w).or_default().push(i);
+    }
+    let (mut kept, mut cleared) = (Vec::new(), Vec::new());
+    for (_, mut column) in columns {
+        column.sort_unstable_by(|a, b| b.cmp(a));
+        let cut_at = column
+            .iter()
+            .position(|&i| height_of(canvas, projection, lift, i).is_some_and(|e| e > limit))
+            .unwrap_or(column.len());
+        cleared.extend_from_slice(&column[cut_at..]);
+        kept.extend_from_slice(&column[..cut_at]);
+    }
+    kept.sort_unstable();
+    cleared.sort_unstable();
+    (kept, cleared)
+}
+
+/// What the door rule makes of one door sprite.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DoorCut {
+    /// Walkers the whole door hides; none means it stays whole.
+    pub before: Vec<i32>,
+    /// Canvas pixels cleared (empty: whole).
+    pub cleared: Vec<usize>,
+    /// Walkers the stub still hides.
+    pub after: Vec<i32>,
+    /// The stub grew to keep `min_pixels` (a teleport door).
+    pub grown: bool,
+}
+
+/// The door rule (`declutter` module, rule 4) for a door sprite rendered
+/// on `canvas` and anchored at `hex`: when it hides a walker, every column
+/// loses its pixels from the first one higher than `stub` above the foot
+/// upwards. With `min_pixels`, the stub grows by half until at least that
+/// many pixels stay, or the door is whole again.
+pub(crate) fn trim_door(
+    canvas: &Canvas,
+    hex: i32,
+    ground: [i64; 2],
+    projection: &Projection,
+    trim: &Trim<'_>,
+    stub: f32,
+    min_pixels: Option<usize>,
+) -> DoorCut {
+    let w = canvas.width as usize;
+    let mut out = DoorCut::default();
+    if w == 0 {
+        return out;
+    }
+    let pixels: Vec<usize> = (0..w * canvas.height as usize)
+        .filter(|&i| canvas.opaque(i))
+        .collect();
+    let base = [
+        ground[0] + i64::from(canvas.origin[0]) + i64::from(trim.offset[0]),
+        ground[1] + i64::from(canvas.origin[1]) + i64::from(trim.offset[1]),
+    ];
+    let at = |i: usize| [base[0] + (i % w) as i64, base[1] + (i / w) as i64];
+    out.before = hidden(&pixels, hex, &at, trim, false);
+    if out.before.len() <= trim.settings.max_walkers {
+        return out;
+    }
+    let mut limit = f64::from(stub);
+    let tallest = pixels
+        .iter()
+        .filter_map(|&i| height_of(canvas, projection, trim.lift, i))
+        .fold(f64::MIN, f64::max);
+    loop {
+        let (kept, cleared) = crop_columns(canvas, &pixels, projection, trim.lift, limit);
+        let short = min_pixels.is_some_and(|m| kept.len() < m);
+        if short && limit < tallest {
+            limit *= 1.5;
+            out.grown = true;
+            continue;
+        }
+        if short || cleared.is_empty() {
+            // Whole again: nothing cut.
+            out.after = out.before.clone();
+            return out;
+        }
+        out.after = hidden(&kept, hex, &at, trim, false);
+        out.cleared = cleared;
+        return out;
+    }
 }
 
 /// The walkers a set of canvas pixels (all owned by strip hex `strip`)
@@ -200,6 +315,7 @@ pub(crate) fn trim(
         }
         kept.sort_unstable();
         out.cut += 1;
+        out.cut_hexes.push(strip);
         if kept.is_empty() {
             out.emptied.push(strip);
         }

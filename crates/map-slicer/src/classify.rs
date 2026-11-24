@@ -214,6 +214,39 @@ pub enum SkipReason {
     /// Declutter, interior mode: a beam, duct, plank or fixture hanging
     /// over walkable hexes ([`crate::OverhangRule`]).
     Overhang,
+    /// A wire or lattice prop, dropped ([`crate::WireRule::drop`]).
+    Wire,
+    /// The model is a tree in a format the converter does not read
+    /// (SpeedTree `.spt`): it has no mesh.
+    TreeFormat,
+}
+
+/// The share of a mesh's triangle area whose material is alpha-tested or
+/// blended (wires, lattices, foliage cards, cut-outs); `None` without any
+/// area.
+pub fn masked_share(mesh: &StaticMesh) -> Option<f64> {
+    let (mut area, mut masked) = (0.0f64, 0.0f64);
+    for primitive in mesh.primitives.iter().filter(|p| p.is_well_formed()) {
+        let alpha = primitive.material.alpha != nif::AlphaMode::Opaque;
+        for tri in primitive.indices.as_chunks::<3>().0 {
+            let [a, b, c] = tri.map(|i| primitive.positions[i as usize].map(f64::from));
+            let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let w = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            let n = [
+                u[1] * w[2] - u[2] * w[1],
+                u[2] * w[0] - u[0] * w[2],
+                u[0] * w[1] - u[1] * w[0],
+            ];
+            let half = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt() * 0.5;
+            if half.is_finite() {
+                area += half;
+                if alpha {
+                    masked += half;
+                }
+            }
+        }
+    }
+    (area > 0.0).then(|| masked / area)
 }
 
 impl SkipReason {
@@ -242,6 +275,8 @@ impl SkipReason {
             SkipReason::ClutterDensity => "clutter density",
             SkipReason::Decal => "decal",
             SkipReason::Overhang => "overhang",
+            SkipReason::Wire => "wire prop",
+            SkipReason::TreeFormat => "tree format not converted",
         }
     }
 
@@ -388,8 +423,8 @@ fn is_slab(footprint: &Footprint, facts: &MeshFacts, scale: f32, config: &Slicer
 ///
 /// 1. deleted, initially disabled, a trigger volume → skip;
 /// 2. a base kind in `skip_kinds` → skip;
-/// 3. no model or no converted mesh → skip; a model matching
-///    `skip_patterns` → skip;
+/// 3. no model or no converted mesh → skip (a SpeedTree `.spt` model as
+///    [`SkipReason::TreeFormat`]); a model matching `skip_patterns` → skip;
 /// 4. `facts` missing or without geometry → skip;
 /// 5. items, doors and containers → one sprite each, whatever their size;
 /// 6. a model matching `flat_patterns`, or a height under `flat_height` →
@@ -433,6 +468,14 @@ pub fn classify(
         return Class::Skip(SkipReason::Kind(kind.unwrap_or_default().to_owned()));
     }
     let (Some(model), Some(_)) = (reference.model.as_deref(), reference.mesh.as_deref()) else {
+        // SpeedTree models are never converted to meshes: say so.
+        if reference
+            .model
+            .as_deref()
+            .is_some_and(|m| m.to_ascii_lowercase().ends_with(".spt"))
+        {
+            return Class::Skip(SkipReason::TreeFormat);
+        }
         return Class::Skip(SkipReason::NoMesh);
     };
     let model = model.to_ascii_lowercase().replace('/', "\\");
@@ -463,6 +506,12 @@ pub fn classify(
     }
     if kind_in(&config.container_kinds, kind) {
         return Class::Sprite(Role::Container);
+    }
+    // A deck of an upper exterior level is that level's ground.
+    if !config.flat_references.is_empty()
+        && config.flat_references.contains(&reference.form.to_string())
+    {
+        return Class::GroundFlat;
     }
     // Indoors, only what lies on the floor is flattened onto it.
     let on_floor = interior.is_none_or(|i| i.on_floor(footprint.z[0]));

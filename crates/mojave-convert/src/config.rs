@@ -118,6 +118,70 @@ pub struct SliceSpec {
     /// Needs the declutter pass on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tone: Option<crate::declutter::ToneSpec>,
+    /// `loot = true`: items, filled containers, locked doors, armed and
+    /// sided people (`crate::catalogue`). Absent or `false`: off, and the
+    /// map is what it was before loot existed. `--loot` wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loot: Option<bool>,
+    /// The critter stage's animation level: `"minimal"` (the default: a
+    /// stand, a walk and stills, byte for byte the first wave),
+    /// `"combat"` or `"full"`. `--animations` wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub animations: Option<String>,
+    /// Falls and corpses: `"ragdoll"` (default) or `"game"`. Needs a level
+    /// above minimal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deaths: Option<String>,
+    /// Walk travel against the grid: `"exact"` (default), `"matched"` or
+    /// `"whole_hexes"`. Needs a level above minimal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stride: Option<String>,
+    /// How figures are drawn: `"default"` or `"readable"` (the figures
+    /// tone and a dark rim). Needs a level above minimal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub figure_look: Option<String>,
+    /// `footprints = true`: block every hex under the placed bounds of
+    /// furniture (single sprites, and small sliced references indoors).
+    /// Default off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footprints: Option<bool>,
+    /// The map's file stem (1 to 8 of `[a-z0-9_-]`). Default: the slice's
+    /// name, cut to eight characters. A layer needs distinct stems.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub map: Option<String>,
+    /// Interior only: `"one"` (the default outside a layer: one storey, as
+    /// before) or `"auto"` (the default in a layer: every floor of the
+    /// cell's navmesh its own elevation, `map_builder::storeys`, stairs as
+    /// exit grids; more than three floors spill into further maps).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storeys: Option<String>,
+    /// Interior only, with `storeys = "auto"`: which floors (0 the lowest,
+    /// as `map_builder::storeys::split_storeys` sorts them) become
+    /// elevations 0, 1, 2, in this order. The others are left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storey_floors: Option<Vec<usize>>,
+    /// Exterior only: `"one"` (the default: one level, as before) or
+    /// `"auto"` (`map_builder::levels::split_levels`: surfaces over one
+    /// another on different elevations, ramps as exit grids).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub levels: Option<String>,
+    /// `wire = true`: wire and lattice props (shopping carts) are drawn
+    /// solid (`map_slicer::WireRule`); with it the Fallout 3 readable
+    /// preset no longer prunes shopping carts as clutter. Default off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire: Option<bool>,
+    /// Which hexes a navmesh triangle covers: `"tolerance"` (the default),
+    /// `"centre"` or `"share:F"` (at least share `F` of the hex's pixels;
+    /// `"share:0.5"` is recommended indoors with footprints).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub navmesh_coverage: Option<String>,
+    /// How the readability count judges a figure: `"any"` (the default,
+    /// one pixel covers) or `"visible"` (more than a quarter of the box).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sight: Option<String>,
+    /// How the entrance rule judges a figure: `"any"` or `"visible"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrance_sight: Option<String>,
 }
 
 /// `game = "fo3" | "fnv"` (the longer ids `fallout3` and `falloutnv` are
@@ -174,6 +238,20 @@ impl Default for SliceSpec {
             entrance: None,
             declutter: None,
             tone: None,
+            loot: None,
+            animations: None,
+            deaths: None,
+            stride: None,
+            figure_look: None,
+            footprints: None,
+            map: None,
+            storeys: None,
+            storey_floors: None,
+            levels: None,
+            wire: None,
+            navmesh_coverage: None,
+            sight: None,
+            entrance_sight: None,
         }
     }
 }
@@ -225,6 +303,8 @@ impl SliceSpec {
                 y: SPRINGVALE_Y,
                 interior_depth: 1,
                 map_center: Some(SPRINGVALE_CENTER),
+                loot: Some(true),
+                animations: Some("combat".to_owned()),
                 ..Self::default()
             }),
             _ => None,
@@ -312,11 +392,94 @@ impl SliceSpec {
         if let Some(declutter) = &self.declutter {
             declutter.validate(self.tone.as_ref())?;
         }
+        self.critter_settings()?;
         self.validate_interior()
     }
 
+    /// The keys added with layers (`map`, `storeys`, `storey_floors`,
+    /// `levels`, `navmesh_coverage`, `sight`, `entrance_sight`).
+    fn validate_layer_keys(&self) -> Result<(), String> {
+        if let Some(map) = &self.map
+            && !((1..=8).contains(&map.len())
+                && map.bytes().all(|b| {
+                    b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-'
+                }))
+        {
+            return Err(format!(
+                "map {map:?}: 1 to 8 lowercase letters, digits, '_' or '-'"
+            ));
+        }
+        for (key, value) in [("storeys", &self.storeys), ("levels", &self.levels)] {
+            if let Some(v) = value
+                && v != "one"
+                && v != "auto"
+            {
+                return Err(format!("{key} = {v:?}: expected \"one\" or \"auto\""));
+            }
+        }
+        if self.storey_floors.is_some() && self.storeys.as_deref() == Some("one") {
+            return Err("storey_floors needs storeys = \"auto\"".to_owned());
+        }
+        if let Some(floors) = &self.storey_floors {
+            let unique: std::collections::BTreeSet<&usize> = floors.iter().collect();
+            if floors.is_empty() || floors.len() > 3 || unique.len() != floors.len() {
+                return Err("storey_floors: one to three distinct floor indices".to_owned());
+            }
+        }
+        if let Some(text) = &self.navmesh_coverage {
+            parse_coverage(text)?;
+        }
+        for text in [&self.sight, &self.entrance_sight].into_iter().flatten() {
+            parse_sight(text)?;
+        }
+        if self.interior.is_some() && self.levels.is_some() {
+            return Err("levels applies to an exterior slice (storeys to an interior)".to_owned());
+        }
+        if self.interior.is_none() && (self.storeys.is_some() || self.storey_floors.is_some()) {
+            return Err(
+                "storeys and storey_floors apply to an interior slice (levels to an exterior)"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+
+    /// The map file stem: `map`, else the name's first eight characters.
+    pub fn map_stem(&self) -> String {
+        self.map
+            .clone()
+            .unwrap_or_else(|| crate::map::map_stem(&self.name))
+    }
+
+    /// The builder's coverage rule (`navmesh_coverage`), default
+    /// tolerance.
+    pub fn coverage(&self) -> map_builder::walk::NavmeshCoverage {
+        self.navmesh_coverage
+            .as_deref()
+            .and_then(|t| parse_coverage(t).ok())
+            .unwrap_or(map_builder::walk::NavmeshCoverage::Tolerance)
+    }
+
+    /// The builder's readability and entrance sight rules.
+    pub fn sight_rules(&self) -> (map_builder::cover::SightRule, map_builder::cover::SightRule) {
+        let rule = |t: &Option<String>| {
+            t.as_deref()
+                .and_then(|t| parse_sight(t).ok())
+                .unwrap_or(map_builder::cover::SightRule::AnyPixel)
+        };
+        (rule(&self.sight), rule(&self.entrance_sight))
+    }
+
+    /// Whether this slice is built through the layer path on its own: its
+    /// storeys or levels split (a one-map layer).
+    pub fn wants_layer(&self) -> bool {
+        self.storeys.as_deref() == Some("auto") || self.levels.as_deref() == Some("auto")
+    }
+
     fn validate_interior(&self) -> Result<(), String> {
+        self.validate_layer_keys()?;
         let Some(id) = &self.interior else {
+            // `entrance` also names an exterior map's entrance target.
             let set: Vec<&str> = [
                 ("floor_z", self.floor_z.is_some()),
                 ("place_disabled", self.place_disabled),
@@ -325,12 +488,17 @@ impl SliceSpec {
                 ("floor_band", self.floor_band.is_some()),
                 ("hang_clearance", self.hang_clearance.is_some()),
                 ("walk_band", self.walk_band.is_some()),
-                ("entrance", self.entrance.is_some()),
             ]
             .into_iter()
             .filter(|(_, on)| *on)
             .map(|(key, _)| key)
             .collect();
+            if self
+                .entrance
+                .is_some_and(|p| !p.iter().all(|v| v.is_finite()))
+            {
+                return Err("entrance is not finite".to_owned());
+            }
             if set.is_empty() {
                 return Ok(());
             }
@@ -389,6 +557,26 @@ impl SliceSpec {
             );
         }
         Ok(())
+    }
+
+    /// The slice's critter stage keys, parsed (each `None` when absent).
+    pub fn critter_settings(&self) -> Result<CritterSettings, String> {
+        let level = self
+            .animations
+            .as_deref()
+            .map(|t| t.parse::<crate::critters::AnimationLevel>())
+            .transpose()
+            .map_err(|e| format!("animations = {e}"))?;
+        let deaths = self.deaths.as_deref().map(parse_deaths).transpose()?;
+        let stride = self.stride.as_deref().map(parse_stride).transpose()?;
+        let look = self.figure_look.as_deref().map(parse_look).transpose()?;
+        Ok(CritterSettings {
+            level,
+            deaths,
+            stride,
+            look,
+            only: Vec::new(),
+        })
     }
 
     /// The game whose master the plugin list starts with, if it does.
@@ -461,6 +649,99 @@ impl SliceSpec {
     }
 }
 
+/// The critter stage's settings from the command line or the slice
+/// (`None`: not given there).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CritterSettings {
+    pub level: Option<crate::critters::AnimationLevel>,
+    pub deaths: Option<crate::critters::DeathSource>,
+    pub stride: Option<crate::critters::Stride>,
+    /// `true` for the readable look.
+    pub look: Option<bool>,
+    /// `--only`: editor ids to render.
+    pub only: Vec<String>,
+}
+
+impl CritterSettings {
+    /// `self` where given, else `other`.
+    pub fn or(&self, other: &CritterSettings) -> CritterSettings {
+        CritterSettings {
+            level: self.level.or(other.level),
+            deaths: self.deaths.or(other.deaths),
+            stride: self.stride.or(other.stride),
+            look: self.look.or(other.look),
+            only: if self.only.is_empty() {
+                other.only.clone()
+            } else {
+                self.only.clone()
+            },
+        }
+    }
+}
+
+/// `ragdoll` or `game`.
+pub fn parse_deaths(text: &str) -> Result<crate::critters::DeathSource, String> {
+    match text {
+        "ragdoll" => Ok(crate::critters::DeathSource::Ragdoll),
+        "game" => Ok(crate::critters::DeathSource::Game),
+        other => Err(format!("deaths {other:?}: expected ragdoll or game")),
+    }
+}
+
+/// `exact`, `matched` or `whole_hexes` (`whole-hexes` too).
+pub fn parse_stride(text: &str) -> Result<crate::critters::Stride, String> {
+    match text {
+        "exact" => Ok(crate::critters::Stride::Exact),
+        "matched" => Ok(crate::critters::Stride::Matched),
+        "whole_hexes" | "whole-hexes" => Ok(crate::critters::Stride::WholeHexes),
+        other => Err(format!(
+            "stride {other:?}: expected exact, matched or whole_hexes"
+        )),
+    }
+}
+
+/// `tolerance`, `centre` (`center`) or `share:F` with `F` in (0, 1].
+pub fn parse_coverage(text: &str) -> Result<map_builder::walk::NavmeshCoverage, String> {
+    use map_builder::walk::NavmeshCoverage;
+    match text {
+        "tolerance" => Ok(NavmeshCoverage::Tolerance),
+        "centre" | "center" => Ok(NavmeshCoverage::Centre),
+        other => {
+            let share = other
+                .strip_prefix("share:")
+                .and_then(|s| s.trim().parse::<f32>().ok())
+                .filter(|s| s.is_finite() && *s > 0.0 && *s <= 1.0)
+                .ok_or_else(|| {
+                    format!(
+                        "navmesh_coverage {other:?}: expected \"tolerance\", \"centre\" or \
+                         \"share:F\" with F in (0, 1]"
+                    )
+                })?;
+            Ok(NavmeshCoverage::Share(share))
+        }
+    }
+}
+
+/// `any` (one pixel covers) or `visible` (`SightRule::VISIBLE`).
+pub fn parse_sight(text: &str) -> Result<map_builder::cover::SightRule, String> {
+    match text {
+        "any" => Ok(map_builder::cover::SightRule::AnyPixel),
+        "visible" => Ok(map_builder::cover::SightRule::VISIBLE),
+        other => Err(format!("sight {other:?}: expected \"any\" or \"visible\"")),
+    }
+}
+
+/// `default` (false) or `readable` (true).
+pub fn parse_look(text: &str) -> Result<bool, String> {
+    match text {
+        "default" => Ok(false),
+        "readable" => Ok(true),
+        other => Err(format!(
+            "figure look {other:?}: expected default or readable"
+        )),
+    }
+}
+
 /// The validated inputs of a run. Both installs are required for every
 /// stage: the source game for content, Fallout 2 for the palette, fonts,
 /// interface art and sound effects the output relies on.
@@ -494,6 +775,25 @@ pub struct Inputs {
     /// `--declutter off|readable`: overrides the slice's declutter profile.
     /// `None` leaves it to the slice and the game's default.
     pub declutter: Option<String>,
+    /// `--loot on|off`: overrides the slice's `loot`. `None` leaves it to
+    /// the slice (default off).
+    pub loot: Option<bool>,
+    /// `--rebalance <file>`: the rebalance tables (`crate::rebalance`).
+    /// `None` looks for `rebalance/<game>.toml` beside the slice.
+    pub rebalance: Option<PathBuf>,
+    /// The slice file, when `--slice` named one: the default rebalance
+    /// file is looked for beside it.
+    pub slice_file: Option<PathBuf>,
+    /// `--animations`, `--deaths`, `--stride`, `--figure-look`, `--only`:
+    /// over the slice's keys.
+    pub critter: CritterSettings,
+    /// A layer of several maps (`--slice <file>.layer.toml`,
+    /// `crate::layer`); `slice` is then the union the extract, sprite and
+    /// critter stages run over. `None`: one slice, one map, as before.
+    pub layer: Option<crate::layer::LayerSpec>,
+    /// `--with-interiors`: build the exterior slice with every interior its
+    /// doors lead to (depth 1) into one layer.
+    pub with_interiors: bool,
 }
 
 impl Inputs {
@@ -539,7 +839,80 @@ impl Inputs {
             outline: false,
             standalone: false,
             declutter: None,
+            loot: None,
+            rebalance: None,
+            slice_file: None,
+            critter: CritterSettings::default(),
+            layer: None,
+            with_interiors: false,
         })
+    }
+
+    /// The layer this run builds, if any: the layer file's, or the
+    /// exterior slice with `--with-interiors`, or a slice that splits its
+    /// storeys or levels (a one-map layer).
+    pub fn layer_spec(&self) -> Option<crate::layer::LayerSpec> {
+        if let Some(layer) = &self.layer {
+            return Some(layer.clone());
+        }
+        if self.with_interiors && !self.slice.is_interior() {
+            return Some(crate::layer::LayerSpec::with_interiors_of(&self.slice));
+        }
+        self.slice
+            .wants_layer()
+            .then(|| crate::layer::LayerSpec::single(&self.slice))
+    }
+
+    /// These inputs for one map of a layer: its slice, everything else the
+    /// run's.
+    pub fn for_map(&self, slice: &SliceSpec) -> Inputs {
+        Inputs {
+            slice: slice.clone(),
+            layer: None,
+            with_interiors: false,
+            ..self.clone()
+        }
+    }
+
+    /// Whether this run builds items and loot: `--loot`, else the slice's
+    /// `loot`, else off.
+    pub fn loot_on(&self) -> bool {
+        self.loot.or(self.slice.loot).unwrap_or(false)
+    }
+
+    /// The critter settings of this run: the command line's, else the
+    /// slice's.
+    pub fn critter_settings(&self) -> Result<CritterSettings, ConvertError> {
+        let slice = self
+            .slice
+            .critter_settings()
+            .map_err(|reason| ConvertError::Slice {
+                name: self.slice.name.clone(),
+                reason,
+            })?;
+        Ok(self.critter.or(&slice))
+    }
+
+    /// The rebalance tables of this run (`crate::rebalance`): `--rebalance`,
+    /// else `rebalance/<game>.toml` beside the slice file (or the working
+    /// directory) or above, else the built-in defaults.
+    pub fn rebalance(&self) -> Result<crate::rebalance::LoadedRebalance, ConvertError> {
+        let error = |reason: String| ConvertError::stage("rebalance", reason);
+        if let Some(path) = &self.rebalance {
+            return crate::rebalance::LoadedRebalance::from_file(self.game, path).map_err(error);
+        }
+        let start = self
+            .slice_file
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        match crate::rebalance::find_default(self.game, &start) {
+            Some(path) => {
+                crate::rebalance::LoadedRebalance::from_file(self.game, &path).map_err(error)
+            }
+            None => Ok(crate::rebalance::LoadedRebalance::built_in(self.game)),
+        }
     }
 
     /// The declutter profile name this run uses: `--declutter`, else the
@@ -565,14 +938,27 @@ impl Inputs {
         out: &Path,
         jobs: usize,
     ) -> Result<Self, ConvertError> {
-        let spec = match slice {
-            Some(name) => SliceSpec::resolve(name)?,
-            None => {
+        // A layer file (`*.layer.toml`): its maps' union is the run's slice.
+        let layer = match slice {
+            Some(name) if crate::layer::is_layer_file(name) => {
+                Some(crate::layer::LayerSpec::load(Path::new(name))?)
+            }
+            _ => None,
+        };
+        let spec = match (&layer, slice) {
+            (Some(layer), _) => layer.union_slice(),
+            (None, Some(name)) => SliceSpec::resolve(name)?,
+            (None, None) => {
                 let game = crate::source::resolve(install, None)?.game;
                 SliceSpec::resolve(SliceSpec::default_name(game))?
             }
         };
-        Self::for_install(install, f2, out, spec, jobs)
+        let mut inputs = Self::for_install(install, f2, out, spec, jobs)?;
+        inputs.layer = layer;
+        inputs.slice_file = slice
+            .filter(|name| SliceSpec::preset(name).is_none())
+            .map(PathBuf::from);
+        Ok(inputs)
     }
 
     /// Replaces the default calibration with the one in a TOML file.
@@ -604,8 +990,38 @@ impl Inputs {
                 reason,
             })?;
         }
+        // A figure look needs a level above minimal; refused here, before
+        // extract, as the critter stage would refuse it.
+        let settings = self.critter_settings()?;
+        let minimal = settings
+            .level
+            .is_none_or(|l| l == crate::critters::AnimationLevel::Minimal);
+        let toned = self
+            .slice
+            .tone
+            .as_ref()
+            .is_some_and(|t| t.figures.is_some());
+        if minimal && (settings.look == Some(true) || toned) {
+            return Err(ConvertError::Slice {
+                name: self.slice.name.clone(),
+                reason: "a figure look (figure_look = \"readable\", [tone.figures]) needs \
+                         animations = \"combat\" or \"full\""
+                    .to_owned(),
+            });
+        }
+        // Every map of a layer is checked as its own slice would be; an
+        // interior of a layer shares the layer's lists and needs no
+        // standalone mode of its own.
+        if let Some(layer) = &self.layer {
+            for map in &layer.maps {
+                let mut one = self.for_map(&map.slice);
+                one.standalone = one.standalone || map.slice.is_interior();
+                one.check_mode()?;
+            }
+            return Ok(());
+        }
         match &self.slice.interior {
-            Some(id) if !self.standalone => Err(ConvertError::Slice {
+            Some(id) if !self.standalone && !self.slice.wants_layer() => Err(ConvertError::Slice {
                 name: self.slice.name.clone(),
                 reason: format!(
                     "interior {id} builds a standalone demo map (its own walls and tiles \
@@ -877,6 +1293,12 @@ interior = "TestRoomInterior"
             outline: false,
             standalone: false,
             declutter: None,
+            loot: None,
+            rebalance: None,
+            slice_file: None,
+            critter: CritterSettings::default(),
+            layer: None,
+            with_interiors: false,
         };
         let error = inputs.check_mode().expect_err("refused").to_string();
         assert!(error.contains("--standalone"), "{error}");

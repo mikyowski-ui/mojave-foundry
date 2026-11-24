@@ -17,9 +17,12 @@ pub struct Exit {
     pub hex: i32,
     pub to_map: i32,
     pub to_hex: i32,
+    /// The destination elevation.
+    pub to_elevation: i32,
 }
 
-/// Elevation 0 of one map as a walker sees it.
+/// One elevation of one map (elevation 0 unless loaded with
+/// [`WalkMap::load_elevation`]) as a walker sees it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WalkMap {
     /// `maps/<file>`.
@@ -32,7 +35,16 @@ pub struct WalkMap {
     pub blocked: Vec<bool>,
     /// Exit grids, sorted.
     pub exits: Vec<Exit>,
+    /// Where a walk starts: the map's entry hex on its entry elevation;
+    /// on another elevation the first arrival hex of an exit grid leading
+    /// there (stairs), or 0 when nothing leads there.
     pub entry: i32,
+    /// The elevation loaded, and the map's entry elevation.
+    pub elevation: usize,
+    pub entry_elevation: usize,
+    /// Arrival hexes on this elevation of exit grids leading here from
+    /// this map's other elevations, sorted.
+    pub arrivals: Vec<i32>,
 }
 
 /// No parent yet (not reached).
@@ -175,6 +187,11 @@ impl WalkMap {
     /// critter, scenery or wall art and it is neither hidden nor
     /// non-blocking; a multi-hex object also stops its six neighbours.
     pub fn load(layer_dir: &Path, map: &str) -> Result<Self, String> {
+        Self::load_elevation(layer_dir, map, 0)
+    }
+
+    /// [`WalkMap::load`] of elevation `elevation` (0 to 2).
+    pub fn load_elevation(layer_dir: &Path, map: &str, elevation: usize) -> Result<Self, String> {
         use vault_formats::map::{MapFile, ObjectDetail, ObjectState};
         use vault_formats::pro::BasicFlags;
         use vault_formats::pro_catalog::LocalPrototypeCatalog;
@@ -207,17 +224,58 @@ impl WalkMap {
         let parsed = MapFile::parse_for(bytes, &catalog, GameProfile::Fallout2)
             .map_err(|e| format!("{path}: {e}"))?;
 
+        if elevation > 2 {
+            return Err(format!(
+                "elevation {elevation}: a map has elevations 0 to 2"
+            ));
+        }
+        // The map's own number, for grids between its elevations.
+        let own_number = map_builder::read_layer(layer_dir).ok().and_then(|l| {
+            l.manifest()
+                .maps
+                .iter()
+                .find(|m| m.file == map)
+                .map(|m| m.number as i32)
+        });
+        let mut arrivals = Vec::new();
+        for (e, list) in parsed.objects.elevations.iter().enumerate() {
+            if e == elevation {
+                continue;
+            }
+            for object in list {
+                if let ObjectState::Other {
+                    detail:
+                        ObjectDetail::ExitGrid {
+                            map: to,
+                            hex: at,
+                            elevation: to_e,
+                            ..
+                        },
+                    ..
+                } = &object.state
+                    && Some(*to) == own_number
+                    && *to_e as usize == elevation
+                {
+                    arrivals.push(*at);
+                }
+            }
+        }
+        arrivals.sort_unstable();
+        arrivals.dedup();
         let mut blocked = vec![false; HEXES];
         let mut exits = Vec::new();
         let mut blockers = 0usize;
-        for object in &parsed.objects.elevations[0] {
+        for object in &parsed.objects.elevations[elevation] {
             let Some(hex) = object.hex.filter(|h| in_grid(*h)) else {
                 continue;
             };
             if let ObjectState::Other {
                 detail:
                     ObjectDetail::ExitGrid {
-                        map: to, hex: at, ..
+                        map: to,
+                        hex: at,
+                        elevation: to_e,
+                        ..
                     },
                 ..
             } = &object.state
@@ -226,6 +284,7 @@ impl WalkMap {
                     hex,
                     to_map: *to,
                     to_hex: *at,
+                    to_elevation: *to_e,
                 });
             }
             let stops = object.flags.0 & (BasicFlags::HIDDEN.0 | BasicFlags::NONBLOCKING.0) == 0
@@ -242,13 +301,22 @@ impl WalkMap {
             }
         }
         exits.sort_unstable();
+        let entry_elevation = parsed.header.entry_elevation.clamp(0, 2) as usize;
+        let entry = if elevation == entry_elevation {
+            parsed.header.entry_hex
+        } else {
+            arrivals.first().copied().unwrap_or(0)
+        };
         Ok(Self {
             path,
-            objects: parsed.objects.elevations[0].len(),
+            objects: parsed.objects.elevations[elevation].len(),
             blockers,
             blocked,
             exits,
-            entry: parsed.header.entry_hex,
+            entry,
+            elevation,
+            entry_elevation,
+            arrivals,
         })
     }
 
@@ -329,6 +397,9 @@ mod tests {
             blocked: vec![false; HEXES],
             exits: Vec::new(),
             entry,
+            elevation: 0,
+            entry_elevation: 0,
+            arrivals: Vec::new(),
         }
     }
 
@@ -421,6 +492,7 @@ mod tests {
                 hex: hex(105, r),
                 to_map: 152,
                 to_hex: 1,
+                to_elevation: 0,
             });
         }
         let route = map.route_to(hex(110, 100)).expect("a route");

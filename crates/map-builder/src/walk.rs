@@ -215,7 +215,8 @@ pub struct WalkStats {
     pub triangles_too_high: usize,
     pub triangles_unreadable: usize,
     /// Interior builds: triangles skipped as outside the floor level's
-    /// band (an upper storey, a cellar). Always 0 on an exterior build.
+    /// band (an upper storey, a cellar); exterior levels: triangles of
+    /// other levels. Always 0 on a one-level exterior build.
     pub triangles_off_level: usize,
     /// Hexes some triangle covers.
     pub covered: usize,
@@ -304,13 +305,40 @@ pub fn walkability(
 
 /// Hex centres in tile space, binned by floor square, for rasterizing
 /// triangles.
-struct Raster {
-    centres: Vec<[f64; 2]>,
+pub(crate) struct Raster {
+    pub centres: Vec<[f64; 2]>,
     buckets: Vec<Vec<u32>>,
 }
 
 impl Raster {
-    fn new(frame: &Frame) -> Self {
+    /// Every hex whose centre the tile-space triangle `tri` covers (within
+    /// `tolerance` tiles), in bucket order.
+    pub(crate) fn hexes_under(&self, tri: [[f64; 2]; 3], tolerance: f64) -> Vec<u32> {
+        let lo = [0, 1]
+            .map(|axis| tri.iter().map(|p| p[axis]).fold(f64::INFINITY, f64::min) - tolerance);
+        let hi = [0, 1].map(|axis| {
+            tri.iter()
+                .map(|p| p[axis])
+                .fold(f64::NEG_INFINITY, f64::max)
+                + tolerance
+        });
+        let mut out = Vec::new();
+        if hi[0] < 0.0 || hi[1] < 0.0 || lo[0] >= BUCKETS as f64 || lo[1] >= BUCKETS as f64 {
+            return out;
+        }
+        for by in bucket(lo[1])..=bucket(hi[1]) {
+            for bx in bucket(lo[0])..=bucket(hi[0]) {
+                for &hex in &self.buckets[by * BUCKETS + bx] {
+                    if covers(self.centres[hex as usize], tri, tolerance) {
+                        out.push(hex);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    pub(crate) fn new(frame: &Frame) -> Self {
         let centres: Vec<[f64; 2]> = (0..HEXES as i32)
             .map(|hex| frame.hex_centre_tile(hex).unwrap_or([f64::NAN; 2]))
             .collect();
@@ -348,11 +376,172 @@ impl Raster {
             }
         }
     }
+
+    /// Set, in `masks`, the bit of every sample (hex centre plus
+    /// `offsets[k]`, tile space) the triangle covers.
+    fn fill_samples(&self, tri: [[f64; 2]; 3], offsets: &[[f64; 2]], masks: &mut [u64]) {
+        // A hex's samples lie within about half a tile of its centre.
+        let reach = offsets
+            .iter()
+            .map(|o| o[0].abs().max(o[1].abs()))
+            .fold(0.0f64, f64::max);
+        let lo =
+            [0, 1].map(|axis| tri.iter().map(|p| p[axis]).fold(f64::INFINITY, f64::min) - reach);
+        let hi = [0, 1].map(|axis| {
+            tri.iter()
+                .map(|p| p[axis])
+                .fold(f64::NEG_INFINITY, f64::max)
+                + reach
+        });
+        if hi[0] < 0.0 || hi[1] < 0.0 || lo[0] >= BUCKETS as f64 || lo[1] >= BUCKETS as f64 {
+            return;
+        }
+        for by in bucket(lo[1])..=bucket(hi[1]) {
+            for bx in bucket(lo[0])..=bucket(hi[0]) {
+                for &hex in &self.buckets[by * BUCKETS + bx] {
+                    let hex = hex as usize;
+                    let c = self.centres[hex];
+                    for (k, o) in offsets.iter().enumerate() {
+                        let bit = 1u64 << k;
+                        if masks[hex] & bit == 0 && covers([c[0] + o[0], c[1] + o[1]], tri, 0.0) {
+                            masks[hex] |= bit;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Which hexes a navmesh triangle covers ([`BuildOptions::navmesh_coverage`]).
+///
+/// A hex is about 70 source units across (half a floor square), and the
+/// navmesh stops at furniture: a pool table or a counter is a hole in it.
+/// The tolerance rule calls a hex covered when its centre comes within
+/// [`BuildOptions::navmesh_tolerance`] (24 units) of a triangle, so a hex
+/// whose centre lies under the edge of a table counts as floor. The two
+/// stricter rules are for interiors.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum NavmeshCoverage {
+    /// The hex centre lies inside a triangle or within
+    /// [`BuildOptions::navmesh_tolerance`] source units of it. The default,
+    /// and the rule of every earlier build.
+    #[default]
+    Tolerance,
+    /// The hex centre lies inside a triangle (no tolerance).
+    Centre,
+    /// At least this share (0 to 1) of the hex's own ground lies inside
+    /// the triangles: the hex's screen pixels (those `HexGrid::pick_hex`
+    /// gives the hex), sampled every [`SHARE_STEP`] pixels, taken to the
+    /// ground plane. Above 0; 1 asks for every sample.
+    Share(f32),
+}
+
+/// Screen pixels between the samples of [`NavmeshCoverage::Share`].
+pub const SHARE_STEP: i64 = 4;
+
+/// The screen offsets, from a hex's centre, of the samples of
+/// [`NavmeshCoverage::Share`]: every [`SHARE_STEP`] pixels, those that
+/// `pick_hex` gives the hex itself (the shape is the same for every hex).
+fn share_offsets() -> Vec<[i64; 2]> {
+    let grid = HexGrid::default();
+    let hex = 100 * 200 + 100;
+    let Ok(centre) = grid.hex_center(hex) else {
+        return vec![[0, 0]];
+    };
+    let mut out = Vec::new();
+    let mut dy = -16;
+    while dy <= 16 {
+        let mut dx = -24;
+        while dx <= 24 {
+            let p = [centre[0] + dx, centre[1] + dy];
+            if grid.pick_hex([p[0] as i32, p[1] as i32]) == Some(hex) {
+                out.push([dx, dy]);
+            }
+            dx += SHARE_STEP;
+        }
+        dy += SHARE_STEP;
+    }
+    if out.is_empty() {
+        out.push([0, 0]);
+    }
+    out
+}
+
+/// Hexes covered by triangles under a [`NavmeshCoverage`] rule.
+struct Coverage {
+    raster: Raster,
+    mode: NavmeshCoverage,
+    /// Tiles.
+    tolerance: f64,
+    covered: Vec<bool>,
+    /// [`NavmeshCoverage::Share`]: per hex, the samples covered so far.
+    masks: Vec<u64>,
+    offsets: Vec<[f64; 2]>,
+}
+
+impl Coverage {
+    fn new(frame: &Frame, options: &BuildOptions) -> Self {
+        let raster = Raster::new(frame);
+        let mode = options.navmesh_coverage;
+        let tolerance = match mode {
+            NavmeshCoverage::Tolerance => {
+                f64::from(options.navmesh_tolerance.max(0.0)) / frame.tile_units()
+            }
+            NavmeshCoverage::Centre | NavmeshCoverage::Share(_) => 0.0,
+        };
+        let (masks, offsets) = match mode {
+            NavmeshCoverage::Share(_) => {
+                let offsets: Vec<[f64; 2]> = share_offsets()
+                    .into_iter()
+                    .take(64)
+                    .map(|o| frame.tile_of_screen([o[0] as f64, o[1] as f64]))
+                    .collect();
+                (vec![0u64; HEXES], offsets)
+            }
+            _ => (Vec::new(), Vec::new()),
+        };
+        Self {
+            raster,
+            mode,
+            tolerance,
+            covered: vec![false; HEXES],
+            masks,
+            offsets,
+        }
+    }
+
+    fn add(&mut self, tri: [[f64; 2]; 3]) {
+        match self.mode {
+            NavmeshCoverage::Share(_) => {
+                self.raster
+                    .fill_samples(tri, &self.offsets, &mut self.masks)
+            }
+            _ => self.raster.fill(tri, self.tolerance, &mut self.covered),
+        }
+    }
+
+    /// The raster and the covered hexes.
+    fn finish(mut self) -> (Raster, Vec<bool>) {
+        if let NavmeshCoverage::Share(share) = self.mode {
+            let n = self.offsets.len() as f64;
+            let need = (f64::from(share.clamp(0.0, 1.0)) * n).ceil().max(1.0) as u32;
+            for (hex, mask) in self.masks.iter().enumerate() {
+                self.covered[hex] = mask.count_ones() >= need;
+            }
+        }
+        (self.raster, self.covered)
+    }
 }
 
 /// [`walkability`] with the reason for every hex. With
 /// [`BuildOptions::interior`] set this is [`interior_verdicts`], and
-/// `sampler` is not read.
+/// `sampler` is not read. With [`BuildOptions::level`] only that level's
+/// triangles are rasterized, at any height above the terrain (no "too
+/// high" filter; [`WalkStats::triangles_off_level`] counts the others), a
+/// hex they cover is walkable unless blocked (the terrain slope under a
+/// deck plays no part), and a hex in a cell without a navmesh is judged by
+/// slope on level 0 and is [`Verdict::NoGround`] above it.
 pub fn verdicts(
     frame: &Frame,
     sampler: &GroundSampler,
@@ -364,11 +553,8 @@ pub fn verdicts(
         return interior_verdicts(frame, cells, blocked, options, interior);
     }
     let mut stats = WalkStats::default();
-    let raster = Raster::new(frame);
-    let centres = &raster.centres;
-    let tolerance = f64::from(options.navmesh_tolerance.max(0.0)) / frame.tile_units();
+    let mut coverage = Coverage::new(frame, options);
     let max_height = f64::from(options.navmesh_max_height);
-    let mut covered = vec![false; HEXES];
     let mut nav_cells = BTreeSet::new();
     for cell in cells.iter().filter(|cell| !cell.is_interior()) {
         let mir::CellLocation::Exterior { x, y, .. } = &cell.location else {
@@ -378,6 +564,7 @@ pub fn verdicts(
             if !navmesh.triangles.is_empty() {
                 nav_cells.insert((*x, *y));
             }
+            let form = options.level.as_ref().map(|_| navmesh.form.to_string());
             for index in 0..navmesh.triangles.len() {
                 stats.triangles += 1;
                 let Some(corners) = navmesh.corners(index) else {
@@ -386,6 +573,18 @@ pub fn verdicts(
                 };
                 if corners.iter().flatten().any(|v| !v.is_finite()) {
                     stats.triangles_unreadable += 1;
+                    continue;
+                }
+                if let (Some(level), Some(form)) = (&options.level, &form) {
+                    // Exterior levels: the level's triangles, at any height.
+                    if !level.triangles.contains(&(form.clone(), index as u32)) {
+                        stats.triangles_off_level += 1;
+                        continue;
+                    }
+                    stats.triangles_rasterized += 1;
+                    let tri =
+                        corners.map(|v| frame.tile_of_source(f64::from(v[0]), f64::from(v[1])));
+                    coverage.add(tri);
                     continue;
                 }
                 let too_high = corners.iter().all(|v| {
@@ -399,10 +598,12 @@ pub fn verdicts(
                 }
                 stats.triangles_rasterized += 1;
                 let tri = corners.map(|v| frame.tile_of_source(f64::from(v[0]), f64::from(v[1])));
-                raster.fill(tri, tolerance, &mut covered);
+                coverage.add(tri);
             }
         }
     }
+    let (raster, covered) = coverage.finish();
+    let centres = &raster.centres;
     let limit = options.slope_limit;
     let mut verdicts = vec![Verdict::OffGrid; HEXES];
     for hex in 0..HEXES {
@@ -416,6 +617,45 @@ pub fn verdicts(
         let [x, y] = frame.source_of_tile(c);
         let cell = mir::cell_of(&[x as f32, y as f32, 0.0]);
         let has_navmesh = nav_cells.contains(&cell);
+        if let Some(level) = &options.level {
+            // Exterior levels: the navmesh is trusted at any height; off it
+            // the ground level keeps the slope rule, an upper level has no
+            // ground.
+            let verdict = if covered[hex] {
+                None
+            } else if has_navmesh {
+                stats.rejected_navmesh += 1;
+                Some(Verdict::OffNavmesh)
+            } else if level.level > 0 {
+                stats.rejected_no_ground += 1;
+                Some(Verdict::NoGround)
+            } else {
+                stats.slope_only += 1;
+                match sampler.slope(x as f32, y as f32) {
+                    Some(slope) if slope <= limit => None,
+                    Some(_) => {
+                        stats.rejected_slope += 1;
+                        Some(Verdict::TooSteep)
+                    }
+                    None => {
+                        stats.rejected_no_ground += 1;
+                        Some(Verdict::NoGround)
+                    }
+                }
+            };
+            if let Some(verdict) = verdict {
+                verdicts[hex] = verdict;
+                continue;
+            }
+            if blocked.get(hex).copied().unwrap_or(false) {
+                stats.rejected_blocked += 1;
+                verdicts[hex] = Verdict::Blocked;
+                continue;
+            }
+            verdicts[hex] = Verdict::Walkable;
+            stats.walkable += 1;
+            continue;
+        }
         if !has_navmesh {
             stats.slope_only += 1;
         } else if !covered[hex] {
@@ -492,8 +732,9 @@ fn interior_triangles<'a>(
 
 /// Walkability of an interior demo (crate notes, "Interior demo"): a hex
 /// is [`Verdict::Walkable`] when a navmesh triangle of an interior cell
-/// whose every corner lies in [`InteriorBuild::band`] covers its centre
-/// (within [`BuildOptions::navmesh_tolerance`]) and `blocked` does not hold
+/// whose every corner lies in [`InteriorBuild::band`] covers it (by
+/// [`BuildOptions::navmesh_coverage`]: by default its centre, within
+/// [`BuildOptions::navmesh_tolerance`]) and `blocked` does not hold
 /// it; [`Verdict::OffNavmesh`] when no such triangle covers it (exterior
 /// cells, slope and terrain play no part); [`Verdict::Blocked`] when one
 /// does but it is blocked. [`WalkStats::triangles_off_level`] counts the
@@ -507,9 +748,7 @@ pub fn interior_verdicts(
     interior: &InteriorBuild,
 ) -> (Vec<Verdict>, WalkStats) {
     let mut stats = WalkStats::default();
-    let raster = Raster::new(frame);
-    let tolerance = f64::from(options.navmesh_tolerance.max(0.0)) / frame.tile_units();
-    let mut covered = vec![false; HEXES];
+    let mut coverage = Coverage::new(frame, options);
     for level in interior_triangles(cells, interior) {
         stats.triangles += 1;
         match level {
@@ -518,10 +757,11 @@ pub fn interior_verdicts(
             Level::On(corners) => {
                 stats.triangles_rasterized += 1;
                 let tri = corners.map(|v| frame.tile_of_source(f64::from(v[0]), f64::from(v[1])));
-                raster.fill(tri, tolerance, &mut covered);
+                coverage.add(tri);
             }
         }
     }
+    let (raster, covered) = coverage.finish();
     let mut verdicts = vec![Verdict::OffGrid; HEXES];
     for hex in 0..HEXES {
         if !raster.centres[hex][0].is_finite() {
@@ -771,6 +1011,94 @@ mod tests {
         let flat = [[0.0, 0.0], [4.0, 0.0], [8.0, 0.0]];
         assert!(covers([3.0, 0.05], flat, 0.1));
         assert!(!covers([3.0, 1.0], flat, 0.1));
+    }
+
+    /// An interior cell with two floor rectangles at z 0, a gap of `gap`
+    /// units between them along x (a counter the navmesh stops at).
+    fn gapped_floor(gap: f32) -> CellDoc {
+        let rect = |x0: f32, x1: f32| {
+            [
+                [[x0, -400.0, 0.0], [x1, -400.0, 0.0], [x1, 400.0, 0.0]],
+                [[x0, -400.0, 0.0], [x1, 400.0, 0.0], [x0, 400.0, 0.0]],
+            ]
+        };
+        let mut vertices = Vec::new();
+        let mut triangles = Vec::new();
+        for t in rect(-600.0, -gap / 2.0)
+            .into_iter()
+            .chain(rect(gap / 2.0, 600.0))
+        {
+            let base = vertices.len() as u32;
+            vertices.extend_from_slice(&t);
+            triangles.push(mir::NavTriangleDoc {
+                vertices: [base, base + 1, base + 2],
+                links: [-1; 3],
+                flags: 0,
+            });
+        }
+        CellDoc {
+            schema_version: mir::SCHEMA_VERSION,
+            form: mir::FormKey::new("synthetic.esm", 0x9100),
+            editor_id: None,
+            name: None,
+            location: mir::CellLocation::Interior,
+            flags: 1,
+            water_height: None,
+            land: None,
+            references: Vec::new(),
+            navmeshes: vec![mir::NavmeshDoc {
+                form: mir::FormKey::new("synthetic.esm", 0x9101),
+                vertices,
+                triangles,
+                cover_triangles: Vec::new(),
+                door_links: Vec::new(),
+                external_links: Vec::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn the_stricter_coverage_rules_drop_hexes_at_the_navmesh_edge() {
+        let frame = frame();
+        let cells = [gapped_floor(140.0)];
+        let covered = |coverage: NavmeshCoverage| -> BTreeSet<i32> {
+            let options = BuildOptions {
+                interior: Some(InteriorBuild::new(0.0)),
+                navmesh_coverage: coverage,
+                ..BuildOptions::default()
+            };
+            standable_hexes(&frame, &GroundSampler::default(), &cells, &options)
+                .into_iter()
+                .collect()
+        };
+        let tolerance = covered(NavmeshCoverage::Tolerance);
+        let centre = covered(NavmeshCoverage::Centre);
+        let quarter = covered(NavmeshCoverage::Share(0.25));
+        let half = covered(NavmeshCoverage::Share(0.5));
+        let most = covered(NavmeshCoverage::Share(0.75));
+        assert!(centre.is_subset(&tolerance) && centre.len() < tolerance.len());
+        assert!(most.is_subset(&half) && half.is_subset(&quarter));
+        assert!(most.len() < half.len() && half.len() < quarter.len());
+        // Deep inside the floor every rule covers the hex; in the middle of
+        // the gap none does (70 units from either edge).
+        let inside = frame.hex_of_source(-350.0, 0.0).unwrap();
+        let gap = frame.hex_of_source(0.0, 0.0).unwrap();
+        for set in [&tolerance, &centre, &quarter, &half, &most] {
+            assert!(set.contains(&inside));
+            assert!(!set.contains(&gap));
+        }
+        // The default is the tolerance rule: verdicts are unchanged.
+        let default = BuildOptions {
+            interior: Some(InteriorBuild::new(0.0)),
+            ..BuildOptions::default()
+        };
+        assert_eq!(default.navmesh_coverage, NavmeshCoverage::Tolerance);
+        let samples = share_offsets();
+        assert!(
+            samples.len() > 8 && samples.len() <= 64,
+            "{}",
+            samples.len()
+        );
     }
 
     #[test]

@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 use mojave_convert::{Inputs, SliceSpec};
 
+pub mod mini_mart;
+
 pub struct Fixture {
     pub root: tempfile::TempDir,
     pub fnv: PathBuf,

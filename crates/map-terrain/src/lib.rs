@@ -19,7 +19,9 @@
 //!    lights a surface; the ground is multiplied by
 //!    `max(0, 1 + relief · (shade(n) / shade(up) − 1))`, so flat ground
 //!    keeps its texture colour and `relief` scales the departure.
-//! 3. **Overlays** are alpha-composited over the ground in the order given.
+//! 3. **Tone and overlays.** The land colour takes the optional tone curve
+//!    ([`TerrainOptions::tone`], none by default), then the overlays are
+//!    alpha-composited over it in the order given.
 //! 4. **Quantization** per tile with `quantize_at` and ordered dither at
 //!    the tile's absolute corner, so the pattern is continuous across
 //!    tiles.
@@ -81,7 +83,7 @@ mod tests;
 
 use std::time::{Duration, Instant};
 
-use foundry_render::{Calibration, Projection};
+use foundry_render::{Calibration, Projection, Tone};
 use mir::{GroundSampler, MapWindow, Mir};
 use quantize::{Dither, PaletteMap};
 use vault_formats::geometry::HexGrid;
@@ -211,6 +213,15 @@ pub struct TerrainOptions {
     /// Weight of seam continuity against a square's own error when the
     /// quantizer picks its substitute (default 1, 0 is off, at most 100).
     pub seam_weight: f32,
+    /// A tone curve for the land colour (the declutter pass's floor tone,
+    /// `foundry_render::Tone`): applied to each pixel's land colour after
+    /// texture, vertex colour and relief, **before** the overlays are
+    /// composited over it, then the result is quantized. Overlays are left
+    /// alone because the slicer tones its baked floor and flat overlays
+    /// itself. Ground with no land under
+    /// [`TerrainOptions::blank_without_land`] (black) is not toned. `None`
+    /// (the default) or [`foundry_render::Tone::IDENTITY`] changes no byte.
+    pub tone: Option<Tone>,
 }
 
 impl Default for TerrainOptions {
@@ -231,6 +242,7 @@ impl Default for TerrainOptions {
             blank_without_land: false,
             cluster_iterations: 8,
             seam_weight: 1.0,
+            tone: None,
         }
     }
 }
@@ -290,6 +302,12 @@ impl TerrainOptions {
                 "cluster_iterations",
                 format!("{} is above 100", self.cluster_iterations),
             );
+        }
+        if let Some(tone) = &self.tone {
+            tone.validate().map_err(|e| TerrainError::InvalidOption {
+                key: "tone",
+                reason: e.to_string(),
+            })?;
         }
         Ok(())
     }
@@ -608,6 +626,7 @@ pub fn build_ground_from(
                 map,
                 dither,
                 options.blank_without_land,
+                options.tone.filter(|t| !t.is_identity()),
             )
         },
     );
@@ -733,6 +752,7 @@ fn evaluate_square(
     map: &PaletteMap,
     dither: Dither,
     blank_without_land: bool,
+    tone: Option<Tone>,
 ) -> Result<SquareTile, TerrainError> {
     let corner = grid
         .square_corner(square, false)
@@ -757,6 +777,8 @@ fn evaluate_square(
     let mut missing = 0;
     let mut defaulted = 0;
     let mut drawn = 0u64;
+    // Pass 1: the land colour of every pixel of the square.
+    let mut land_pixels: Vec<(i32, i32, [f32; 3], bool)> = Vec::new();
     for py in 0..th {
         for px in 0..tw {
             let point = [corner[0] + px, corner[1] + py];
@@ -769,41 +791,61 @@ fn evaluate_square(
             missing += u64::from(sample.missing);
             defaulted += u64::from(sample.defaulted);
             let blank = blank_without_land && sample.fallback;
-            let mut rgb = if blank {
+            let rgb = if blank {
                 [0.0; 3]
             } else {
                 sample.rgb.map(|c| c.clamp(0.0, 255.0))
             };
-            let mut covered = false;
-            for overlay in &touching {
-                let ox = i64::from(point[0]) - i64::from(overlay.origin[0]);
-                let oy = i64::from(point[1]) - i64::from(overlay.origin[1]);
-                if ox < 0
-                    || oy < 0
-                    || ox >= i64::from(overlay.width)
-                    || oy >= i64::from(overlay.height)
-                {
-                    continue;
-                }
-                let at = ((oy * i64::from(overlay.width) + ox) * 4) as usize;
-                let px = &overlay.rgba[at..at + 4];
-                covered |= px[3] > 0;
-                let alpha = f32::from(px[3]) / 255.0;
-                for k in 0..3 {
-                    rgb[k] += (f32::from(px[k]) - rgb[k]) * alpha;
-                }
+            land_pixels.push((px, py, rgb, blank));
+        }
+    }
+    // The land tone, on the land colour only (crate notes on
+    // `TerrainOptions::tone`); without one the colours are untouched.
+    if let Some(tone) = tone {
+        let mut buffer: Vec<u8> = land_pixels
+            .iter()
+            .flat_map(|(_, _, rgb, blank)| {
+                let [r, g, b] = rgb.map(|c| (c + 0.5) as u8);
+                [r, g, b, if *blank { 0 } else { 255 }]
+            })
+            .collect();
+        tone.apply(&mut buffer);
+        for (pixel, toned) in land_pixels.iter_mut().zip(buffer.as_chunks::<4>().0) {
+            if !pixel.3 {
+                pixel.2 = [toned[0], toned[1], toned[2]].map(f32::from);
             }
-            if blank && !covered {
-                // Not drawn: index 0.
+        }
+    }
+    // Pass 2: the overlays over it.
+    for (px, py, land_rgb, blank) in land_pixels {
+        let point = [corner[0] + px, corner[1] + py];
+        let mut rgb = land_rgb;
+        let mut covered = false;
+        for overlay in &touching {
+            let ox = i64::from(point[0]) - i64::from(overlay.origin[0]);
+            let oy = i64::from(point[1]) - i64::from(overlay.origin[1]);
+            if ox < 0 || oy < 0 || ox >= i64::from(overlay.width) || oy >= i64::from(overlay.height)
+            {
                 continue;
             }
-            drawn += 1;
-            let at = (py * tw + px) as usize * 4;
+            let at = ((oy * i64::from(overlay.width) + ox) * 4) as usize;
+            let px = &overlay.rgba[at..at + 4];
+            covered |= px[3] > 0;
+            let alpha = f32::from(px[3]) / 255.0;
             for k in 0..3 {
-                rgba[at + k] = (rgb[k] + 0.5) as u8;
+                rgb[k] += (f32::from(px[k]) - rgb[k]) * alpha;
             }
-            rgba[at + 3] = 255;
         }
+        if blank && !covered {
+            // Not drawn: index 0.
+            continue;
+        }
+        drawn += 1;
+        let at = (py * tw + px) as usize * 4;
+        for k in 0..3 {
+            rgba[at + k] = (rgb[k] + 0.5) as u8;
+        }
+        rgba[at + 3] = 255;
     }
     let indexed = quantize::quantize_at(&rgba, TILE_WIDTH, TILE_HEIGHT, map, dither, corner)?;
     Ok(SquareTile {

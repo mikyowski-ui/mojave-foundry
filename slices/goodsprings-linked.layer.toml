@@ -1,0 +1,19 @@
+# Goodsprings and the Prospector Saloon (New Vegas) as one layer: the
+# control of door links on the first game converted. The town (the built-in
+# goodsprings slice) and the saloon (saloon.toml, one storey), their doors
+# linked both ways; loot on. Run with --standalone; see docs/running.md
+# ("Layers").
+name = "goodsprings-linked"
+start = "goodspri"
+
+[all_maps]
+loot = true
+
+[[maps]]
+slice = "goodsprings"
+map = "goodspri"
+
+[[maps]]
+slice = "saloon.toml"
+map = "saloon"
+storeys = "one"

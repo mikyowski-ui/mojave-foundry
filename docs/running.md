@@ -12,6 +12,7 @@ Status, commands, slice keys and build notes. The overview is in the
 | M2 | Sprite foundry and Fallout 2 emission adapters | done, verified on a real install |
 | M3 | Goodsprings exterior as a native Fallout 2 map | done; loads, draws and walks in the engine headless, exits work both ways; see the handoff for what it found |
 | M4 | Skinned characters, faces, ragdoll deaths | first wave done: townsfolk stand and idle on the map, posed from the game's skeleton and animations; no faces, creatures or death art yet |
+| Phase B | Items, loot, sides; layers of linked maps, interior storeys, exterior levels | done on Fallout 3 and New Vegas; the Super-Duper Mart, Megaton, Springvale and Goodsprings layers load, link both ways and cross their stairs in the engine; see handoff section 11 |
 | M5 | Script transpiler and the Goodsprings quests | not started |
 
 ## Running
@@ -148,10 +149,33 @@ the replay logs and engine logs in `work/`.
 `megaton.toml` (the town, in its own worldspace `MegatonWorld`),
 `super-duper-mart-exterior.toml`, and two rooms, `super-duper-mart.toml`
 and `megaton-saloon.toml` (Moriarty's Saloon, cut at 120). What their
-first conversion showed is in `docs/handoff-pass-1.md` section 11.
+first conversion showed is in `docs/handoff-pass-1.md` section 11. All five say `loot = true` and
+`animations = "combat"` (items, loot, sides; people drawn with their
+fights and the weapon they carry); the two rooms also say
+`[declutter] profile = "readable"`, and the Super-Duper Mart
+`footprints = true` (Moriarty's keeps them off: with them its bar closes
+the way to the back). What the Phase B conversion of the two rooms showed
+is at the end of handoff section 11.
 
 ```
 mojave-convert all --standalone --fo3 <Fallout 3> --f2 <Fallout 2> --slice slices/fo3/super-duper-mart.toml --jobs 2 --out <dir>
+```
+
+Beside them, three layer files build several of these into one layer
+("Layers" below): `super-duper-mart.layer.toml` (the car park and the
+two-storey store), `megaton.layer.toml` (the town on three elevations,
+Moriarty's, Craterside Supply, the clinic) and `springvale.layer.toml`
+(the town and the bandit house); `slices/goodsprings-linked.layer.toml` is
+New Vegas's (Goodsprings and the Prospector Saloon).
+
+The decluttered saloon against the plain one (two runs, then one page of
+their map previews and the same viewpoints in the engine):
+
+```
+mojave-convert all --standalone --slice slices/saloon.toml --fnv <New Vegas> --f2 <Fallout 2> --out <plain>
+mojave-convert all --standalone --declutter readable --slice slices/saloon.toml --fnv <New Vegas> --f2 <Fallout 2> --out <readable>
+mojave-convert before-after --before <plain> --after <readable> --out saloon-pairs.png
+mojave-convert shots --engine <vault-platform> --f2 <Fallout 2> --out <readable> --at <hex> --at <hex> --classic
 ```
 
 ### Interior demo rooms
@@ -238,6 +262,204 @@ sprites the figures tone. `map-report.md` gains `## Declutter` (the
 profile and its source, pruned by rule, kept and pruned by kind, protected
 by reason, the cutaway, the floor before and after) and `## Readability`
 (`BuildReport::readability_summary`, written on every run).
+
+### Loot, sides and the rebalance tables
+
+`loot = true` in a slice, or `--loot on` (on `map`, `all`, `estimate`;
+`--loot off` wins over the slice), gives the map real items: one item
+prototype per weapon, armour, ammunition, aid item, key and other item
+the window places, its containers hold or its people carry, each with its
+record's name, a short generated description, a ground sprite and an
+inventory icon; containers filled (leveled lists drawn once per
+container), locked containers and doors, keys; and its people armed,
+armoured and on a side. Off (the default for every slice that does not
+say so), nothing changes. The Fallout 3 slices have it on.
+
+```
+mojave-convert all --standalone --fo3 <Fallout 3> --f2 <Fallout 2> --slice slices/fo3/super-duper-mart.toml --jobs 2 --out <dir>
+mojave-convert map --standalone --loot on --rebalance my-tables.toml ...
+```
+
+The figures come from the rebalance tables: `rebalance/fo3.toml` and
+`rebalance/fnv.toml`, full copies of the built-in defaults with a header
+saying how to tune. A run reads `--rebalance <file>`, else
+`rebalance/<game>.toml` beside the slice file or in a directory above it
+(the working directory for a built-in slice), else the built-in tables;
+a file only needs the keys it changes. Besides `emit`'s tables (damage,
+action points, ranges, armour, ammunition, aid, fighters, weapon classes,
+calibres, skills) the file has the converter's own:
+
+| Table | What |
+|---|---|
+| `[convert.weapons]` | `by_animation`: a weapon record's animation type to its class; `energy_skill`; `[[convert.weapons.rules]]` refine by editor-id pattern, animation type and skill (knives, swords and axes are blades, spears, shotguns, SMGs, flamers; plasma, electric, pulse and explosive damage) |
+| `[convert.hostility]` | `player_faction`, `hostile_aggression` (2), `enemy_aggression` (1), `hostile_patterns` (used only when an actor has no AI data), `friendly_patterns`, `hostile_team` (66), `hostile_packet` ("Merc Raider") and `hostile_packet_number` (136), `friendly_team` and `friendly_packet` (empty: the builder's defaults) |
+| `[convert.loot]` | `level` (1: the player level leveled lists are drawn at), `max_carried` (12), `max_contents` (24) |
+
+A person is hostile when its AI data (after its templates) says very
+aggressive or frenzied, unless one of its factions and the player's are
+friends; or aggressive with a faction that is the player's enemy. Hostile
+people share the hostile team and AI packet; the rest stay on the
+builder's peaceful team. Fallout 2 critters attack the player only when
+attacked (or scripted); in the engine's autoplay the bot attacks every
+unscripted critter of another team.
+
+`map-report.md` gains `## Loot` (item prototypes by kind, containers
+filled, locks, keys, people with their side, the reason, packet, team,
+weapon, armour and kit, and every item with its figures) and
+`## Furniture`; `## Characters` gives each sprite set's files and bytes
+and the `critters.lst` rows used. `gallery/items-NN.png` shows every
+item's ground sprite with its inventory icon. `footprints = true` in a
+slice blocks the hexes under furniture (tables, counters, shelves,
+freezers) found by the slicer.
+
+### Layers: several maps, storeys and levels
+
+A **layer file** (`<name>.layer.toml`, given to `--slice`) builds several
+slices into one layer and one `--out`: an exterior and the interiors its
+doors lead to, the doors linked both ways (an exit grid on each side
+arriving on a walkable hex beside the partner door), doors leading outside
+the build keeping their stub maps, one art budget for the whole layer.
+
+```toml
+name = "super-duper-mart"     # the layer; the report's title
+start = "sdmart"              # the start map's stem (default: the first map)
+with_interiors = false        # also every interior the exterior's doors lead to
+
+[all_maps]                    # slice keys laid over every map's slice
+loot = true
+wire = true
+[all_maps.declutter]
+profile = "readable"
+
+[[maps]]
+slice = "super-duper-mart-exterior.toml"   # relative to the layer file, or a built-in name
+map = "sdmart"                              # any slice key: overrides the file's
+
+[[maps]]
+slice = "super-duper-mart.toml"
+map = "sdmartin"
+storeys = "auto"
+
+[[maps]]
+interior = "MegatonClinic"    # no slice file: the first exterior's keys, as an interior
+```
+
+Every map must be of one game, one plugin list and one worldspace: extract,
+sprites and critters run once over their union (the union of the cell
+ranges, the deepest `interior_depth`; above the minimal animation level the
+critter stage renders only the people the maps place). Map stems must be
+distinct (`map` names one; an exterior's stub maps take its first four
+letters, so two exteriors need different heads). An interior of a layer
+splits its storeys unless it says `storeys = "one"`, and needs no
+`--standalone` of its own (the layer's lists are shared; the layers checked
+in are run standalone). `--with-interiors` on `map`, `all` and `estimate`
+turns an exterior slice into such a layer: every interior its doors (in the
+window) lead to, each with the exterior's keys, `place_disabled = true`,
+`storeys = "auto"` and a stem from its editor id (`MegatonClinic` in
+`MegatonWorld` is `clinic`).
+
+| Slice key | Default | What |
+|---|---|---|
+| `map` | the name's first eight characters | the map file stem |
+| `storeys` | `one` (`auto` in a layer) | interior: every storey of the navmesh its own elevation (`map_builder::storeys::split_storeys`; navmesh floors within one band of a larger floor's height are one storey; the three largest storeys are kept), the stairs and ramps between them paired exit grids |
+| `storey_floors` | the three largest | interior, with `storeys = "auto"`: which storeys (0 the lowest) become elevations 0, 1, 2, in order |
+| `levels` | `one` | exterior: `auto` splits the navmesh into levels that never lie over one another (`map_builder::levels::split_levels`), up to three elevations, ramps between them paired exit grids |
+| `entrance` | (none) | on an exterior too: the source point `[x, y]` the entrance is sought near (`BuildOptions::entrance_near`); with `levels = "auto"` and no `entrance`, the window's first door leading to another worldspace |
+| `wire` | off | wire props (shopping carts) drawn solid (`map_slicer::WireRule`); the Fallout 3 readable preset then keeps its carts |
+| `navmesh_coverage` | `tolerance` | `centre` or `share:F`; `share:0.5` is recommended indoors with footprints |
+| `sight` | `any` | `visible`: `## Readability` counts a figure covered only when more than a quarter of its box is under art drawn after it |
+| `entrance_sight` | `any` | the entrance rule's sight |
+
+These keys are read on a one-map run as well, each only when present; a
+slice with `storeys = "auto"` or `levels = "auto"` is built as a layer of
+one map. Without them nothing changes: Goodsprings, the Prospector Saloon
+and every earlier slice keep their bytes.
+
+**Storeys.** One slicer run and one terrain run per storey: the slicer's
+interior mode at the storey's floor, its ceiling cut never above the next
+storey (10 units under it), the floor bake as that elevation's ground;
+people go to the storey whose band holds their height (outside every
+kept band they are "on another level", or clamped with `clamp_levels`); a
+door's placement is kept on the storey nearest its height only.
+
+**Levels.** Level 0 is the exterior run of a one-level map, with only
+level 0's navmesh walkable, and it still draws the whole town (the decks
+above stand over the ground as on one level). A level above has no
+terrain: its references (those whose highest surface at or below their
+origin is on it, `LevelSplit::reference_level`; doors by
+`level_of_point`) are drawn on their own origin, and the references that
+carry its walking surface (the smallest placed footprint holding each of
+its navmesh triangles, two or more triangles) are baked flat as its floor
+(`SlicerConfig::flat_references`). The rest of an upper level is blank.
+
+**Budget.** Every map and elevation is estimated (`map_slicer::estimate`)
+and given its share of the walls, scenery and items lists in proportion
+(largest remainder); interiors are sliced first, then the levels above an
+exterior's ground, its ground level last, each run passing on what it
+leaves unused, so the ground level's budget ladder takes the squeeze. Floor
+tiles are shared in proportion to each elevation's floor (the exterior's
+ground level counts 10,000 squares), smallest first, with carry-over.
+`estimate` on a layer prints the table.
+
+**Output.** `map-report.md` opens with `## Layer`: the maps (number,
+elevations, entrance, walkable hexes and people per elevation, links,
+stubs), every link with its destination and whether it leads back, the
+`verify_links` result, the stubs, the budget per map and elevation (demand,
+share, use, tiles); then each map with its storeys or levels and per
+elevation its reach, slicer, ground and open-hex sections. Features are in
+`features/<stem>.json` per map and `map-features.json` for the start map;
+previews `gallery/map-<stem>.png` and `map-<stem>-e<N>.png`. `shots
+--map <file>` and `walkthrough --map <file>` read that map's features;
+`probe walk <layer> <map> --elevation N` walks any elevation (from the
+stairs' first arrival when it is not the entrance's). A `walkthrough
+--through` hex that is an exit grid ends that leg on the grid: the walk
+goes on from its arrival hex on the grid's map and elevation, the camera
+re-centred.
+
+```
+mojave-convert all --standalone --fo3 <Fallout 3> --f2 <Fallout 2> --slice slices/fo3/super-duper-mart.layer.toml --jobs 4 --out <dir>
+mojave-convert all --standalone --fo3 <Fallout 3> --f2 <Fallout 2> --slice slices/fo3/megaton.layer.toml --jobs 4 --out <dir>
+mojave-convert all --standalone --fo3 <Fallout 3> --f2 <Fallout 2> --slice slices/fo3/springvale.layer.toml --jobs 4 --out <dir>
+mojave-convert all --standalone --fnv <New Vegas> --f2 <Fallout 2> --slice slices/goodsprings-linked.layer.toml --jobs 4 --out <dir>
+mojave-convert all --standalone --with-interiors --fo3 <Fallout 3> --f2 <Fallout 2> --slice slices/fo3/springvale.toml --out <dir>
+scripts/layer-check.sh <vault-platform> <Fallout 2> <dir> 4000 <mojave-convert>
+```
+
+`scripts/layer-check.sh` loads every map headless, walks every elevation
+(`probe walk`), and runs a 2,000-tick autoplay and a 4,000-tick
+`--chaos-doors-c4` autoplay from the start map; the summary is
+`<dir>/engine-check/summary.txt`.
+
+### Critter stage options
+
+| Flag (on `critters`, `all`) | Slice key | Default | What |
+|---|---|---|---|
+| `--animations minimal\|combat\|full` | `animations` | `minimal` | a stand, a walk and stills (the first wave's bytes); combat adds every unarmed animation the source has and the armed set of the weapon carried; full adds pistol and rifle sets for everyone |
+| `--deaths ragdoll\|game` | `deaths` | `ragdoll` | falls and corpses from the physics sampler, or the game's knock-downs |
+| `--stride exact\|matched\|whole_hexes` | `stride` | `exact` | walk travel against the grid |
+| `--figure-look default\|readable` | `figure_look` | `default` | the readable look: the figures tone and a dark rim; `[tone.figures]` is laid over it |
+| `--only <editor id>` | | all | render only these actors |
+
+A figure look needs `combat` or `full`. The Fallout 3 slices say
+`animations = "combat"`; the New Vegas ones keep `minimal`, so their
+layers stay byte-identical. A combat set is about 3.5 to 4.6 MB and 21 to
+24 animation files of six directions. `--rebalance` is on every
+subcommand: it classifies the weapons the critter stage draws in hand.
+
+### Engine checks of a fight
+
+`replay-frames` films a recorded engine run (an autoplay bundle's
+`inputs.jsonl`) by replaying growing prefixes of it, keeping the last
+frame of each, and writes the frames, a contact page and a GIF; `before-after`
+pairs two runs' map previews on one page.
+
+```
+E=target/engine-head/target/release/vault-platform
+$E --autoplay-headless --game-profile fallout2 --master-dat $F2/master.dat --critter-dat $F2/critter.dat \
+   --mod-list load_order.toml --preview-map maps/super-du.map --ticks 4000 --chaos-doors-c4 --autoplay-output engine-check/chaos
+mojave-convert replay-frames --engine $E --f2 $F2 --out <dir> --log <dir>/engine-check/autoplay/inputs.jsonl --from 300 --every 30
+mojave-convert before-after --before <dir without the pass> --after <dir with it> --out pairs.png
+```
 
 To play a converted map in a `vault-engine` build:
 

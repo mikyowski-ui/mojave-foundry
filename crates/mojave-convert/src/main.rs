@@ -66,6 +66,57 @@ struct Common {
     /// Draw a one-pixel dark inner edge on sprites.
     #[arg(long)]
     outline: bool,
+    /// A rebalance TOML laid over the game's defaults. Default:
+    /// rebalance/<game>.toml beside the slice file or above it, else the
+    /// built-in tables.
+    #[arg(long, value_name = "FILE")]
+    rebalance: Option<PathBuf>,
+}
+
+/// The critter stage's options; each wins over the slice's key.
+#[derive(Args, Default)]
+struct CritterArgs {
+    /// How many animations a sprite set carries: minimal (default; the
+    /// first wave's stand, walk and stills), combat or full.
+    #[arg(long, value_name = "LEVEL")]
+    animations: Option<String>,
+    /// Falls and corpses: ragdoll or game.
+    #[arg(long, value_name = "SOURCE")]
+    deaths: Option<String>,
+    /// Walk travel against the grid: exact, matched or whole_hexes.
+    #[arg(long, value_name = "RULE")]
+    stride: Option<String>,
+    /// How figures are drawn: default or readable.
+    #[arg(long, value_name = "LOOK")]
+    figure_look: Option<String>,
+    /// Render only the actors with this editor id (repeatable).
+    #[arg(long, value_name = "EDITOR_ID")]
+    only: Vec<String>,
+}
+
+impl CritterArgs {
+    fn apply(&self, inputs: &mut Inputs) -> Result<(), ConvertError> {
+        let bad = |e: String| ConvertError::stage("arguments", format!("--{e}"));
+        let settings = &mut inputs.critter;
+        if let Some(level) = &self.animations {
+            settings.level = Some(
+                level
+                    .parse::<critters::AnimationLevel>()
+                    .map_err(|e| bad(format!("animations {e}")))?,
+            );
+        }
+        if let Some(deaths) = &self.deaths {
+            settings.deaths = Some(mojave_convert::config::parse_deaths(deaths).map_err(bad)?);
+        }
+        if let Some(stride) = &self.stride {
+            settings.stride = Some(mojave_convert::config::parse_stride(stride).map_err(bad)?);
+        }
+        if let Some(look) = &self.figure_look {
+            settings.look = Some(mojave_convert::config::parse_look(look).map_err(bad)?);
+        }
+        settings.only = self.only.clone();
+        Ok(())
+    }
 }
 
 /// How the map stage treats Fallout 2's art lists.
@@ -80,12 +131,21 @@ struct Mode {
     /// slice's `[declutter] profile`, else off.
     #[arg(long, value_name = "PROFILE")]
     declutter: Option<String>,
+    /// Items, filled containers, locked doors, armed and sided people: on
+    /// or off. Default: the slice's `loot`, else off.
+    #[arg(long, value_name = "ON|OFF")]
+    loot: Option<String>,
+    /// On an exterior slice: build every interior its doors lead to (depth
+    /// 1) into the same layer, the doors linked both ways.
+    #[arg(long)]
+    with_interiors: bool,
 }
 
 impl Common {
     fn inputs_in(&self, mode: &Mode) -> Result<Inputs, ConvertError> {
         let mut inputs = self.inputs()?;
         inputs.standalone = mode.standalone;
+        inputs.with_interiors = mode.with_interiors;
         if let Some(name) = &mode.declutter {
             if !mojave_convert::declutter::PROFILES.contains(&name.as_str()) {
                 return Err(ConvertError::stage(
@@ -98,6 +158,17 @@ impl Common {
             }
             inputs.declutter = Some(name.clone());
         }
+        inputs.loot = match mode.loot.as_deref() {
+            None => None,
+            Some("on") => Some(true),
+            Some("off") => Some(false),
+            Some(other) => {
+                return Err(ConvertError::stage(
+                    "arguments",
+                    format!("--loot {other}: expected on or off"),
+                ));
+            }
+        };
         Ok(inputs)
     }
 
@@ -159,6 +230,7 @@ impl Common {
             }
         };
         inputs.outline = self.outline;
+        inputs.rebalance = self.rebalance.clone();
         Ok(inputs)
     }
 }
@@ -173,6 +245,8 @@ enum Command {
     Critters {
         #[command(flatten)]
         common: Common,
+        #[command(flatten)]
+        animation: CritterArgs,
         /// Instead, write a large picture of this actor (by editor id) to
         /// gallery/actor-<id>.png, for tuning.
         #[arg(long, value_name = "EDITOR_ID")]
@@ -191,6 +265,8 @@ enum Command {
         common: Common,
         #[command(flatten)]
         mode: Mode,
+        #[command(flatten)]
+        animation: CritterArgs,
     },
     /// After extract: the slicer's pre-check of the map window against the
     /// art budget of the chosen mode, in seconds, rendering nothing.
@@ -204,6 +280,9 @@ enum Command {
     Shots(ShotsArgs),
     /// A frame sequence and animated GIF of one walk, taken by the engine.
     Walkthrough(sequence::WalkthroughArgs),
+    /// Frames and a GIF of a recorded run (an autoplay log), replayed by
+    /// the engine a prefix at a time.
+    ReplayFrames(sequence::ReplayFramesArgs),
     /// A contact page of PNG files, each under its label, scaled to fit.
     Contact {
         /// The page to write.
@@ -220,6 +299,19 @@ enum Command {
         cell: String,
         /// `LABEL=FILE.png`, or a file alone (labelled by its name).
         pictures: Vec<String>,
+    },
+    /// A page pairing two runs' map previews (gallery/map-*.png): the
+    /// declutter pass before and after.
+    BeforeAfter {
+        /// The --out directory of the run without the pass.
+        #[arg(long)]
+        before: PathBuf,
+        /// The --out directory of the run with it.
+        #[arg(long)]
+        after: PathBuf,
+        /// The page to write.
+        #[arg(long)]
+        out: PathBuf,
     },
     /// Write contact sheets of the rendered sprites.
     Gallery {
@@ -319,6 +411,10 @@ enum Probe {
         layer: PathBuf,
         /// The map's file name under maps/.
         map: String,
+        /// The elevation to walk (0 to 2); on one that is not the map's
+        /// entry elevation the walk starts at its stairs' first arrival.
+        #[arg(long, default_value_t = 0)]
+        elevation: usize,
         /// Steps between printed waypoints.
         #[arg(long, default_value_t = 20)]
         hop: usize,
@@ -345,8 +441,13 @@ fn run(cli: Cli) -> Result<(), String> {
             println!("output: {}", inputs.sprites_dir().display());
             Ok(())
         }
-        Command::Critters { common, preview } => {
-            let inputs = common.inputs().map_err(|e| e.to_string())?;
+        Command::Critters {
+            common,
+            animation,
+            preview,
+        } => {
+            let mut inputs = common.inputs().map_err(|e| e.to_string())?;
+            animation.apply(&mut inputs).map_err(|e| e.to_string())?;
             if let Some(id) = preview {
                 let (rgba, width, height) =
                     critters::preview(&inputs, &id, 5.0, &[2, 1, 5]).map_err(|e| e.to_string())?;
@@ -360,7 +461,13 @@ fn run(cli: Cli) -> Result<(), String> {
                 return Ok(());
             }
             let summary = critters::critters(&inputs).map_err(|e| e.to_string())?;
-            println!("critters: {summary:?}");
+            for line in &summary.lines {
+                println!("  {line}");
+            }
+            println!(
+                "critters: {} actors, {} sets ({} rendered, {} reused, {} failed)",
+                summary.actors, summary.sets, summary.rendered, summary.reused, summary.failed
+            );
             println!("output: {}", inputs.critters_dir().display());
             Ok(())
         }
@@ -372,11 +479,23 @@ fn run(cli: Cli) -> Result<(), String> {
             println!("report: {}", inputs.out.join("map-report.md").display());
             Ok(())
         }
-        Command::All { common, mode } => {
-            let inputs = common.inputs_in(&mode).map_err(|e| e.to_string())?;
+        Command::All {
+            common,
+            mode,
+            animation,
+        } => {
+            let mut inputs = common.inputs_in(&mode).map_err(|e| e.to_string())?;
+            animation.apply(&mut inputs).map_err(|e| e.to_string())?;
             let summary = pipeline::all(&inputs).map_err(|e| e.to_string())?;
             println!("sprites: {:?}", summary.sprites);
-            println!("critters: {:?}", summary.critters);
+            for line in &summary.critters.lines {
+                println!("  {line}");
+            }
+            let c = &summary.critters;
+            println!(
+                "critters: {} actors, {} sets ({} rendered, {} reused, {} failed)",
+                c.actors, c.sets, c.rendered, c.reused, c.failed
+            );
             println!("map: {:#?}", summary.map);
             println!("gallery: {:?}", summary.gallery);
             println!("report: {}", inputs.mir_dir().join("report.md").display());
@@ -386,6 +505,14 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Estimate { common, mode } => {
             let started = std::time::Instant::now();
             let inputs = common.inputs_in(&mode).map_err(|e| e.to_string())?;
+            if let Some(layer) = inputs.layer_spec() {
+                inputs.check_mode().map_err(|e| e.to_string())?;
+                let text = mojave_convert::layer::estimate_layer(&inputs, &layer)
+                    .map_err(|e| e.to_string())?;
+                println!("estimate for the layer {}:\n{text}", layer.name);
+                println!("time: {:.1} s", started.elapsed().as_secs_f64());
+                return Ok(());
+            }
             let summary = map::estimate(&inputs).map_err(|e| e.to_string())?;
             println!("{summary}");
             println!("\nDetail:\n{}", summary.report);
@@ -435,6 +562,7 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
         Command::Walkthrough(args) => sequence::walkthrough_cli(&args),
+        Command::ReplayFrames(args) => sequence::replay_frames_cli(&args),
         Command::Contact {
             out,
             title,
@@ -465,6 +593,12 @@ fn run(cli: Cli) -> Result<(), String> {
             println!("contact: {}", out.display());
             Ok(())
         }
+        Command::BeforeAfter { before, after, out } => {
+            gallery::before_after_page(&before, &after, ["before", "after"], &out)
+                .map_err(|e| e.to_string())?;
+            println!("before/after: {}", out.display());
+            Ok(())
+        }
         Command::Gallery { common, filter } => {
             let inputs = common.inputs().map_err(|e| e.to_string())?;
             let summary = gallery::gallery(&inputs, &filter).map_err(|e| e.to_string())?;
@@ -487,9 +621,10 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Probe(Probe::Walk {
             layer,
             map,
+            elevation,
             hop,
             from,
-        }) => probe::walk(&layer, &map, hop, &from),
+        }) => probe::walk(&layer, &map, elevation, hop, &from),
     }
 }
 

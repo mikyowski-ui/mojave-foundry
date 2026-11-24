@@ -78,6 +78,48 @@ pub enum Sight {
     Covered,
 }
 
+/// How much of a figure's box opaque art covers ([`Cover::shares`]), 0 to
+/// 1 each; the two never overlap.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct FigureShares {
+    /// Covered by art drawn after the figure: hidden.
+    pub front: f32,
+    /// Covered only by art drawn before it: the figure is drawn over it.
+    pub behind: f32,
+}
+
+/// The default share of [`SightRule::Share`]: a figure with at most a
+/// quarter of its box under art drawn over it (feet behind a kerb strip, a
+/// rail across its legs) is mostly in plain view.
+pub const VISIBLE_SHARE: f32 = 0.25;
+
+/// How a figure's [`Sight`] is decided ([`Cover::sight_by`]).
+///
+/// Measured on the written Prospector Saloon, Super-Duper Mart and
+/// Moriarty's Saloon (2026-11-23): under [`SightRule::AnyPixel`] 72 to 98
+/// % of the walkable hexes are `Covered`, though the people standing on
+/// them in an engine frame of the room are in plain view: the pixels that
+/// count are the tops of stools, tables or kerb strips one to four hex
+/// rows south, over the figure's feet and legs, 1 to 6 % of its box.
+/// [`SightRule::VISIBLE`] calls those figures clear.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SightRule {
+    /// Any opaque pixel in the box counts ([`Cover::sight`]): one pixel of
+    /// a kerb strip in front makes the figure `Covered`. The rule every
+    /// build used before shares existed.
+    AnyPixel,
+    /// `Covered` takes more than this share of the box (0 to 1) under art
+    /// drawn after the figure; anything less is `Clear`
+    /// ([`VISIBLE_SHARE`] in [`SightRule::VISIBLE`]).
+    Share(f32),
+}
+
+impl SightRule {
+    /// [`SightRule::Share`] of [`VISIBLE_SHARE`]: "clear" is a figure
+    /// mostly in plain view.
+    pub const VISIBLE: SightRule = SightRule::Share(VISIBLE_SHARE);
+}
+
 /// The placements' opaque art, indexed by screen position.
 #[derive(Debug, Clone)]
 pub struct Cover<'a> {
@@ -224,6 +266,60 @@ impl<'a> Cover<'a> {
         sight
     }
 
+    /// The shares of a figure's box (`[width, height]` pixels standing on
+    /// `hex`, module notes) that opaque art covers: drawn after the figure
+    /// (anchored on the same or a later hex: over it) and drawn before it
+    /// (behind it, and not already counted in front). Each pixel of the box
+    /// counts once, whatever number of sprites covers it. `None` off the
+    /// grid.
+    pub fn shares(&self, hex: i32, [width, height]: [u32; 2]) -> Option<FigureShares> {
+        let [cx, cy] = HexGrid::default().hex_center(hex).ok()?;
+        let (w, h) = (i64::from(width.max(1)), i64::from(height.max(1)));
+        let (x0, x1) = (cx - w / 2, cx - w / 2 + w - 1);
+        let (y0, y1) = (cy - h + 1, cy);
+        // 0 nothing, 1 behind, 2 front.
+        let mut mask = vec![0u8; (w * h) as usize];
+        for index in self.near(x0, y0, x1, y1) {
+            let s = &self.sprites[index as usize];
+            let mark = if s.hex >= hex { 2 } else { 1 };
+            let image = &self.art[s.art];
+            let (lx, hx) = ((x0 - s.left).max(0), (x1 - s.left).min(s.width - 1));
+            let (ly, hy) = ((y0 - s.top).max(0), (y1 - s.top).min(s.height - 1));
+            for y in ly..=hy {
+                let row = (y * s.width) as usize;
+                let box_row = ((s.top + y - y0) * w) as usize;
+                for x in lx..=hx {
+                    if image.pixels[row + x as usize] != 0 {
+                        let at = box_row + (s.left + x - x0) as usize;
+                        mask[at] = mask[at].max(mark);
+                    }
+                }
+            }
+        }
+        let total = mask.len() as f32;
+        let front = mask.iter().filter(|m| **m == 2).count() as f32;
+        let behind = mask.iter().filter(|m| **m == 1).count() as f32;
+        Some(FigureShares {
+            front: front / total,
+            behind: behind / total,
+        })
+    }
+
+    /// [`Cover::sight`] by `rule`: [`SightRule::AnyPixel`] is exactly
+    /// [`Cover::sight`]; [`SightRule::Share`] calls the figure `Covered`
+    /// when more than that share of its box is covered by art drawn over
+    /// it, else `Clear`: mostly in plain view. Art drawn behind a figure
+    /// never hides it, so the share rule never answers `Behind`.
+    pub fn sight_by(&self, hex: i32, figure: [u32; 2], rule: SightRule) -> Sight {
+        match rule {
+            SightRule::AnyPixel => self.sight(hex, figure),
+            SightRule::Share(limit) => match self.shares(hex, figure) {
+                Some(s) if s.front <= limit => Sight::Clear,
+                _ => Sight::Covered,
+            },
+        }
+    }
+
     /// Whether wall art stands on `hex` (module notes).
     pub fn stands_on(&self, hex: i32) -> bool {
         let Ok([cx, cy]) = HexGrid::default().hex_center(hex) else {
@@ -287,6 +383,65 @@ mod tests {
         let art = vec![image(ArtCategory::Scenery, 32, 120)];
         let cover = Cover::new(&art, &[placement(0, front, Role::FloorPiece, "a")]);
         assert_eq!(cover.sight(at, [32, 72]), Sight::Clear);
+    }
+
+    #[test]
+    fn shares_count_each_box_pixel_once_and_the_share_rule_reads_them() {
+        let at = 100 * 200 + 100;
+        let front = at + 2 * 200;
+        // A kerb strip two rows south whose top 6 rows reach over the
+        // figure's feet: one pixel is enough for the any-pixel rule.
+        let mut kerb = image(ArtCategory::Walls, 96, 30);
+        kerb.shift = [0, 0];
+        let kerbs = [kerb];
+        let cover = Cover::new(&kerbs, &[placement(0, front, Role::WallStrip, "k")]);
+        let shares = cover.shares(at, [32, 72]).unwrap();
+        assert!(
+            shares.front > 0.0 && shares.front < VISIBLE_SHARE,
+            "{shares:?}"
+        );
+        assert_eq!(shares.behind, 0.0);
+        assert_eq!(cover.sight(at, [32, 72]), Sight::Covered);
+        assert_eq!(
+            cover.sight_by(at, [32, 72], SightRule::AnyPixel),
+            Sight::Covered
+        );
+        assert_eq!(
+            cover.sight_by(at, [32, 72], SightRule::VISIBLE),
+            Sight::Clear
+        );
+        // Two copies of it on one hex cover the same pixels: counted once.
+        let twice = Cover::new(
+            &kerbs,
+            &[
+                placement(0, front, Role::WallStrip, "k"),
+                placement(0, front, Role::WallStrip, "l"),
+            ],
+        );
+        assert_eq!(twice.shares(at, [32, 72]), Some(shares));
+        // A full-height wall in front hides the figure by either rule.
+        let walls = [image(ArtCategory::Walls, 96, 120)];
+        let cover = Cover::new(&walls, &[placement(0, front, Role::WallStrip, "w")]);
+        assert!(cover.shares(at, [32, 72]).unwrap().front > 0.5);
+        assert_eq!(
+            cover.sight_by(at, [32, 72], SightRule::VISIBLE),
+            Sight::Covered
+        );
+        // Art behind never hides: the share rule calls it clear.
+        let cover = Cover::new(&walls, &[placement(0, at - 2 * 200, Role::WallStrip, "w")]);
+        let behind = cover.shares(at, [32, 72]).unwrap();
+        assert!(behind.behind > 0.5 && behind.front == 0.0);
+        assert_eq!(cover.sight(at, [32, 72]), Sight::Behind);
+        assert_eq!(
+            cover.sight_by(at, [32, 72], SightRule::VISIBLE),
+            Sight::Clear
+        );
+        // Off the grid: covered.
+        assert_eq!(cover.shares(-1, [32, 72]), None);
+        assert_eq!(
+            cover.sight_by(-1, [32, 72], SightRule::VISIBLE),
+            Sight::Covered
+        );
     }
 
     #[test]

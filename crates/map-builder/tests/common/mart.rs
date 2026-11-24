@@ -608,6 +608,7 @@ pub fn elevation(scene: &Scene) -> ElevationInput<'_> {
         placements: &scene.placements,
         blocked_hexes: &scene.blocked,
         interior: scene.options.interior.clone(),
+        level: None,
     }
 }
 

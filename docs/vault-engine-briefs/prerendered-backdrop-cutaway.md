@@ -4,7 +4,7 @@ Basis: `vault-engine` at revision `4d5183a`. Modules: `vault_render::map`
 (the CPU reference compositor: `tiles`, `objects`, `roof`, `lighting`,
 `render_floor_lit`), `vault_render::map::enhanced` (roof peek),
 `vault_render::layers` (`FrameLayer`, `SortKey`, the instanced CPU executor,
-in `crates/vault-render/src/layers/instanced.rs`) and
+in its instanced-layers module) and
 `vault_render::layers::gpu` (the wgpu pass, which creates its pipelines with
 `depth_stencil: None`); `vault_formats::map` (`MapFile`),
 `vault_formats::geometry` (`HexGrid`), `vault_formats::dat` (LZSS block

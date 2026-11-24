@@ -331,6 +331,73 @@ fn back_faces_are_culled_unless_two_sided() {
 }
 
 #[test]
+fn an_instance_can_draw_every_face() {
+    let up = quad("");
+    let flip = [
+        [1.0, 0.0, 0.0, 70.0],
+        [0.0, -1.0, 0.0, -70.0],
+        [0.0, 0.0, -1.0, 0.0],
+    ];
+    let shown = render(
+        &scene(vec![
+            Instance::new(&up, flip, &NoTextures).with_two_sided(true),
+        ]),
+        Window::Fit,
+    );
+    let facing_up = render(
+        &scene(vec![Instance::new(&up, at_tile(0.0, 0.0), &NoTextures)]),
+        Window::Fit,
+    );
+    assert_eq!(shown.triangles, 2);
+    assert_eq!(shown.rgba, facing_up.rgba);
+}
+
+#[test]
+fn an_instance_cutoff_keeps_a_minified_lattice() {
+    // A one-texel wire grid (one texel in four opaque): squeezed onto ~40
+    // pixels its mip levels average to alpha 0.25, under the material's
+    // cutoff, so it vanishes; a low cutoff of the instance keeps it solid.
+    let side = 512u32;
+    let mut rgba = Vec::new();
+    for y in 0..side {
+        for x in 0..side {
+            let wire = x % 2 == 0 && y % 2 == 0;
+            rgba.extend_from_slice(&[200, 200, 200, if wire { 255 } else { 0 }]);
+        }
+    }
+    let textures = source(vec![(
+        "wire.dds",
+        Texture {
+            width: side,
+            height: side,
+            rgba,
+        },
+    )]);
+    let mut mesh = quad("wire.dds");
+    mesh.primitives[0].material.alpha = AlphaMode::Mask { cutoff: 0.5 };
+    let plain = render(
+        &scene(vec![Instance::new(&mesh, at_tile(0.0, 0.0), &textures)]),
+        Window::Fit,
+    );
+    let kept = render(
+        &scene(vec![
+            Instance::new(&mesh, at_tile(0.0, 0.0), &textures).with_alpha_cutoff(Some(0.1)),
+        ]),
+        Window::Fit,
+    );
+    assert!(plain.opaque_pixels() < kept.opaque_pixels() / 4);
+    opaque_at(&kept, screen(0.5, 0.5, 0.0));
+    // The default is the material's own cutoff.
+    let default = render(
+        &scene(vec![
+            Instance::new(&mesh, at_tile(0.0, 0.0), &textures).with_alpha_cutoff(None),
+        ]),
+        Window::Fit,
+    );
+    assert_eq!(default.rgba, plain.rgba);
+}
+
+#[test]
 fn mirrored_transforms_keep_outward_faces() {
     let cube = unit_cube();
     let plain = render(

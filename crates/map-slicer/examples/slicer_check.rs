@@ -23,6 +23,16 @@
 //! - `SLICER_MODELS`: when set, a file name in the output directory: every
 //!   reference of the extraction classified (by manifest bounds), one
 //!   `model, class, count` line per pair.
+//! - `SLICER_OPEN=navmesh`: open hexes and landmark walkers from the cells'
+//!   navmeshes, as the map stage gives them (hex centres within
+//!   `SLICER_TOL`, default 24 units, of a triangle not wholly more than 160
+//!   units above the terrain).
+//! - `SLICER_AROUND=x,y,r`: only the references within `r` units of
+//!   `(x, y)`, to look at one building quickly.
+//! - `SLICER_MAX_SLICED`: `max_sliced_hexes` to use (landmarks above it).
+//! - `SLICER_READABLE`: slice with `DeclutterProfile::readable()` (its
+//!   exterior cutaway and the overhang-over-walkable-ground rule on), and
+//!   `SLICER_FURNITURE` with `FurnitureRule::default()`.
 //!
 //! The output digest is a SHA-256 over everything the map builder receives,
 //! for comparing two runs byte for byte.
@@ -36,6 +46,9 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use foundry_render::{Calibration, CpuRenderer, Projection};
+#[path = "common/navmesh.rs"]
+mod navmesh;
+
 use map_slicer::{
     ArtImage, Budget, Class, ClassKind, MeshFacts, MirAssets, Placement, Role, Sliced,
     SlicerConfig, classify,
@@ -111,19 +124,63 @@ fn run() -> Result<(), String> {
     );
     let sampler = GroundSampler::load(&mir, &worldspace, &window).map_err(|e| e.to_string())?;
     let mut references: Vec<Reference> = Vec::new();
+    let mut docs = Vec::new();
+    let around = match std::env::var("SLICER_AROUND") {
+        Ok(text) => Some(numbers(&text)?),
+        Err(_) => None,
+    };
     let (xs, ys) = window.cells(1);
     for y in ys {
         for x in xs.clone() {
             if let Some(doc) = mir.cell(&worldspace, x, y).map_err(|e| e.to_string())? {
-                references.extend(doc.references.into_iter().filter(|r| {
-                    let p = r.transform.position;
-                    window.contains(p[0], p[1])
-                }));
+                references.extend(
+                    doc.references
+                        .iter()
+                        .filter(|r| {
+                            let p = r.transform.position;
+                            window.contains(p[0], p[1])
+                                && around.as_ref().is_none_or(|a| {
+                                    let (dx, dy) = (f64::from(p[0]) - a[0], f64::from(p[1]) - a[1]);
+                                    (dx * dx + dy * dy).sqrt() <= a[2]
+                                })
+                        })
+                        .cloned(),
+                );
+                docs.push(doc);
             }
         }
     }
     println!("{} references in the window", references.len());
     let mut config = SlicerConfig::default();
+    if std::env::var("SLICER_OPEN").is_ok_and(|v| v == "navmesh") {
+        let tolerance = std::env::var("SLICER_TOL")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(24.0);
+        let centres = navmesh::hex_sources(&projection, &window);
+        let open = navmesh::open_hexes(&docs, &centres, &sampler, None, [0.0, 160.0], tolerance);
+        println!("{} navmesh hexes open", open.len());
+        config.landmark_walkers = Some(open.clone());
+        config.open_hexes = open;
+    }
+    if let Ok(v) = std::env::var("SLICER_MAX_SLICED") {
+        config.max_sliced_hexes = v
+            .trim()
+            .parse()
+            .map_err(|e| format!("SLICER_MAX_SLICED: {e}"))?;
+    }
+    if std::env::var_os("SLICER_NO_CROP").is_some() {
+        config.landmark_crop_unreachable = false;
+    }
+    if std::env::var_os("SLICER_READABLE").is_some() {
+        config.declutter = Some(map_slicer::DeclutterProfile::readable());
+    }
+    if std::env::var_os("SLICER_FURNITURE").is_some() {
+        config.furniture = Some(map_slicer::FurnitureRule::default());
+    }
+    if std::env::var_os("SLICER_WIRE").is_some() {
+        config.wire = Some(map_slicer::WireRule::default());
+    }
     if let Ok(text) = std::env::var("SLICER_LANDMARK") {
         // Landmark limits to try: piece width, height, max pieces, tolerance.
         let v = numbers(&text)?;
@@ -238,12 +295,17 @@ fn run() -> Result<(), String> {
             &budget,
             &config,
         ) {
-            Ok(fitted) => println!(
-                "\nagainst {budget:?} in {:.1} s, output digest {}\n{}",
-                started.elapsed().as_secs_f64(),
-                digest(&fitted),
-                fitted.report
-            ),
+            Ok(fitted) => {
+                println!(
+                    "\nagainst {budget:?} in {:.1} s, output digest {}\n{}",
+                    started.elapsed().as_secs_f64(),
+                    digest(&fitted),
+                    fitted.report
+                );
+                let dir = out.join("fitted");
+                std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                write_images(&fitted, &palette, &dir)?;
+            }
             Err(e) => println!("\nagainst {budget:?}: {e}"),
         }
     }
@@ -263,6 +325,69 @@ fn run() -> Result<(), String> {
         }
     }
     write_images(&sliced, &palette, &out)?;
+    if let Ok(form) = std::env::var("SLICER_REF") {
+        // One reference's placements: role, hex, blocking.
+        let mine: Vec<&Placement> = sliced
+            .placements
+            .iter()
+            .filter(|p| p.reference == form)
+            .collect();
+        let mut roles: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        for p in &mine {
+            let e = roles.entry(format!("{:?}", p.role)).or_default();
+            e.0 += 1;
+            e.1 += usize::from(p.blocking);
+        }
+        let mut hexes: Vec<i32> = mine.iter().map(|p| p.hex).collect();
+        hexes.sort_unstable();
+        println!(
+            "{form}: {roles:?}, median hex {:?}; open hexes among its strips {}",
+            hexes.get(hexes.len() / 2),
+            mine.iter()
+                .filter(|p| p.role == Role::WallStrip && !p.blocking)
+                .count()
+        );
+        if let Ok(path) = std::env::var("SLICER_REF_LIST") {
+            let text: String = mine
+                .iter()
+                .map(|p| {
+                    let a = &sliced.art[p.art];
+                    format!(
+                        "{:?} {} {} {}x{}\n",
+                        p.role, p.hex, p.blocking, a.width, a.height
+                    )
+                })
+                .collect();
+            std::fs::write(out.join(path), text).map_err(|e| e.to_string())?;
+        }
+    }
+    if let Ok(text) = std::env::var("SLICER_VIEW") {
+        // `hex,width,height[,walker hex...]`: an engine-order view around a
+        // hex at full scale, with figures standing on the walker hexes.
+        let v = numbers(&text)?;
+        if v.len() < 3 {
+            return Err("SLICER_VIEW is hex,width,height[,walker...]".into());
+        }
+        let walkers: Vec<i32> = v[3..].iter().map(|h| *h as i32).collect();
+        let path = out.join("view.png");
+        engine_view(
+            &sliced,
+            &palette,
+            v[0] as i32,
+            [v[1] as i64, v[2] as i64],
+            &walkers,
+            &path,
+        )?;
+        for &w in &walkers {
+            let blocked = sliced.blocked_hexes.binary_search(&w).is_ok()
+                || sliced.placements.iter().any(|p| p.blocking && p.hex == w);
+            println!(
+                "walker hex {w}: {}",
+                if blocked { "blocked" } else { "free" }
+            );
+        }
+        println!("view in {}", path.display());
+    }
     println!("images in {}", out.display());
     Ok(())
 }
@@ -418,7 +543,13 @@ fn digest(sliced: &Sliced) -> String {
     n(&mut h, sliced.skipped.len() as i64);
     for s in &sliced.skipped {
         h.update(s.reference.as_bytes());
-        h.update(s.reason.to_string().as_bytes());
+        // The SpeedTree skip was "no mesh" before it had a name of its own:
+        // hashed as before, so digests compare across that change.
+        let reason = match s.reason {
+            map_slicer::SkipReason::TreeFormat => map_slicer::SkipReason::NoMesh.to_string(),
+            ref other => other.to_string(),
+        };
+        h.update(reason.as_bytes());
     }
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -495,6 +626,81 @@ fn origin(a: &ArtImage, p: &Placement) -> [i64; 2] {
         c[0] + i64::from(a.shift[0]) + i64::from(p.displacement[0]) - i64::from(a.width / 2),
         c[1] + i64::from(a.shift[1]) + i64::from(p.displacement[1]) - (i64::from(a.height) - 1),
     ]
+}
+
+/// The engine's order around `centre`: overlays, floor pieces, then by
+/// ascending hex every placement and the figure standing there (a plain
+/// 20 x 72 silhouette, blue, bottom centre on the hex centre).
+pub(crate) fn engine_view(
+    sliced: &Sliced,
+    palette: &Palette,
+    centre: i32,
+    size: [i64; 2],
+    walkers: &[i32],
+    path: &Path,
+) -> Result<(), String> {
+    let colours = palette.rgba8();
+    let c = HexGrid::default()
+        .hex_center(centre)
+        .map_err(|e| e.to_string())?;
+    let o = [c[0] - size[0] / 2, c[1] - size[1] / 2];
+    let mut picture = Picture::new(o, size[0] as usize, size[1] as usize, [24, 26, 30, 255]);
+    for ov in &sliced.overlays {
+        for y in 0..ov.height as i64 {
+            for x in 0..ov.width as i64 {
+                let k = ((y * i64::from(ov.width) + x) * 4) as usize;
+                if ov.rgba[k + 3] != 0 {
+                    let col = [ov.rgba[k], ov.rgba[k + 1], ov.rgba[k + 2], 255];
+                    picture.put(
+                        i64::from(ov.origin[0]) + x,
+                        i64::from(ov.origin[1]) + y,
+                        col,
+                    );
+                }
+            }
+        }
+    }
+    for p in sliced
+        .placements
+        .iter()
+        .filter(|p| p.role == Role::FloorPiece)
+    {
+        let a = &sliced.art[p.art];
+        picture.art(a, origin(a, p), &colours, 1);
+    }
+    let mut by_hex: BTreeMap<i32, Vec<&Placement>> = BTreeMap::new();
+    for p in sliced
+        .placements
+        .iter()
+        .filter(|p| p.role != Role::FloorPiece)
+    {
+        by_hex.entry(p.hex).or_default().push(p);
+    }
+    for &w in walkers {
+        by_hex.entry(w).or_default();
+    }
+    for (hex, placed) in by_hex {
+        for p in placed {
+            let a = &sliced.art[p.art];
+            picture.art(a, origin(a, p), &colours, 1);
+        }
+        if walkers.contains(&hex)
+            && let Ok(h) = HexGrid::default().hex_center(hex)
+        {
+            for y in 0..72 {
+                let half = if y < 14 { 5 } else { 10 };
+                for x in -half..half {
+                    let shade = if y < 14 {
+                        [220, 190, 150, 255]
+                    } else {
+                        [40, 70, 200, 255]
+                    };
+                    picture.put(h[0] + x, h[1] - 71 + y, shade);
+                }
+            }
+        }
+    }
+    picture.save(path)
 }
 
 struct Picture {

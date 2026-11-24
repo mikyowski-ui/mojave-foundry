@@ -159,6 +159,11 @@ pub(crate) struct MapPlan<'a> {
     pub window_centre: [f64; 2],
     /// An interior entrance elevation's target and whether it was given.
     pub entrance_near: Option<([f64; 2], bool)>,
+    /// An exterior entrance elevation's target
+    /// ([`BuildOptions::entrance_near`]), when given and finite.
+    pub exterior_entrance: Option<[f64; 2]>,
+    /// The level surfaces of an exterior map of levels.
+    pub level_geometry: Option<crate::levels::LevelGeometry>,
 }
 
 impl MapPlan<'_> {
@@ -363,6 +368,29 @@ pub(crate) fn validate_map(
             None,
         ));
     }
+    if map.options.level.is_some() {
+        return Err(locate(
+            BuildError::Input(
+                "BuildOptions::level is set; in a layer each ElevationInput carries its level"
+                    .into(),
+            ),
+            map.map_name,
+            None,
+        ));
+    }
+    if let Some(e) = map
+        .elevations
+        .iter()
+        .position(|e| e.interior.is_some() && e.level.is_some())
+    {
+        return Err(locate(
+            BuildError::Input(format!(
+                "elevation {e} has both an interior band and an exterior level"
+            )),
+            map.map_name,
+            None,
+        ));
+    }
     let o = &map.options;
     let l = &layer.options;
     if o.standalone != l.standalone
@@ -524,6 +552,7 @@ pub(crate) fn plan_map<'a>(
     for (e, elevation) in input.elevations.iter().enumerate() {
         let mut options = input.options.clone();
         options.interior = elevation.interior.clone();
+        options.level = elevation.level.clone();
         let (placements, report) =
             crate::readability::protect(elevation.placements, interactive_keys);
         interactive.placements += report.placements;
@@ -594,6 +623,18 @@ pub(crate) fn plan_map<'a>(
                 "{prefix}interior demo: walkable ground is the navmesh from z {low:.0} to \
                  {high:.0} ({} of {} triangles; {} on other levels ignored)",
                 stats.triangles_rasterized, stats.triangles, stats.triangles_off_level
+            ));
+        } else if let Some(level) = &elevation.level {
+            notes.push(format!(
+                "{prefix}exterior level {}: walkable ground is its {} of {} navmesh triangles{}",
+                level.level,
+                stats.triangles_rasterized,
+                stats.triangles,
+                if level.level == 0 && stats.slope_only > 0 {
+                    format!(", and {} hexes judged by slope alone", stats.slope_only)
+                } else {
+                    String::new()
+                }
             ));
         } else if stats.triangles == 0 {
             notes.push(format!(
@@ -736,7 +777,22 @@ pub(crate) fn plan_map<'a>(
                 false,
             ),
         });
-    let (critter_elevation, critter_radius, levels) = assign_critters(input, entrance_elevation);
+    let exterior_entrance = input
+        .options
+        .entrance_near
+        .filter(|p| p.iter().all(|v| v.is_finite()))
+        .filter(|_| input.elevations[entrance_elevation].interior.is_none())
+        .map(|p| [f64::from(p[0]), f64::from(p[1])]);
+    let level_geometry = crate::levels::LevelGeometry::new(
+        input.cells,
+        &input
+            .elevations
+            .iter()
+            .map(|e| e.level.as_ref())
+            .collect::<Vec<_>>(),
+    );
+    let (critter_elevation, critter_radius, levels) =
+        assign_critters(input, entrance_elevation, level_geometry.as_ref());
     Ok(MapPlan {
         input,
         stem,
@@ -752,6 +808,8 @@ pub(crate) fn plan_map<'a>(
         levels,
         window_centre,
         entrance_near,
+        exterior_entrance,
+        level_geometry,
     })
 }
 
@@ -787,7 +845,35 @@ fn classify(
 fn assign_critters(
     input: &MapInput,
     entrance_elevation: usize,
+    geometry: Option<&crate::levels::LevelGeometry>,
 ) -> (Vec<usize>, Vec<Result<i32, String>>, Vec<CritterLevel>) {
+    if let Some(geometry) = geometry {
+        // An exterior map of levels: the elevation whose surface the
+        // reference stands on.
+        let positions: BTreeMap<String, [f32; 3]> = input
+            .cells
+            .iter()
+            .filter(|cell| !cell.is_interior())
+            .flat_map(|cell| cell.references.iter())
+            .map(|r| (r.form.to_string(), r.transform.position))
+            .collect();
+        let mut elevation_of = Vec::new();
+        let mut radius = Vec::new();
+        let mut levels = Vec::new();
+        for critter in input.critters {
+            let at = positions
+                .get(&critter.reference)
+                .and_then(|p| geometry.elevation_of(*p));
+            elevation_of.push(at.unwrap_or(entrance_elevation));
+            radius.push(Ok(critters::CRITTER_RADIUS));
+            levels.push(if at.is_some() {
+                CritterLevel::Floor
+            } else {
+                CritterLevel::Unknown
+            });
+        }
+        return (elevation_of, radius, levels);
+    }
     let bands: Vec<(usize, &InteriorBuild)> = input
         .elevations
         .iter()
@@ -897,7 +983,22 @@ fn place_on(
 /// arrivals and critters to the largest component, lay the sealing border,
 /// and choose the entrance on the entrance elevation.
 pub(crate) fn reconnect(plan: &mut MapPlan) -> Result<(), BuildError> {
+    // An exterior entrance target (crate notes, "Entrance"): the entrance
+    // elevation's islands join the component nearest it.
+    let target = plan.exterior_entrance;
     for e in 0..plan.elevations.len() {
+        let hub = match target {
+            Some(t) if e == plan.entrance_elevation => {
+                let at = plan.frame.tile_of_source(t[0], t[1]);
+                walk::nearest_walkable(
+                    &plan.frame,
+                    &plan.elevations[e].walkable,
+                    at,
+                    &plan.elevations[e].grid_hexes(),
+                )
+            }
+            _ => None,
+        };
         let provisional: Vec<(String, i32)> = if plan.input.critters.is_empty() {
             Vec::new()
         } else {
@@ -953,6 +1054,7 @@ pub(crate) fn reconnect(plan: &mut MapPlan) -> Result<(), BuildError> {
                 },
                 &elevation.options,
                 elevation.options.reconnect,
+                hub,
             )
         };
         elevation.walkable = walkable;
@@ -970,7 +1072,11 @@ pub(crate) fn reconnect(plan: &mut MapPlan) -> Result<(), BuildError> {
     }
     // The entrance (crate notes).
     let e = plan.entrance_elevation;
-    let target = plan.entrance_near.map_or(plan.window_centre, |(p, _)| p);
+    let target = plan
+        .entrance_near
+        .map(|(p, _)| p)
+        .or(target)
+        .unwrap_or(plan.window_centre);
     let centre = plan.frame.tile_of_source(target[0], target[1]);
     let elevation = &plan.elevations[e];
     let grids = elevation.grid_hexes();
@@ -984,6 +1090,8 @@ pub(crate) fn reconnect(plan: &mut MapPlan) -> Result<(), BuildError> {
         &avoid,
         &elevation.cover,
         elevation.options.entrance_box,
+        elevation.options.entrance_sight,
+        plan.exterior_entrance.is_some(),
     )
     .ok_or(BuildError::NoWalkableHex)?;
     plan.elevations[e].entrance = Some(entrance);
@@ -1013,9 +1121,12 @@ pub(crate) fn place_critters(plan: &mut MapPlan) {
     }
 }
 
-/// The entrance by the crate notes' rule: in the largest component, off
-/// the border and `avoid`, clearest [`Sight`] first, nearest `centre`
-/// within a tier; else the walkable hex nearest `centre` off `grids`.
+/// The entrance by the crate notes' rule: in the largest component (with
+/// `nearest_component`, the component of the walkable hex nearest
+/// `centre`), off the border and `avoid`, clearest [`Sight`] by `rule`
+/// first, nearest `centre` within a tier; else the walkable hex nearest
+/// `centre` off `grids`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn entrance(
     frame: &Frame,
     walkable: &[bool],
@@ -1024,16 +1135,23 @@ pub(crate) fn entrance(
     avoid: &BTreeSet<i32>,
     cover: &Cover,
     figure: [u32; 2],
+    rule: crate::cover::SightRule,
+    nearest_component: bool,
 ) -> Option<EntranceReport> {
     let nearest = walk::nearest_walkable(frame, walkable, centre, grids)?;
     let comps = islands::components(|h| walkable[h as usize]);
+    let sought = if nearest_component {
+        comps.of(nearest).unwrap_or(0)
+    } else {
+        0
+    };
     let distance = |hex: i32| {
         frame.hex_centre_tile(hex).map_or(f64::INFINITY, |c| {
             (c[0] - centre[0]).powi(2) + (c[1] - centre[1]).powi(2)
         })
     };
     let mut candidates: Vec<(f64, i32)> = comps
-        .members(0)
+        .members(sought)
         .filter(|hex| !islands::on_border(*hex) && !avoid.contains(hex))
         .map(|hex| (distance(hex), hex))
         .collect();
@@ -1041,7 +1159,7 @@ pub(crate) fn entrance(
     let steps = |hex: i32| HexGrid::lattice_distance(nearest, hex).unwrap_or(0);
     let mut fallback: [Option<i32>; 2] = [None, None];
     for (_, hex) in candidates {
-        match cover.sight(hex, figure) {
+        match cover.sight_by(hex, figure, rule) {
             Sight::Clear => {
                 return Some(EntranceReport {
                     hex,
@@ -1070,8 +1188,8 @@ pub(crate) fn entrance(
     }
     Some(EntranceReport {
         hex: nearest,
-        sight: cover.sight(nearest, figure),
-        in_main: comps.of(nearest) == Some(0),
+        sight: cover.sight_by(nearest, figure, rule),
+        in_main: comps.of(nearest) == Some(sought),
         steps_from_centre: 0,
     })
 }

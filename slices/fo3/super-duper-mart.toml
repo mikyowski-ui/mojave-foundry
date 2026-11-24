@@ -12,3 +12,11 @@ y = [-6, -4]
 interior_depth = 1
 interior = "SuperDuperMart"
 place_disabled = true
+# Phase B: items and loot on, people drawn at the combat level (their
+# fights' animations and the weapon in hand). See docs/running.md.
+loot = true
+animations = "combat"
+footprints = true
+
+[declutter]
+profile = "readable"

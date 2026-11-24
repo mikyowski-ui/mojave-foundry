@@ -2,11 +2,11 @@
 
 Basis: `vault-engine` at revision `4d5183a`. Modules: `vault_core::world`
 (`WorldState::set_view_center`, `WorldState::move_object`, in
-`crates/vault-core/src/world/spatial.rs`), `vault_core::ui::cursor`
+its spatial module), `vault_core::ui::cursor`
 (`inside_border`, `distance_refused`, `BORDER_COLUMNS`, `BORDER_ROWS`),
 `vault_core::camera` (`CameraCommand`, `CameraRegion`), `vault_platform::map_preview::camera`
 (`Camera`, `Camera::tick`, `Camera::resume_follow`, `Camera::drag`,
-`Camera::zoom_to`, in `crates/vault-platform/src/map_preview/camera.rs`),
+`Camera::zoom_to`, in its camera module),
 `vault_platform::map_preview::pointer` (`center_on_player`),
 `vault_platform::enhanced` (`EnhancedSettings`), `vault_platform::config`
 (`EnhancedProfile`), `vault_platform::input` (`InputCommand`,

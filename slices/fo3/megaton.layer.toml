@@ -1,0 +1,43 @@
+# Megaton (Fallout 3) as one layer: the town on its levels (crater floor,
+# decks and walkways over one another on up to three elevations, the ramps
+# between them as exit grids), the entrance inside the gate, and
+# Moriarty's Saloon (both its doors: the front on the crater floor, the
+# second on the deck above), Craterside Supply and the clinic, linked both
+# ways. The other houses keep stub maps. Coordinates and editor ids only.
+# Run with --standalone; see docs/running.md ("Layers").
+name = "megaton"
+start = "megaton"
+
+[all_maps]
+loot = true
+animations = "combat"
+wire = true
+sight = "visible"
+
+[all_maps.declutter]
+profile = "readable"
+
+[[maps]]
+slice = "megaton.toml"
+map = "megaton"
+levels = "auto"
+# Inside the gate, by the gate door (the town's own arrival point).
+entrance = [-3055.0, -22100.0]
+
+[[maps]]
+slice = "megaton-saloon.toml"
+map = "moriarty"
+
+[[maps]]
+interior = "MegatonCratersideSupply"
+map = "crater"
+cut_height = 150.0
+footprints = true
+navmesh_coverage = "share:0.5"
+
+[[maps]]
+interior = "MegatonClinic"
+map = "clinic"
+cut_height = 150.0
+footprints = true
+navmesh_coverage = "share:0.5"

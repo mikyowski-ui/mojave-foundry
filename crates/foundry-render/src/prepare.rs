@@ -272,11 +272,13 @@ pub(crate) fn prepare(
             let chain = &textures.chains[texture as usize];
             let texel_area = f64::from(chain.levels[0].width) * f64::from(chain.levels[0].height);
             let material = &primitive.material;
-            let cutoff = match material.alpha {
-                AlphaMode::Opaque => -1.0,
-                AlphaMode::Mask { cutoff } if cutoff.is_finite() => cutoff.clamp(0.0, 1.0),
-                AlphaMode::Mask { .. } | AlphaMode::Blend => 0.5,
+            let cutoff = match (material.alpha, instance.alpha_cutoff) {
+                (AlphaMode::Opaque, _) => -1.0,
+                (_, Some(own)) if own.is_finite() => own.clamp(0.0, 1.0),
+                (AlphaMode::Mask { cutoff }, _) if cutoff.is_finite() => cutoff.clamp(0.0, 1.0),
+                (AlphaMode::Mask { .. } | AlphaMode::Blend, _) => 0.5,
             };
+            let two_sided = material.two_sided || instance.two_sided;
             let opacity = if material.opacity.is_finite() {
                 material.opacity.clamp(0.0, 1.0)
             } else {
@@ -340,7 +342,7 @@ pub(crate) fn prepare(
                     continue;
                 }
                 let front = (cross as f64) * orient < 0.0;
-                if !front && !material.two_sided {
+                if !front && !two_sided {
                     continue;
                 }
                 let facing = if front { 1.0 } else { -1.0 };

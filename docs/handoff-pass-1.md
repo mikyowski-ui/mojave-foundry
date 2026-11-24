@@ -896,3 +896,273 @@ view. Moriarty's front railing opens.
    before it), and the figures tone is not applied to critter sprites
    (`critters.rs`, the characters agent's).
 
+### Phase B, first half: items, loot, armed and sided people (same day)
+
+On the builder's `map_builder::loot` (`Catalogue`, `verify_loot`), its
+furniture footprints and `emit::rebalance`. Interfaces in
+`docs/contracts.md` 9.6 and 10.6, commands and keys in `docs/running.md`
+("Loot, sides and the rebalance tables", "Critter stage options", "Engine
+checks of a fight"). New code: `mojave_convert::rebalance` (the tables),
+`mojave_convert::catalogue` (records to a `Catalogue`), the map stage's
+wiring, `CritterOptions::for_run`, `gallery::items_page` and
+`before_after_page`, `probe f2` listing the base `ai.txt` packets, and
+the subcommands `replay-frames` and `before-after`.
+
+**Switches.** Slice keys `loot`, `animations`, `deaths`, `stride`,
+`figure_look`, `footprints`; flags `--loot on|off` (map, all, estimate),
+`--rebalance <file>` (every stage), `--animations`, `--deaths`,
+`--stride`, `--figure-look`, `--only` (critters, all). Loot is off and the
+level minimal unless a slice says otherwise; the five Fallout 3 slices say
+`loot = true` and `animations = "combat"` (the rooms also readable
+declutter; the Super-Duper Mart footprints). Above minimal an interior
+slice renders only the people its room places (Moriarty's rendered all 43
+Megaton sets, 431 s, before this; the saloon now renders 5 in 87 s).
+`[tone.figures]` and the readable look need a level above minimal.
+
+**Weapon classes** (`[convert.weapons]`, both games): animation type 0
+unarmed, 1 blunt, 2 heavy melee, 3 pistol, 4 energy pistol, 5 rifle, 6
+assault rifle, 7 energy rifle, 8 minigun, 9 launcher, 10 to 12 grenade,
+13 thrown; with the energy weapons skill (34) a pistol, rifle or minigun
+takes its energy class; rules then make knives, swords, axes blades,
+spears spears, shotguns and SMGs theirs, flamers flamers (fire);
+plasma, Tesla, pulse by name; launchers, grenades and mines explosive.
+The `DNAM` automatic flag gives a single-shot class a burst.
+
+**Sides** (`[convert.hostility]`): the AI data (`AIDT` byte 0) and
+factions (`SNAM`) of the actor that supplies them through its templates
+(flags 0x10 and 0x04, leveled NPC lists by their first lowest-level
+entry), against the player faction's relations (`XNAM`, either way).
+Aggression 2 or 3 is hostile unless a faction is the player's friend or
+ally; aggression 1 is hostile only with a faction that is the player's
+enemy. Fallback patterns (raider, talon, super mutant, slaver, feral;
+fiend, viper, jackal for New Vegas) are used only without AI data; no
+real actor needed them. Hostile people: team 66, packet "Merc Raider"
+(136); friendly: team 99 and the builder's packet (179 in a stock
+install).
+
+**Runs** (binary `out/bin/mojave-convert-b2`; `all --standalone --jobs 2`
+from an empty `--out`; then a 2,000-tick autoplay, a 4,000-tick
+`--chaos-doors-c4` autoplay, `probe walk`, `shots --auto 8 --classic
+--wide`, one `walkthrough`):
+
+| | Super-Duper Mart (`out/fo3b/super-duper-mart`) | Moriarty's Saloon (`out/fo3b/megaton-saloon`) | Prospector Saloon, loot and combat (`out/fnvb/saloon`) |
+|---|---|---|---|
+| item prototypes | 77: 8 weapons, 3 armour, 7 ammunition, 17 aid, 1 key, 41 misc | 33: 2, 5, 2, 3, 1, 20 | 63: 8, 7, 5, 14, 0, 29 |
+| icons; own ground sprites | 74; 26 (21 models read from the install, 1 placeholder: the bottle cap renders empty) | 32; 18 | 63; 28 |
+| on the ground | 353 references | 45 | 95 |
+| containers | 68, 30 filled, 48 stacks, 3 locked; 301 leveled lists drawn, 89 empty | 15, 5 filled, 8 stacks | 5, 4 filled, 10 stacks |
+| doors | 21 (1 locked and keyed) | 3 (1 locked) | 6 (1 locked) |
+| named placements | 128 | 38 | 41 |
+| people | 10 in the data, all hostile raiders (aggression 2); 8 placed, all armed (6 `.32 Pistol`, 2 `Pool Cue`), all in Raider Painspike Armor | 6, all friendly (aggression 0 or 1); 4 armed | 8, all friendly (aggression 1; the Powder Gangers' faction is not the player's enemy); 7 armed |
+| critter art | 2 sets, 44 files, 8.1 MB (23 and 21 files, 3.4 and 4.6 MB); rows 103 and 104 of `critters.lst`, 3,991 free | 6 sets | 5 sets |
+| walkable / reachable | 2,125 / 2,108 of 2,117 | 116 / 110 (footprints off; 63 of 95 with them) | 207 / 199 |
+| `all` | 53 s, 708 MB | 431 s (all of Megaton rendered; see above) | 87 s, 684 MB |
+| autoplay 2,000 ticks | the bot fought the raiders and the player died at tick 1,455, 0 errors | clean, 397 actions, 1 fight | clean, 771 actions, 1 fight |
+| chaos 4,000 ticks | clean: 6 fights ended, every raider attacked, 118 checks of doors and containers held, then "nothing left to do" | 25 checks held, then the stuck-loop guard (a room with no exit) | not run |
+
+**Engine findings.** What runs headless: combat starts, but only because
+the autoplay bot attacks every unscripted critter on another team
+(`vault-core` `autoplay.rs`, `next_goal`); a Fallout 2 critter on a
+hostile team and an aggressive packet does not attack the player by
+itself (contracts 10.1), so in a person's game the raiders stand until
+shot. Once fighting, the raiders fire their pistols and swing their cues:
+the first run ends with the player dead, the chaos run with every raider
+dead and no foe left. No run logged an error; every set has the full
+`combat_requirements` (0 placeholders), so no animation is missing.
+Containers open and locked ones stay shut (the chaos checks), but the bot
+never takes from a container, and looting needs the loot screen: a person
+at the keyboard has to check it. `replay-frames` filmed the first run
+(`out/fo3b/super-duper-mart/combat/run.gif`, `contact.png`, made on the
+first build of the layer), but a plain
+`--replay-inputs` of an autoplay log does not repeat the run (only
+`--replay-bundle` does, and it writes no frames): from command 1,050 on
+the frames hold still with the player unhurt, so they show the approach,
+not the fight. A frame option for `--replay-bundle` would be an owner
+brief.
+
+**Regressions.** The Prospector Saloon with its slice's defaults
+(`out/fnvb/saloon-baseline`) matches `out/baseline-saloon.sha` in all
+1,117 files, critter art included (the minimal level is the default
+again). Goodsprings with defaults (`all --fnv ... --out out/fnvb/goodsprings`, 84 s) matches `out/baseline-goodsprings-2.sha` in all 6,866 files.
+
+**Frames.** `out/fo3b/super-duper-mart/shots/` (16, all arrived),
+`walkthrough/raiders/raiders-classic.gif`, `gallery/items-01.png`,
+`gallery/characters/*-strips.png` and `.gif`; the same under
+`out/fo3b/megaton-saloon/` (`walkthrough/bar/bar-classic.gif`).
+
+Aid figures: health from restore effects only (magnitude times seconds,
+at most 500); an effect that raises maximum health (Buffout's) is left
+out. The map stage's key carries a catalogue version (`catalogue-3`)
+when loot is on, so a change of these rules rebuilds loot maps only.
+
+**Not done.** Creatures are still not rendered (the Protectron). Weapons
+whose damage is their explosion's (grenades, mines) get 1 to 1. Aid items
+that raise maximum health are left at their other effects. Lock levels
+are not converted (Fallout 2 has none): every lock is locked, none
+jammed. A key opens nothing by itself in the engine (a door's script
+does that).
+
+**For the next agent (several maps, door links, storeys).** `map.rs`
+builds one map through `map_builder::build_map`. The catalogue is made
+per scene after slicing (`catalogue::build` takes the scene's
+references, the slicer's art and placements and the people) and handed in
+`BuildOptions::catalogue`; for `build_layer` it must become one
+`LayerOptions::catalogue` over every map's references and placements (item
+keys are base form keys, so merging catalogues is a union of `items`,
+`placed`, `critters`; draws are seeded per reference, so a container gives
+the same contents in any layer). `critter_inputs` and `apply_declutter`
+take one scene. `Scene` holds one window, one floor and one
+`BuildOptions`; a storey would be one `ElevationInput` per floor band
+from `mir::storeys` (the builder's `levels` work). The report writers
+(`write_*_section`) take one `BuildReport` and one `Sliced`; the loot
+section takes the layer's `LootReport`, which already lists every map.
+
+### Phase B, second half: layers, linked doors, storeys and levels (same day)
+
+On the builder's `build_layer`, `storeys` and `levels` (`crates/map-builder/DESIGN-levels.md`
+sections 3 and 4). New code: `mojave_convert::layer` (the layer file, the
+plan per map and elevation, the budget split, the report),
+`SliceSpec` keys `map`, `storeys`, `storey_floors`, `levels`, `wire`,
+`navmesh_coverage`, `sight`, `entrance_sight` (and `entrance` on an
+exterior), `--with-interiors`, `estimate` on a layer, per-map features
+(`features/<stem>.json`, `MapFeatures::read_for`), `probe walk --elevation`,
+walkthroughs that cross exit grids (`Hop::lands`, a re-centre after each
+crossing), `scripts/layer-check.sh`, and in `map-slicer` one additive key,
+`SlicerConfig::flat_references` (decks of an upper exterior level baked
+flat; empty by default, with a test). Formats and keys:
+`docs/running.md` ("Layers"); interfaces: `docs/contracts.md` 9.7.
+
+**Layer files** (`slices/fo3/super-duper-mart.layer.toml`, `megaton.layer.toml`,
+`springvale.layer.toml`, `slices/goodsprings-linked.layer.toml`); all
+`--standalone --jobs 4`, binary `out/bin/mojave-convert-c`:
+
+| | Super-Duper Mart (`out/fo3c/super-duper-mart`) | Megaton (`out/fo3c/megaton`) | Springvale (`out/fo3c/springvale`) | Goodsprings + saloon (`out/fnvc/goodsprings-linked`) |
+|---|---|---|---|---|
+| maps (elevations) | `sdmart` (1), `sdmartin` (2) | `megaton` (3), `moriarty` (2), `crater` (2), `clinic` (1) | `springva` (1), `bandits` (1) | `goodspri` (1), `saloon` (1) |
+| link ends | 4 door, 4 stairs; all both ways | 8 door, 70 stairs (33 transitions of the level split); all both ways; 14 doors keep stubs | 4 door, both ways; 1 stub (the school) | 8 door (the saloon's four doors), both ways; 11 stubs |
+| `verify_links` | 22 grids, 4 links, 0 one way | 534 grids, 46 links, 0 one way | 34 grids, 4 links, 0 one way | 249 grids, 24 links, 0 one way |
+| walls used of 4,096 (per map, elevation) | 1,329 / 1,431 + 1,291 | 3,002 + 119 + 88 / 112 + 123 / 105 + 110 / 99 | 3,086 / 62 | 3,380 / 263 |
+| floor tiles of 4,094 | 3,578 / 469 + 40 | 3,683 + 216 + 91 / 28 + 26 / 17 + 19 / 13 | 4,078 / 10 | 4,041 / 50 |
+| people per elevation | 2 / 8 + 2 (the two raiders upstairs placed: they were left out before) | 2 + 1 + 0 / 6 + 0 / 2 + 0 / 4 | 0 / 1 | 3 / 8 |
+| walkable, main component share | 33,165, 100 % / 2,126 (99.1 %) + 228 (71.7 %) | 10,084 (34.2 %: three components of 3,451, 3,373, 3,259) + 1,170 (71.5 %) + 490 (100 %) / 116 + 121 / 83 + 96 / 39 | 26,421 / 25 | 30,655 / 207 |
+| `all` from an empty `--out` | 3:07, 845 MB | 2:19, 768 MB (critter sets copied from the Phase B Moriarty run, a content-keyed cache) | 2:59, 1.05 GB | 1:30, 779 MB |
+
+Megaton's levels as built: level 0 is the crater floor and the ground
+outside the wall, drawing the whole town as one level did; levels 1 and 2
+(954 and 396 navmesh hexes) draw 209 and 115 references on their own
+origin and bake 51 and 26 decks flat. The entrance is inside the gate
+(`entrance` in the layer file, level 0). Moriarty's back door is on its
+ground floor in the data; outside it is on level 1, so that link goes from
+Megaton elevation 1 to Moriarty's elevation 0 (the balcony is elevation 1,
+reached by its stairs). Craterside Supply also splits into two storeys.
+23 teleports in Megaton (19 in Goodsprings, 4 in the Mart) named the
+worldspace's persistent cell; they are pointed at the cell their partner
+door was extracted into (`normalise_teleports`), without which every
+interior's door back was one-way.
+
+**Budget.** Proportional shares from the slicer's estimate, interiors
+sliced first, the exterior ground level last with the carry-over. The
+estimate of a storey counts every reference of the room (it ignores the
+cut), so rooms are given more than they use and the rest flows to the
+ground level: Megaton's level 0 got 3,340 walls and used 3,002; nothing
+overflowed. The Mart's first attempt, sliced in map order with five
+"storeys" (navmesh floors at nearly one height), failed with the exterior
+given 509 walls; floors are now grouped into storeys by height band.
+
+**Engine acceptance** (`scripts/layer-check.sh`, then walkthroughs; engine
+`target/engine-head/target/release/vault-platform`):
+
+- Every map of every layer loads headless (exit 0); `probe walk` per map
+  and elevation is in each `engine-check/summary.txt`.
+- (a) Doors, by scripted replay (walkthrough frames): Mart car park ->
+  front door -> store (arrives by the partner door) -> other front door ->
+  car park; Springvale -> bandit house -> out of the back door beside the
+  house; Goodsprings -> saloon -> out of another door; Megaton level 1 ->
+  Moriarty's back door. Each arrival is the link's arrival hex on the
+  other map, beside the partner door. By autoplay: Springvale clean in
+  2,000 ticks with 1,359 audited map transitions (the bot back and forth
+  through the bandit house's doors) and in a 4,000-tick chaos run with
+  3,006; Goodsprings clean with 10, and its chaos run clean with 3,878
+  audited transitions and 7 door and container checks held.
+- (b) Stairs, by scripted replay: the Mart's stairs up and back down
+  (`walkthrough/stairs-both`), Megaton's ramp from the crater floor to
+  the level-1 decks (`walkthrough/gate-to-moriarty`); the engine saves and
+  reloads the map and places the player on the arrival hex of the other
+  elevation each time. By autoplay on Megaton, both runs fail at the first
+  audited elevation change: `AuditMismatch at tick 51 (Checks)`, "object
+  1335: ObjectRow { pid: 619, hex: None, elevation: 0, ... holder: Some(1)
+  } became ObjectRow { ... elevation: 1, ... }" (and object 1337; the
+  chaos run at tick 18). The two are items the bot had picked up: the
+  live world keeps the elevation they were picked up on while a load seats
+  them on the player's. That is the engine (`WorldState::move_object`
+  moves the holder only); owner brief
+  `docs/vault-engine-briefs/elevation-change-audit.md`, with a synthetic
+  reproduction. On the Mart the chaos run went up the second stairs into a
+  23-hex island of the upper level and stopped with `StuckLoop` (2,000
+  decisions, "Nothing left to do on this map"); its walks onto that
+  island's grids back down did not take it down, though the same grids
+  work in a replay. I cannot tell whether that is the bot or the layer.
+- (c) Mart raiders: on the written map they are on the hostile team with
+  their weapons in hand (the report's loot table; the fixture test asserts
+  it object by object). In the engine the bot did not fight them this time:
+  starting inside the two-storey store it picks up some 60 items without
+  walking, aims only at the two raiders upstairs, fails to reach them and
+  ends with "Nothing left to do" (clean in 2,000 ticks; `StuckLoop` in the
+  chaos run, 0 container checks). In the one-storey Phase B build the same
+  bot fought all of them; the difference is the second elevation, and I
+  cannot tell from here whether the cause is the layer or the bot. Starting
+  on the car park, the plain autoplay never took the front door (27
+  actions); the chaos run did.
+
+**Pictures** (`out/fo3c/best/`, `out/fnvc/best/`; classic frames, stationary
+camera): `super-duper-mart.png`, `megaton.png`, `springvale.png`,
+`goodsprings-linked.png`; GIFs `lot-to-upper-classic.gif` (car park ->
+front door -> aisles -> stairs -> upper level), `stairs-both-classic.gif`,
+`sdmart-door-both-classic.gif`, `gate-to-moriarty-classic.gif` (gate ->
+crater floor -> ramp -> level 1 -> Moriarty's), `springvale-door-both-classic.gif`,
+`goodsprings-door-both-classic.gif`; every layer's own `shots-<map>/` and
+`walkthrough/` directories.
+
+**What looks wrong, by owner.**
+1. `map-builder`/`map-slicer` ("player on roofs"): exterior hexes under a
+   building's roof are walkable, so a walker crosses the Mart's store
+   "on its roof" (`super-duper-mart/walkthrough/door-both`, frames 10 to
+   16) and arrives over the saloon's roof outside its second door in
+   Goodsprings (`goodsprings-linked/walkthrough/door-both`, frame 37). The
+   Mart layer sets `entrance` in the car park because the window centre is
+   inside the store.
+2. `map-slicer`: overpass sections render as rows of separate bars in the
+   Mart car park (`shots-sdmart/sdmart-05-classic.png`); a white blank
+   plane in Megaton (`shots-megaton/megaton-03-classic.png`); level 0 of
+   Megaton shows black ground where the land lies far below the town
+   (`megaton-02-classic.png`), as in the one-level map.
+3. `map-builder`: the Mart's second stairs arrive in a 23-hex island of
+   the upper level (no passage: "every way crosses wall art ..."); Megaton
+   level 1 keeps islands of 197, 88 and 48 hexes, one holding an exit and
+   five stair ends. A tall office-pit wall piece hides the player in the
+   store (`shots-sdmartin/sdmartin-05-classic.png`; the builder lists it as
+   "walkable furniture?").
+4. Engine: the elevation-change audit above (brief written); the bot's
+   behaviour on a map of two elevations (not understood).
+5. Mine, left: storey grouping keeps the three largest storeys and has no
+   spill into further maps (the builder's `layout` can; no target needed
+   it); the estimate overcounts storeys; an upper exterior level draws
+   only what stands on it, so the town above the walker is not drawn there.
+
+**Regressions and determinism.** With the new keys absent: Goodsprings
+(`all --fnv`, 57 s) matches `out/baseline-goodsprings-2.sha` in all 6,866
+files and the Prospector Saloon (`out/fnvc/saloon-baseline`, 45 s)
+`out/baseline-saloon.sha` in all 1,117. The Springvale layer's map stage
+run again into a fresh `--out` (`out/fo3c/springvale-det`) writes the same
+12,546 layer files and features; the report differs only in the item-art
+cache tally. `tests/slices.rs` checks the eight New Vegas and five
+Fallout 3 slices and the four layer files; `tests/mini_mart.rs` builds the
+linked two-storey mini mart twice (8 s). Gates: fmt, clippy `-D warnings`,
+890 tests, all green.
+
+**Not verified.** Looting by hand (the bot never takes from containers);
+the Mart's raiders fighting in the two-storey layer; a full autoplay over
+Megaton past the engine's audit; Craterside's and the clinic's interiors
+in pictures; a full build with `--with-interiors` (on Springvale its
+`estimate` finds the school, three storeys, as `spring02` and the bandit
+house as `zspringv`, and splits the budget; no map was built that way).

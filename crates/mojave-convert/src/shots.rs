@@ -227,6 +227,7 @@ pub fn replay_log(view: View, hops: &[(i32, usize)], zoom: f32) -> String {
             steps,
             ticks: hop_ticks(steps),
             path: vec![hex],
+            lands: None,
         })
         .collect();
     build_log(&LogOptions::shots(view, zoom), &hops, None).text()
@@ -264,6 +265,7 @@ pub fn route_hops(
                 steps,
                 ticks: ticks(steps),
                 path,
+                lands: None,
             }
         })
         .collect()
@@ -746,9 +748,8 @@ pub fn shots(options: &ShotsOptions) -> Result<ShotsSummary, ConvertError> {
         options.map.as_deref(),
         options.timeout,
     )?;
-    let read = match MapFeatures::read(&options.out) {
-        Ok(f) if f.map_file.trim_start_matches("maps/") == map => Some(f),
-        Ok(_) => None,
+    let read = match MapFeatures::read_for(&options.out, &map) {
+        Ok(f) => Some(f),
         Err(error) => {
             if options.auto > 1 {
                 eprintln!(
@@ -1268,6 +1269,9 @@ mod tests {
             blocked: vec![false; route::HEXES],
             exits: Vec::new(),
             entry,
+            elevation: 0,
+            entry_elevation: 0,
+            arrivals: Vec::new(),
         }
     }
 

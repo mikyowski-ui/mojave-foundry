@@ -62,6 +62,30 @@ needs a second extract.
 Only `crates/mir` reads or writes this directory. Other crates go through
 its API, never through the files.
 
+**Manifest fields** (2026-11-23). Besides the path index and the extract
+inputs, `manifest.json` records `game` (the plugin list's game, detected
+from its first plugin or given to `mir::extract_for_game`; a manifest
+without it reads as New Vegas), `records_revision` (the revision of the
+tables in `records.sqlite`, `mir::RECORDS_REVISION`, within one
+`SCHEMA_VERSION`: extract rebuilds an older one, and a reader of a table an
+older file lacks returns `MirError::MissingTable`; 0 when absent) and
+`notes` (things worth knowing that are not issues: a persistent reference
+in a grid cell with no cell record, a cell whose land comes from the parent
+worldspace).
+
+**Tables** of `records.sqlite` (revision 1): `records`, `worldspaces`,
+`cells`, `placed_refs`, `lands`, `navmeshes`, `statics`, `doors`,
+`containers`, `inventory`, `misc_items`, `weapons` (with the combat
+columns), `armors`, `ingestibles`, `ammo`, `npcs`, `creatures`,
+`land_textures`, `texture_sets`, `scripts`, `script_variables`,
+`embedded_scripts`, `quests`, `quest_stages`, `quest_objectives`, `topics`,
+`topic_quests`, `infos`, `info_responses`, `conditions`, `terminals`,
+`terminal_items`, `notes`, `note_quests`, `packages`, `actor_packages`,
+`script_refs`, `quest_targets`, `bad_records`, plus `meta` (the game,
+`meta.game`), `plugins` and `raw_subrecords` (the lossless store). Revision
+1 added the game, terminals, notes, packages, actor packages, the script
+and quest-target references and the weapon combat columns.
+
 **Paths.** `mir` owns path normalisation, and nothing else does it:
 lowercase ASCII, `/` to `\`, a leading `data\` dropped, and the root
 prefix added when missing (`meshes\` for a record's model path,
@@ -621,6 +645,169 @@ no exits. `mojave-convert` refuses it without `--standalone`
 - **Cache.** The slice's TOML (every new key) is in the key; an exterior
   slice serialises none of them.
 
+### 9.6 Items, loot and sides (2026-11-23)
+
+With loot on (`Inputs::loot_on`: `--loot on|off`, else the slice's
+`loot = true`, else off) the map stage builds a `map_builder::Catalogue`
+(`mojave_convert::catalogue::build`) after slicing and hands it to the
+builder in `BuildOptions::catalogue`. Off, nothing below runs and the
+layer is what it was. The rules are in the module notes of
+`crates/mojave-convert/src/catalogue.rs`; in short:
+
+- **Rebalance tables** (`mojave_convert::rebalance::LoadedRebalance`):
+  `emit::rebalance::Rebalance::for_game(game)` and the converter's
+  `ConvertTables` (`[convert.weapons]`, `[convert.hostility]`,
+  `[convert.loot]`), overlaid by `--rebalance <file>`, else
+  `rebalance/<game>.toml` in the slice file's directory or above (the
+  working directory for a built-in slice), else built in. The repository's
+  `rebalance/fo3.toml` and `fnv.toml` are full copies of the defaults
+  (`MOJAVE_BLESS=1 cargo test -p mojave-convert --lib rebalance` rewrites
+  them). `LoadedRebalance::digest` (the effective tables, not the file) is
+  in the map stage's key when loot is on, with `loot=on`.
+- **Items** (`Catalogue::items`, keyed by the base's form key): every base
+  of a reference the slicer placed as an item only (`Role::Item`), of the
+  contents of every reference placed as a container only, and of the
+  inventory of every person the builder is given (the NPC that supplies
+  inventory through its templates, flag 0x100), plus every weapon's
+  ammunition. Records: `weapons` (with the `DNAM` automatic flag from the
+  raw store), `armors` (armour rating in hundredths: DR = rating / 100),
+  `ammo` (calibre key from the name), `ingestibles` (effects from `EFID`
+  and `EFIT`, by the magic effect's editor id and actor value; addiction
+  from `ENIT`), `misc_items` and the base object for keys, books, notes and
+  the rest (all miscellaneous). Leveled item lists (raw `LVLO`) are drawn
+  per container, seeded by the container reference's key; a person's by
+  the actor documents' rule.
+- **Art**: `GroundArt::FirstPlacement` for an item some placed reference
+  draws; otherwise `GroundArt::Sprite` of the model rendered as the sprite
+  stage renders a prop (the extraction's mesh, else read from the install
+  through `mir::DataSource`), cached in `<out>/sprites/` under the sprite
+  stage's key scheme (`sprites::key_prefix`); the inventory icon
+  (`ItemIcon::Indexed`) is the same model rendered three times larger
+  (`tile_metres / 3`, `pixels_per_metre_vertical * 3`), cached the same
+  way. A model that does not render gets a small placeholder box and no
+  icon (reported).
+- **Placed** (`Catalogue::placed`): `Item` (count from `XCNT`; ammunition
+  in packs, the front pack partly full), `Container` (base name, capacity
+  at least 100 and above the contents' size, `LockState { locked: lock
+  present, jammed: false }`, at most `max_contents` stacks), `Door` (base
+  name, lock, the lock's key when the catalogue holds that key), `Named`
+  for activators, terminals, furniture, moving statics and sliced doors or
+  containers with a real name.
+- **People** (`Catalogue::critters`, by reference): `fighter_spec` of a
+  `SourceActor` (level and health from the actor document; attributes and
+  skills from the stats supplier's `DATA` and `DNAM`) with the worn armour
+  (the first body armour, slot 0x4, of the inventory); right hand =
+  `ActorDoc::weapons[0]` when carried (the weapon the critter stage drew);
+  carried = the rest (at most `max_carried`). Side by
+  `rebalance::Hostility`: AI data (`AIDT` aggression, after templates by
+  flag 0x10) and factions (`SNAM`, flag 0x04) against the player's
+  faction's relations (`XNAM`, both ways); patterns only when the record
+  has no AI data. Hostile people get `hostile_team` (66) and the packet
+  named `hostile_packet` in the base `data/ai.txt` ("Merc Raider", 136 in
+  a stock install); friendly people the builder's defaults (team 99, the
+  packet of `critters::choose_ai_packet`).
+- **Footprints**: the slice key `footprints = true` sets
+  `SlicerConfig::furniture = Some(FurnitureRule::default())` and passes
+  `Sliced::footprints` to `BuildOptions::footprints`; off by default.
+- **Report**: `map-report.md` has `## Loot` (`LootReport::loot_summary`,
+  `CatalogueReport::lines`, the hostile and friendly split, a table of
+  people and one of items) and `## Furniture`
+  (`FurnitureReport::summary`); `## Characters` lists each sprite set's
+  row, files and bytes and the highest `critters.lst` row used.
+  `gallery/items-NN.png` shows each item's ground sprite beside its icon.
+
+### 9.7 Layers, links, storeys and levels (2026-11-23)
+
+The map stage builds several maps in one layer through
+`map_builder::build_layer` when the run has a layer
+(`Inputs::layer_spec`: a `*.layer.toml` given to `--slice`,
+`--with-interiors` on an exterior slice, or a slice with `storeys = "auto"`
+or `levels = "auto"`, a layer of one map). Otherwise `map::map` is the
+one-map path of 9.4 to 9.6, byte for byte. The code is
+`mojave_convert::layer`; the file format, keys and commands are in
+`docs/running.md` ("Layers").
+
+- **Layer file** (`layer::LayerSpec`): `name`, `start`, `with_interiors`,
+  `[all_maps]` (slice keys laid over every map) and `[[maps]]` (`slice` =
+  a slice file relative to the layer file or a built-in name, or
+  `interior` = an editor id taking the first exterior's keys; any other key
+  overrides the slice's). Maps share one game, plugin list and worldspace;
+  stems are distinct. `LayerSpec::union_slice` is what extract, sprites
+  and critters see (the union of the cell ranges, the deepest interior
+  depth, loot on when any map has it, the first map's critter keys).
+  `layer::actor_ids` is the critter stage's `only` above minimal.
+- **Plan.** One `MapRun` per map, one `Run` per elevation (one slicer
+  run, one terrain run). Exterior: `map::scene`, then with levels
+  `split_levels` over the window's cells (`LevelOptions::default`),
+  `ElevationInput::level = exterior_level(k)`, the open hexes and landmark
+  walkers from `walk::standable_hexes` / `verdicts` with
+  `BuildOptions::level`. Level 0 slices every reference with the
+  worldspace sampler; level `k > 0` slices the references whose
+  `reference_level` is `k` (doors by `level_of_point`) with an empty
+  sampler (each reference anchored on its own origin), and bakes its decks
+  flat (`SlicerConfig::flat_references`: per triangle of the level, the
+  reference with the smallest placed footprint, at least 8,000 units²,
+  holding its centroid in plan and within 40 units in height; two or more
+  triangles). Its ground is `build_ground_from(MemoryLand::default())`
+  with `blank_without_land`. Interior: `map::interior_scene`, then with
+  storeys `split_storeys` and floors grouped into storeys (a floor whose
+  height lies in a larger floor's band joins it; the three largest kept,
+  or `storey_floors`), per storey `SliceSpec::interior_build(z)` and
+  `interior_slice(z)` with the cut capped 10 units under the next storey,
+  `GroundSampler::flat(z)`, the storey's own open hexes. Stairs: per
+  connector, its landings on two kept storeys, as `StairLink`s of the map
+  with itself (labels `<stem> stairs a-b`); levels give
+  `LevelSplit::stair_links`. A teleport door's placement stays on the
+  elevation its height (or level) gives and is dropped on the others.
+- **Entrance.** `BuildOptions::entrance_near` from an exterior's
+  `entrance` key; with levels and no key, the window's first door leading
+  to another worldspace; `MapInput::entrance_elevation` its level. An
+  interior's entrance storey is the one nearest its first door's height.
+- **Teleports.** A teleport whose cell no map of the layer is built from
+  (a door filed in the worldspace's persistent cell) is pointed at the
+  cell its partner door was extracted into before building
+  (`normalise_teleports`); the report counts them.
+- **Budget.** `map_slicer::estimate` per run; shares of
+  `Budgets::slicer` in proportion (largest remainder, `layer::shares`);
+  slicing order interiors, upper levels, ground levels, each run passing
+  on what it leaves; tiles in proportion to each run's floor (an exterior
+  ground level 10,000) smallest first with carry-over. The builder checks
+  the layer's lists once.
+- **Catalogue.** One `LayerOptions::catalogue` from one
+  `catalogue::build` over every map's references, every run's art and
+  placements (art indices offset) and every map's people. Critter sprite
+  sets are shared (`map::critter_inputs_into`).
+- **Checks.** The written layer is read back, `verify_layer` and
+  `verify_links` (every grid onto a walkable hex of an existing elevation;
+  one-way links listed) run on it; the report's `## Layer` gives both.
+- **Furniture, wire, door stubs, coverage, sight.** `footprints = true`
+  as 9.6 (per map, the footprints of all its elevations); `wire = true`
+  sets `SlicerConfig::wire` (`map::wire_rule`: the slicer's defaults plus
+  the cart and wire-basket patterns) and takes `*shoppingcart` off the
+  readable preset's clutter patterns; door stubs, the cutaway wall rules
+  and the roof cut are the readable preset's. `navmesh_coverage` sets
+  `BuildOptions::navmesh_coverage` (`share:0.5` with footprints indoors),
+  `sight` / `entrance_sight` `readability_sight` / `entrance_sight`
+  (`visible` = `SightRule::VISIBLE`). All of them apply on the one-map path
+  too, only when present. `[tone.floor]` with the pass on also tones the
+  terrain (`TerrainOptions::tone`).
+- **Report and features.** `map-report.md`: `## Layer` (maps, links both
+  ways and one way, stubs, `verify_links`, the budget per map and
+  elevation), the art lists, loot and characters once, then per map its
+  storeys or levels and per elevation reach (components, entrance,
+  islands left, passages, arrivals, readability), the slicer, ground and
+  open-hex sections. `features/<stem>.json` per map (the entrance
+  elevation's features and people); `map-features.json` is the start
+  map's. Cache: `cache/map.key` is the layer's key (the layer file, the
+  stems, and `map::cache_key` of every map's inputs); `cache/maps/<stem>.key`
+  each map's.
+- **Slicer addition.** `SlicerConfig::flat_references` (form keys always
+  flattened onto the ground, items, doors and containers excepted; empty
+  by default, nothing changes).
+- **Walk tools.** `route::WalkMap::load_elevation`, `Exit::to_elevation`;
+  `probe walk --elevation`; `replay::Hop::lands` (a hop ending on an exit
+  grid; the camera plan re-centres after it); `sequence::walk_hops_in`.
+
 ## 10. Characters (M4)
 
 Written 2026-11-20, before any M4 code. Engine rules below were read in
@@ -650,7 +837,8 @@ real Goodsprings extraction.
   | 36, 37 | `ch`, `cj` | get up | stays down |
   | 48, 49 | `ra`, `rb` | corpse | no body after an instant kill |
   | 16, 17 | `aq`, `ar` | punch, kick | it cannot fight back |
-  | 13, 15, 19 | `an`, `ap`, `at` | dodge, hit from behind, run | engine falls back |
+  | 13 | `an` | dodge | a missed shot from a weapon without a projectile registers the dodge without testing the art, and the whole attack fails: **required** (corrected 2026-11-23; `emit::combat_requirements` has it required, unarmed and per weapon code) |
+  | 15, 19 | `ap`, `at` | hit from behind, run | engine falls back |
 
 - **Frames.** Every direction has the same frame count. Stored fps 0
   means 10. The frame's bottom centre sits at the hex centre plus the
@@ -852,3 +1040,30 @@ walk's travel is not widened.
 2. Whether creatures (bighorners, ravens) belong in the first wave.
 3. Whether townsfolk may be killed before real death art exists.
 
+### 10.6 Critter stage options and `set.json` schema 2 (2026-11-23)
+
+`critters::critters(inputs)` runs `critters_with(inputs,
+&CritterOptions::for_run(inputs))`: the level, deaths, stride, figure look
+and `--only` from the command line (`--animations`, `--deaths`,
+`--stride`, `--figure-look`, `--only`), else the slice (`animations`,
+`deaths`, `stride`, `figure_look`), else the first wave's: **minimal**, so
+every existing slice keeps its critter art byte for byte
+(`CritterOptions::default()`, the library's, stays at combat). The slice's
+`[tone.figures]` is laid over the look's tone; a look other than the
+default needs a level above minimal (refused by `Inputs::check_mode`
+before extract). Above minimal, `CritterOptions::weapon_codes` comes from
+`catalogue::weapon_codes`: each carried weapon's rebalance class gives
+its code and modes, so the armed set drawn is the one the weapon
+prototype's code asks for (a set without it carries the weapon:
+`LootReport::skipped`). From Fallout 3 on the game is hashed into the
+stage's key prefix (New Vegas keys unchanged). `CrittersSummary::lines`
+are printed by `critters` and `all`.
+
+`<key>/set.json` above minimal is schema 2 (`CritterSetMeta::schema`):
+`appearance`, `label`, `stand_frames`, `walk_frames`, `walk_cycle_units`,
+`animations` (every suffix written, weapon letters included: `read_set`
+returns them all and the map stage ships them all), `missing_textures`,
+`level`, `real` (suffix to `{ source, frames, fps, action_frame }`),
+`placeholders` (stills), `weapons` (weapon letter to the model drawn in
+hand) and `bytes`. A minimal set has no `schema` (it reads as 0) and the
+first wave's fields only.

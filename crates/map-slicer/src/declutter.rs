@@ -37,10 +37,17 @@
 //!    partitions open the room while a jukebox stays whole; a shell holding
 //!    wall art that reaches above the lower cut keeps the interior's cut
 //!    (`keep_wall_art`), so paintings never float. The cut height is part
-//!    of the render key.
+//!    of the render key. Outdoors ([`RoofCut`]), roof triangles high over
+//!    walkable ground leave the render, so a figure under a canopy or a
+//!    hut roof is drawn on the ground in plain view, not on top of the
+//!    roof's art.
 //! 4. **Foreground cutaway** ([`Cutaway`]). Only walls take part: sliced,
 //!    at least `min_height` tall, a shell or thin and long, and protected
-//!    for no reason but being structural. After such a reference is
+//!    for no reason but being structural; of a base kind in `kinds`, not
+//!    matching `exclude_patterns` nor listed in `exclude_refs`, indoors
+//!    reaching the ceiling cut (`reach_cut`), and at least
+//!    `room_height_ratio` of the room's wall height, so a long grocery
+//!    shelf or a display case stays whole. After such a reference is
 //!    rendered and cut into strips, each strip is checked against every
 //!    walkable hex whose walker box (`SlicerConfig::walker_box`) it covers:
 //!    a strip anchored at hex `o` is drawn after a walker on `h < o`, so
@@ -54,13 +61,22 @@
 //!    deduplication work as before, its blocking is unchanged (a strip
 //!    left with no pixel blocks its hex as an invisible blocker), and since
 //!    pixels only leave, the draw order guarantees still hold. Interiors
-//!    and exterior facades are switched separately.
+//!    and exterior facades are switched separately. Doors ([`DoorStub`]):
+//!    a door or door-like static within `reach` of a cut strip that hides
+//!    a walker is cropped the same way to a stub taller than the kerb
+//!    (outlined as before; a teleport door keeps enough pixels to click);
+//!    doors are placed after every wall so the cut strips are known.
+//!    Strips no rule changes are byte-identical to a run without the door
+//!    rule.
 //! 5. **Figure-ground** ([`foundry_render::ClassTones`],
 //!    [`quantize::RimOptions`]). The floor tone is applied to the baked
 //!    floor and the flat overlays, the props tone to every upright render
 //!    and to relief; the figures tone is the caller's to apply to critters.
 //!    Interactive sprites (items, containers, doors, and the base kinds in
-//!    `outline_kinds`) get the rim outline.
+//!    `outline_kinds`) get the rim outline, by kind alone: protection only
+//!    decides what the clutter rules may prune, and an item they leave is
+//!    outlined whether or not it was protected
+//!    ([`crate::DeclutterStats::outlined_kinds`]).
 //! 6. **Metrics** ([`crate::DeclutterStats`]): references kept and pruned
 //!    by rule and by kind, protected references by reason, strips cut,
 //!    pixels removed, walkers covered before and after the cutaway, and
@@ -329,6 +345,26 @@ pub struct Cutaway {
     /// hiding nobody and standing behind nobody, is cut too (and so on
     /// along the wall); 0 cuts only the strips that hide someone.
     pub spread: i32,
+    /// Base kinds a wall may have; empty takes any. Furniture records
+    /// (`FURN`) and activators are not walls.
+    pub kinds: Vec<String>,
+    /// Model patterns (the crate's pattern rules) that are never walls:
+    /// shelves, counters, display cases, freezers, booths, tables.
+    pub exclude_patterns: Vec<String>,
+    /// Form keys that are never walls: a per-reference opt-out.
+    pub exclude_refs: BTreeSet<String>,
+    /// Indoors, a wall reaches the ceiling cut: its placed top stands at
+    /// least the interior's `cut_height` less `cut_tolerance` above the
+    /// floor. A grocery shelf or a display case stops well under it.
+    pub reach_cut: bool,
+    pub cut_tolerance: f32,
+    /// A wall is at least this share of the room's wall height: the median
+    /// height of every wall-shaped piece (indoors clipped at the
+    /// interior's cut). 0 turns the test off.
+    pub room_height_ratio: f32,
+    /// Doors standing in a cut wall ([`DoorStub`]); `None` leaves them
+    /// whole.
+    pub doors: Option<DoorStub>,
 }
 
 impl Default for Cutaway {
@@ -345,6 +381,90 @@ impl Default for Cutaway {
             max_width: 40.0,
             min_span: 120.0,
             spread: 2,
+            kinds: strings(&["STAT", "SCOL"]),
+            exclude_patterns: strings(&[
+                "furniture\\",
+                "grocery\\",
+                "billiards\\",
+                "*shelf",
+                "*shelves",
+                "*shelving",
+                "*counter",
+                "*displaycase",
+                "*freezer",
+                "*fridge",
+                "*cabinet",
+                "*booth",
+                "*pooltable",
+                "*desk",
+                "*table",
+            ]),
+            exclude_refs: BTreeSet::new(),
+            reach_cut: true,
+            cut_tolerance: 16.0,
+            room_height_ratio: 0.75,
+            doors: Some(DoorStub::default()),
+        }
+    }
+}
+
+/// Doors in a cut wall (module documentation, rule 4): a door, or a static
+/// standing in a doorway (`patterns`), whose hex lies within `reach` hex
+/// steps of a strip the cutaway cut and that hides a walker itself is
+/// cropped like a cut strip, to `stub_height` above its foot: taller than
+/// the kerb, so it still reads as a door, and outlined as before. A
+/// teleport door keeps at least `min_click_pixels` opaque pixels (its stub
+/// grows until it does), so it can still be clicked.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DoorStub {
+    pub stub_height: f32,
+    pub reach: i32,
+    /// Model patterns of door-like statics: static doors, door leaves.
+    pub patterns: Vec<String>,
+    pub min_click_pixels: usize,
+}
+
+impl Default for DoorStub {
+    fn default() -> Self {
+        DoorStub {
+            stub_height: 70.0,
+            reach: 2,
+            patterns: strings(&["*door", "!outdoor", "!doormat", "!doorbell"]),
+            min_click_pixels: 400,
+        }
+    }
+}
+
+/// Outdoors: roofs over walkable ground (module documentation, rule 3).
+/// A triangle of a sliced object or a landmark whose every corner stands
+/// more than `clearance` above the terrain, that faces up or down (the
+/// vertical part of its normal at least `min_tilt_cos`: a roof, a canopy, a
+/// soffit) and whose ground outline comes within `reach` floor squares of
+/// a walkable hex's centre, or that is steeper (a fascia, a wall) and comes
+/// within `wall_reach`, is left out of the render,
+/// like an interior ceiling: a figure under a canopy, a hut
+/// roof or a hangar roof is drawn on the ground in plain view instead of
+/// over or under the roof's art. Posts, walls and anything lower stay. The
+/// triangles left out are part of the render key, so references with the
+/// same mesh but other ground under their roof render apart.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoofCut {
+    pub clearance: f32,
+    pub reach: f64,
+    pub min_tilt_cos: f64,
+    pub wall_reach: f64,
+}
+
+impl Default for RoofCut {
+    /// Higher than a head (110 units); roofs tilted at most about 75
+    /// degrees within half a floor square (about a hex), steeper triangles
+    /// within 0.15.
+    fn default() -> Self {
+        RoofCut {
+            clearance: 120.0,
+            reach: 0.5,
+            min_tilt_cos: 0.25,
+            wall_reach: 0.15,
         }
     }
 }
@@ -368,6 +488,9 @@ pub struct DeclutterProfile {
     pub overhang: Option<OverhangRule>,
     pub shell_cut: Option<ShellCut>,
     pub cutaway: Option<Cutaway>,
+    /// Outdoors only: roofs over walkable ground leave the render
+    /// ([`RoofCut`]).
+    pub roof_cut: Option<RoofCut>,
     /// Floor, props and figures tones; the figures tone is the caller's.
     pub tones: ClassTones,
     /// The outline of interactive sprites; `None` draws none.
@@ -402,6 +525,7 @@ impl Default for DeclutterProfile {
             overhang: None,
             shell_cut: None,
             cutaway: None,
+            roof_cut: None,
             tones: ClassTones::IDENTITY,
             outline: None,
             outline_kinds: strings(&["TERM", "ACTI", "TACT"]),
@@ -414,10 +538,11 @@ impl Default for DeclutterProfile {
 
 impl DeclutterProfile {
     /// The readability preset (tuned on two real interiors, a saloon and a
-    /// casino): every rule on with its default, decals at 25 % opacity,
-    /// shells cut at 120, the interior cutaway at 35 units, the readable
-    /// tones, a dark outer outline on interactive sprites, and the baseline
-    /// measured.
+    /// casino, and checked on a store and a gas station): every rule on
+    /// with its default, decals at 25 % opacity, shells cut at 120, the
+    /// interior cutaway at 35 units with door stubs at 70, roofs over
+    /// walkable ground cut outdoors at 120, the readable tones, a dark
+    /// outer outline on interactive sprites, and the baseline measured.
     pub fn readable() -> Self {
         DeclutterProfile {
             clutter: Some(ClutterRules::default()),
@@ -426,6 +551,7 @@ impl DeclutterProfile {
             overhang: Some(OverhangRule::default()),
             shell_cut: Some(ShellCut::default()),
             cutaway: Some(Cutaway::default()),
+            roof_cut: Some(RoofCut::default()),
             tones: ClassTones::readable(),
             outline: Some(RimOptions::outer(0.45)),
             measure_baseline: true,
@@ -478,9 +604,26 @@ impl DeclutterProfile {
                 && c.min_height.is_finite()
                 && finite(c.min_hexes)
                 && finite(c.max_width)
-                && finite(c.min_span))
+                && finite(c.min_span)
+                && c.cut_tolerance.is_finite()
+                && finite(f64::from(c.room_height_ratio))
+                && c.doors.as_ref().is_none_or(|d| {
+                    d.stub_height.is_finite() && d.stub_height >= c.kerb_height && d.reach >= 0
+                }))
         {
-            return Err("declutter cutaway values must be finite and non-negative".into());
+            return Err(
+                "declutter cutaway values must be finite and non-negative, and a door stub at \
+                 least the kerb"
+                    .into(),
+            );
+        }
+        if let Some(r) = &self.roof_cut
+            && !(r.clearance.is_finite()
+                && finite(r.reach)
+                && finite(r.min_tilt_cos)
+                && finite(r.wall_reach))
+        {
+            return Err("declutter roof cut values must be finite".into());
         }
         if !self.protect.structural_min_hexes.is_finite() {
             return Err("declutter structural_min_hexes must be finite".into());
@@ -562,6 +705,8 @@ pub(crate) struct Decision {
     pub faded: Vec<bool>,
     /// Interactive sprites that get the outline.
     pub outlined: Vec<bool>,
+    /// Doors and door-like statics the cutaway's door rule may crop.
+    pub door_like: Vec<bool>,
     /// The pruning and protection tallies (no run numbers yet).
     pub stats: DeclutterStats,
 }
@@ -674,6 +819,7 @@ pub(crate) fn decide(
         cuts: vec![None; n],
         faded: vec![false; n],
         outlined: vec![false; n],
+        door_like: vec![false; n],
         stats: DeclutterStats::default(),
     };
     let walkers = profile.walkers_of(config);
@@ -705,12 +851,20 @@ pub(crate) fn decide(
         }
         // The cutaway crops walls, shells included (protected from pruning
         // as structural); never what is protected for any other reason.
+        // (Shape only here; what is not a wall leaves after the loop.)
         if let (Some(c), Some(f), Class::Sliced) = (&profile.cutaway, f, &classes[i])
             && reason.is_none_or(|r| r == "structural")
         {
             let wall =
                 f.footprint.width() <= c.max_width && f.footprint.longest_side() >= c.min_span;
             d.cutaway[i] = f.footprint.height() >= c.min_height && (f.hexes >= c.min_hexes || wall);
+        }
+        if let Some(doors) = profile.cutaway.as_ref().and_then(|c| c.doors.as_ref())
+            && let Class::Sprite(role) = &classes[i]
+        {
+            d.door_like[i] = *role == Role::Door
+                || (*role == Role::Scenery
+                    && f.is_some_and(|f| config.matches(&doors.patterns, &f.model).is_some()));
         }
         if matches!(
             classes[i],
@@ -768,6 +922,60 @@ pub(crate) fn decide(
                 continue;
             }
         }
+    }
+    // The cutaway takes walls only: furniture shaped like a wall (a long
+    // shelf, a display case) leaves by kind, pattern, opt-out, the ceiling
+    // or the room's wall height.
+    if let Some(c) = &profile.cutaway {
+        let cut_of = |f: &Facts| match interior {
+            Some(indoors) => f
+                .footprint
+                .height()
+                .min(indoors.cut_height + indoors.floor_z - f.footprint.z[0]),
+            None => f.footprint.height(),
+        };
+        let mut shells: Vec<f32> = (0..n)
+            .filter(|&i| d.cutaway[i] && classes[i] == Class::Sliced)
+            .filter_map(|i| placed[i].as_ref())
+            .map(cut_of)
+            .collect();
+        shells.sort_by(f32::total_cmp);
+        let room = shells.get(shells.len() / 2).copied();
+        for i in 0..n {
+            if !(d.cutaway[i] && classes[i] == Class::Sliced) {
+                continue;
+            }
+            let Some(f) = placed[i].as_ref() else {
+                continue;
+            };
+            let r = refs[i];
+            let why = if !c.kinds.is_empty() && !in_list(&c.kinds, r) {
+                Some("kind")
+            } else if c.exclude_refs.contains(&r.form.to_string()) {
+                Some("opted out")
+            } else if config.matches(&c.exclude_patterns, &f.model).is_some() {
+                Some("pattern")
+            } else if let Some(indoors) = interior
+                && c.reach_cut
+                && f.footprint.z[1] - indoors.floor_z < indoors.cut_height - c.cut_tolerance
+            {
+                Some("under the ceiling cut")
+            } else if c.room_height_ratio > 0.0
+                && room.is_some_and(|room| cut_of(f) < c.room_height_ratio * room)
+            {
+                Some("low for the room")
+            } else {
+                None
+            };
+            match why {
+                Some(why) => {
+                    d.cutaway[i] = false;
+                    *d.stats.cutaway_excluded.entry(why.to_owned()).or_insert(0) += 1;
+                }
+                None => d.stats.cutaway_walls += 1,
+            }
+        }
+        d.stats.room_wall_height = room;
     }
     // Dense piles: largest first, a prop stays while fewer than `keep`
     // kept props stand within the radius of it.

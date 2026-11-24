@@ -3,6 +3,7 @@
 
 mod classes;
 mod declutter;
+mod fixes;
 mod interior;
 mod ladder;
 mod landmarks;

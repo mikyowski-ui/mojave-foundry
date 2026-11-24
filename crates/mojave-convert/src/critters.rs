@@ -2250,9 +2250,99 @@ impl Shared<'_> {
 }
 
 /// Renders a sprite set for every distinct human appearance in the slice
-/// to `<out>/critters/`, with the default options.
+/// to `<out>/critters/`, with the run's options
+/// ([`CritterOptions::for_run`]: the command line's and the slice's keys,
+/// [`AnimationLevel::Minimal`] when neither names a level).
 pub fn critters(inputs: &Inputs) -> Result<CrittersSummary, ConvertError> {
-    critters_with(inputs, &CritterOptions::default())
+    critters_with(inputs, &CritterOptions::for_run(inputs)?)
+}
+
+impl CritterOptions {
+    /// The options of a run: the level, deaths, stride, look and `--only`
+    /// from the command line, else the slice (`animations`, `deaths`,
+    /// `stride`, `figure_look`), else the first wave's (minimal level,
+    /// default look). The slice's `[tone.figures]` is laid over the look's
+    /// tone. Above minimal, every carried weapon's code and modes come from
+    /// its rebalance class (`crate::catalogue::weapon_codes`), so that the
+    /// armed set drawn is the one the map stage's weapon prototype asks
+    /// for.
+    pub fn for_run(inputs: &Inputs) -> Result<Self, ConvertError> {
+        let settings = inputs.critter_settings()?;
+        let level = settings.level.unwrap_or(AnimationLevel::Minimal);
+        let mut look = if settings.look == Some(true) {
+            FigureLook::readable()
+        } else {
+            FigureLook::default()
+        };
+        if let Some(curve) = inputs.slice.tone.as_ref().and_then(|t| t.figures) {
+            look.tone.gain = curve.gain.unwrap_or(look.tone.gain);
+            look.tone.gamma = curve.gamma.unwrap_or(look.tone.gamma);
+            look.tone.saturation = curve.saturation.unwrap_or(look.tone.saturation);
+            look.tone.contrast = curve.contrast.unwrap_or(look.tone.contrast);
+        }
+        if level == AnimationLevel::Minimal && !look.is_default() {
+            return Err(ConvertError::Slice {
+                name: inputs.slice.name.clone(),
+                reason: "the figure look (figure_look, [tone.figures]) needs animations =                          \"combat\" or \"full\": the minimal level draws figures as the \
+                         first wave did"
+                    .to_owned(),
+            });
+        }
+        let mut only = settings.only;
+        let weapon_codes = if level == AnimationLevel::Minimal {
+            BTreeMap::new()
+        } else {
+            let mir =
+                Mir::open(&inputs.mir_dir()).map_err(|e| ConvertError::stage("critters", e))?;
+            // An interior demo above minimal renders only the people its
+            // room places: a combat set takes about 20 s, and the extract
+            // holds every actor of the town around it.
+            if only.is_empty()
+                && let Some(id) = &inputs.slice.interior
+                && let Some(doc) = mir
+                    .interior(id)
+                    .map_err(|e| ConvertError::stage("critters", e))?
+            {
+                let placed: BTreeSet<String> = doc
+                    .references
+                    .iter()
+                    .filter(|r| {
+                        matches!(
+                            r.base_kind.as_deref(),
+                            Some("NPC_" | "CREA" | "LVLN" | "LVLC")
+                        )
+                    })
+                    .filter_map(|r| r.base_editor_id.clone())
+                    .collect();
+                only = if placed.is_empty() {
+                    vec![String::new()]
+                } else {
+                    placed.into_iter().collect()
+                };
+            }
+            // A layer above minimal renders the people its maps place: its
+            // exterior windows and its interiors (`crate::layer`).
+            if only.is_empty() && inputs.layer_spec().is_some() {
+                let placed = crate::layer::actor_ids(inputs, &mir)?;
+                only = if placed.is_empty() {
+                    vec![String::new()]
+                } else {
+                    placed
+                };
+            }
+            let rebalance = inputs.rebalance()?;
+            crate::catalogue::weapon_codes(&mir, &rebalance)?
+        };
+        Ok(CritterOptions {
+            level,
+            look,
+            deaths: settings.deaths.unwrap_or_default(),
+            stride: settings.stride.unwrap_or_default(),
+            weapon_codes,
+            only,
+            sampler: Arc::new(RagdollSampler),
+        })
+    }
 }
 
 /// [`critters`] with options.
@@ -2301,6 +2391,10 @@ pub fn critters_with(
     prefix.update(WALK_FPS.to_le_bytes());
     for yaw in yaws {
         prefix.update(yaw.to_le_bytes());
+    }
+    // The game from Fallout 3 on; New Vegas keys stay what they were.
+    if inputs.game != mir::GameVariant::FalloutNewVegas {
+        prefix.update(inputs.game.id().as_bytes());
     }
     if !minimal {
         prefix.update(

@@ -63,6 +63,10 @@ pub(crate) fn open_costs(
                 // An interior's ground is its floor level's navmesh only:
                 // off it there is wall or void, never ground to open.
                 Verdict::OffNavmesh if options.interior.is_some() => return None,
+                // Nor above an exterior's ground level.
+                Verdict::OffNavmesh if options.level.as_ref().is_some_and(|l| l.level > 0) => {
+                    return None;
+                }
                 Verdict::OffNavmesh => {
                     let [x, y] = frame.source_of_tile(frame.hex_centre_tile(hex)?);
                     let slope = sampler.slope(x as f32, y as f32)?;
@@ -90,25 +94,28 @@ fn island_of(comps: &Components, main: usize, target: &Target) -> Option<usize> 
 }
 
 /// Join every island that holds a target to the largest component (crate
-/// notes), opening hexes in `walkable`. `costs` is only called when some
-/// island needs a passage. With `enabled` false nothing is opened and
-/// every such island is reported as left alone.
+/// notes), or to the component of `hub` when that hex is walkable,
+/// opening hexes in `walkable`. `costs` is only called when some island
+/// needs a passage. With `enabled` false nothing is opened and every such
+/// island is reported as left alone.
 pub(crate) fn reconnect(
     walkable: &mut [bool],
     targets: &[Target],
     costs: impl FnOnce() -> Vec<Option<OpenCost>>,
     options: &BuildOptions,
     enabled: bool,
+    hub: Option<i32>,
 ) -> (Vec<PassageReport>, Vec<IslandReport>) {
     let comps = islands::components(|h| walkable[h as usize]);
     let mut passages = Vec::new();
     let mut left = Vec::new();
-    let Some(main_hex) = comps.first_hex(0) else {
+    let hub = hub.and_then(|hex| comps.of(hex).map(|id| (hex, id)));
+    let Some((main_hex, main)) = hub.or_else(|| comps.first_hex(0).map(|hex| (hex, 0))) else {
         return (passages, left);
     };
     let mut holdings: BTreeMap<usize, Vec<String>> = BTreeMap::new();
     for target in targets {
-        if let Some(id) = island_of(&comps, 0, target) {
+        if let Some(id) = island_of(&comps, main, target) {
             holdings.entry(id).or_default().push(target.what.clone());
         }
     }

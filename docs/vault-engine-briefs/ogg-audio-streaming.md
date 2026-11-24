@@ -8,7 +8,7 @@ Basis: `vault-engine` at revision `4d5183a`. Modules: `vault_formats::acm`
 `vault_platform::audio` (`Mixer`, `Channel`, `Voice`, `Stream`,
 `MusicRequest::track`, `MusicState` and its decode worker,
 `MAX_DECODED_SAMPLES`, `EFFECT_VOICES`, in
-`crates/vault-platform/src/audio.rs`), `vault_platform::map_preview`
+its audio module), `vault_platform::map_preview`
 (`play_speech`, `play_library`, `update_audio`), `vault_core::host_sound`
 (`request_speech`, `speech_started`, `speech_clock`) and
 `vault_core::dialogue` (`LipSync`); the `audio` feature of `vault-platform`

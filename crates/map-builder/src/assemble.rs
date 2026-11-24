@@ -275,6 +275,7 @@ pub(crate) fn build(input: &BuildInput) -> Result<Built, BuildError> {
                 placements: input.placements,
                 blocked_hexes: input.blocked_hexes,
                 interior,
+                level: options.level.take(),
             }],
             entrance_elevation: None,
             cells: input.cells,
@@ -1238,6 +1239,7 @@ pub(crate) fn build_layer(input: &LayerInput) -> Result<BuiltLayer, BuildError> 
                 &elevation.placement_blocks,
                 &elevation.cover,
                 elevation.options.entrance_box,
+                elevation.options.readability_sight,
             );
             let blocked = islands::engine_blocked(&per_objects[e]);
             let comps = islands::components(|h| !blocked[h as usize])

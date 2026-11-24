@@ -77,6 +77,7 @@ fn a_stationary_log_freezes_the_camera_after_the_settle_ticks() {
         steps: 3,
         ticks: 10,
         path: vec![start, hex(101, 100), hex(102, 100), hex(103, 100)],
+        lands: None,
     }];
     // A plan centred on the player's own hex: a zero-length drag.
     let plan = CameraPlan {
@@ -136,12 +137,14 @@ fn a_recentre_is_home_a_tick_and_a_panned_freeze() {
             steps: 10,
             ticks: 3,
             path: vec![start, at],
+            lands: None,
         },
         Hop {
             hex: hex(120, 100),
             steps: 10,
             ticks: 3,
             path: vec![at, hex(120, 100)],
+            lands: None,
         },
     ];
     let new_centre = [centre(at)[0] + 100.0, centre(at)[1] - 40.0];

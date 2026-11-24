@@ -39,6 +39,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+#[path = "common/navmesh.rs"]
+mod navmesh;
+
 use foundry_render::{Calibration, CpuRenderer, Projection};
 use std::collections::BTreeSet;
 
@@ -157,6 +160,9 @@ fn run() -> Result<(), String> {
         doc.references.len()
     );
 
+    if let Ok(filter) = std::env::var("SLICER_LIST") {
+        list_references(&mir, &doc, &projection, &interior, &filter)?;
+    }
     let budget = Budget {
         walls: usize::MAX / 4,
         scenery: usize::MAX / 4,
@@ -193,14 +199,46 @@ fn run() -> Result<(), String> {
             ("plain", SlicerConfig::default()),
         ]
     } else {
-        let open = navmesh_hexes(&doc, &projection, &window, floor_z, walk);
+        let open = match std::env::var("SLICER_TOL") {
+            // As the map stage opens them: within a tolerance of a triangle.
+            Ok(v) => {
+                let tolerance: f64 = v.trim().parse().map_err(|e| format!("SLICER_TOL: {e}"))?;
+                let centres = navmesh::hex_sources(&projection, &window);
+                navmesh::open_hexes(
+                    std::slice::from_ref(&doc),
+                    &centres,
+                    &no_land,
+                    Some(floor_z),
+                    walk,
+                    tolerance,
+                )
+            }
+            Err(_) => navmesh_hexes(&doc, &projection, &window, floor_z, walk),
+        };
         println!("{} navmesh hexes in the floor band", open.len());
         let base = SlicerConfig {
             interior: Some(interior.clone()),
             open_hexes: open,
+            furniture: std::env::var_os("SLICER_FURNITURE")
+                .map(|_| map_slicer::FurnitureRule::default()),
+            wire: std::env::var_os("SLICER_WIRE").map(|_| map_slicer::WireRule::default()),
             ..SlicerConfig::default()
         };
         let mut profile = DeclutterProfile::readable();
+        // `SLICER_OLD=doors,walls`: the cutaway as it was before the door
+        // rule and the wall tests, to compare.
+        let old = std::env::var("SLICER_OLD").unwrap_or_default();
+        if let Some(c) = &mut profile.cutaway {
+            if old.contains("doors") {
+                c.doors = None;
+            }
+            if old.contains("walls") {
+                c.kinds.clear();
+                c.exclude_patterns.clear();
+                c.reach_cut = false;
+                c.room_height_ratio = 0.0;
+            }
+        }
         if let Ok(v) = std::env::var("SLICER_KERB")
             && let Some(c) = &mut profile.cutaway
         {
@@ -253,6 +291,20 @@ fn run() -> Result<(), String> {
         )
         .map_err(|e| e.to_string())?;
         println!("\n{name}:\n{}", sliced.report);
+        println!("output digest {}", digest(&sliced));
+        if let Some(f) = &sliced.report.furniture
+            && std::env::var_os("SLICER_FURNITURE_LIST").is_some()
+        {
+            for c in &f.choices {
+                println!(
+                    "  furniture {} {} {} {}",
+                    c.reason, c.footprint, c.reference, c.model
+                );
+            }
+        }
+        if let Ok(text) = std::env::var("SLICER_UNDER") {
+            under_report(&sliced, &doc, &config, &projection, &window, &text, &mir);
+        }
         // What the interior rules skipped, by model.
         let mut by: BTreeMap<(&str, String), usize> = BTreeMap::new();
         for s in &sliced.skipped {
@@ -348,6 +400,69 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+/// `SLICER_LIST=<text>`: one line per reference whose model or kind
+/// contains `text` (empty: all): form, kind, class, placed footprint
+/// (narrowest width, longest side, hexes), height span above the floor,
+/// teleport, model.
+fn list_references(
+    mir: &Mir,
+    doc: &mir::CellDoc,
+    projection: &Projection,
+    interior: &InteriorSlice,
+    filter: &str,
+) -> Result<(), String> {
+    let assets = MirAssets::new(mir, 0);
+    let config = SlicerConfig {
+        interior: Some(interior.clone()),
+        ..SlicerConfig::default()
+    };
+    let filter = filter.to_ascii_lowercase();
+    println!("form kind class width span hexes z0 z1 teleport masked model");
+    for r in &doc.references {
+        let model = r.model.clone().unwrap_or_default().to_ascii_lowercase();
+        let kind = r.base_kind.clone().unwrap_or_default();
+        if !filter.is_empty()
+            && !model.contains(&filter)
+            && !kind.to_ascii_lowercase().contains(&filter)
+        {
+            continue;
+        }
+        let facts = r
+            .mesh
+            .as_deref()
+            .and_then(|h| map_slicer::Assets::mesh(&assets, h).ok())
+            .map(|m| map_slicer::MeshFacts::of(&m));
+        let class = map_slicer::classify(r, facts.as_ref(), projection.tile_units(), &config);
+        let fp = facts
+            .and_then(|f| f.bounds)
+            .filter(|_| r.transform.is_finite())
+            .map(|b| map_slicer::Footprint::of(&r.transform, b));
+        let dims = fp.map_or("-".to_owned(), |f| {
+            format!(
+                "{:.0} {:.0} {:.1} {:.0} {:.0}",
+                f.width(),
+                f.longest_side(),
+                f.hexes(projection.tile_units()),
+                f.z[0] - interior.floor_z,
+                f.z[1] - interior.floor_z
+            )
+        });
+        let masked = r
+            .mesh
+            .as_deref()
+            .and_then(|h| map_slicer::Assets::mesh(&assets, h).ok())
+            .and_then(|m| map_slicer::masked_share(&m))
+            .unwrap_or(0.0);
+        println!(
+            "{} {kind} {:?} {dims} {} {masked:.2} {model}",
+            r.form,
+            class,
+            r.teleport.is_some()
+        );
+    }
+    Ok(())
+}
+
 /// Hexes whose centre lies on a navmesh triangle within the walk band
 /// (`[low, high]` above the floor).
 fn navmesh_hexes(
@@ -408,6 +523,232 @@ fn navmesh_hexes(
         }
     }
     out
+}
+
+/// `SLICER_UNDER=a,b,...`: for every reference whose model contains one of
+/// the words, the hexes under its placed footprint (centre inside it or
+/// within 0.15 floor squares, as the builder's footprints take them) that
+/// are open and not blocked by this run, and the same once the run's
+/// footprints are applied; then the walkable floor of the run.
+fn under_report(
+    sliced: &Sliced,
+    doc: &mir::CellDoc,
+    config: &SlicerConfig,
+    projection: &Projection,
+    window: &MapWindow,
+    text: &str,
+    mir: &Mir,
+) {
+    let words: Vec<String> = text
+        .split(',')
+        .map(|w| w.trim().to_ascii_lowercase())
+        .collect();
+    let centres = navmesh::hex_sources(projection, window);
+    let mut blocked: BTreeSet<i32> = sliced.blocked_hexes.iter().copied().collect();
+    for p in &sliced.placements {
+        if p.blocking {
+            blocked.insert(p.hex);
+        }
+    }
+    let reach = 0.15 * f64::from(projection.tile_units());
+    let under = |polygon: &[[f64; 2]]| -> Vec<i32> {
+        (0..centres.len())
+            .filter(|&h| {
+                centres[h].is_some_and(|c| inside(polygon, c) || distance(polygon, c) <= reach)
+            })
+            .map(|h| h as i32)
+            .collect()
+    };
+    let assets = MirAssets::new(mir, 0);
+    let mut by_footprint: BTreeSet<i32> = BTreeSet::new();
+    let models: BTreeMap<String, String> = doc
+        .references
+        .iter()
+        .map(|r| (r.form.to_string(), r.model.clone().unwrap_or_default()))
+        .collect();
+    for (reference, corners) in &sliced.footprints {
+        let poly: Vec<[f64; 2]> = corners
+            .iter()
+            .map(|c| [f64::from(c[0]), f64::from(c[1])])
+            .collect();
+        let hexes = under(&poly);
+        let newly = hexes
+            .iter()
+            .filter(|h| config.open_hexes.contains(h) && !blocked.contains(h))
+            .count();
+        if newly >= 1 && std::env::var_os("SLICER_FOOTPRINT_LIST").is_some() {
+            println!(
+                "  footprint {reference} blocks {newly} free hexes: {}",
+                models.get(reference).cloned().unwrap_or_default()
+            );
+        }
+        by_footprint.extend(hexes);
+    }
+    let (mut total, mut free, mut free_after) = (0, 0, 0);
+    for r in &doc.references {
+        let model = r.model.clone().unwrap_or_default().to_ascii_lowercase();
+        if !words
+            .iter()
+            .any(|w| !w.is_empty() && model.contains(w.as_str()))
+        {
+            continue;
+        }
+        let Some(b) = r
+            .mesh
+            .as_deref()
+            .and_then(|h| map_slicer::Assets::mesh(&assets, h).ok())
+            .and_then(|m| map_slicer::MeshFacts::of(&m).bounds)
+        else {
+            continue;
+        };
+        let poly = map_slicer::Footprint::of(&r.transform, b).polygon;
+        let hexes = under(&poly);
+        let open: Vec<i32> = hexes
+            .iter()
+            .copied()
+            .filter(|h| config.open_hexes.contains(h))
+            .collect();
+        let f: Vec<i32> = open
+            .iter()
+            .copied()
+            .filter(|h| !blocked.contains(h))
+            .collect();
+        let fa = f.iter().filter(|h| !by_footprint.contains(h)).count();
+        println!(
+            "  under {} {}: {} hexes, {} open, {} free, {} free with the footprints{}",
+            r.form,
+            model.rsplit('\\').next().unwrap_or(&model),
+            hexes.len(),
+            open.len(),
+            f.len(),
+            fa,
+            if sliced.footprints.contains_key(&r.form.to_string()) {
+                " (footprint given)"
+            } else {
+                ""
+            }
+        );
+        total += hexes.len();
+        free += f.len();
+        free_after += fa;
+    }
+    let walkable: BTreeSet<i32> = config
+        .open_hexes
+        .iter()
+        .copied()
+        .filter(|h| !blocked.contains(h))
+        .collect();
+    let walkable_after: BTreeSet<i32> = walkable
+        .iter()
+        .copied()
+        .filter(|h| !by_footprint.contains(h))
+        .collect();
+    println!(
+        "  under all: {total} hexes, {free} free, {free_after} free with the footprints; walkable floor {} \
+         (largest component {}), with the footprints {} (largest component {})",
+        walkable.len(),
+        largest(&walkable),
+        walkable_after.len(),
+        largest(&walkable_after)
+    );
+}
+
+fn inside(poly: &[[f64; 2]], p: [f64; 2]) -> bool {
+    let n = poly.len();
+    if n < 3 {
+        return false;
+    }
+    let side =
+        |a: [f64; 2], b: [f64; 2]| (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]);
+    let s: Vec<f64> = (0..n).map(|i| side(poly[i], poly[(i + 1) % n])).collect();
+    s.iter().all(|v| *v >= 0.0) || s.iter().all(|v| *v <= 0.0)
+}
+
+fn distance(poly: &[[f64; 2]], p: [f64; 2]) -> f64 {
+    let n = poly.len();
+    (0..n)
+        .map(|i| {
+            let (a, b) = (poly[i], poly[(i + 1) % n]);
+            let d = [b[0] - a[0], b[1] - a[1]];
+            let len = d[0] * d[0] + d[1] * d[1];
+            let t = if len > 0.0 {
+                (((p[0] - a[0]) * d[0] + (p[1] - a[1]) * d[1]) / len).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            ((p[0] - a[0] - t * d[0]).powi(2) + (p[1] - a[1] - t * d[1]).powi(2)).sqrt()
+        })
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// The largest connected component of `hexes`.
+fn largest(hexes: &BTreeSet<i32>) -> usize {
+    let mut seen: BTreeSet<i32> = BTreeSet::new();
+    let mut best = 0;
+    for &start in hexes {
+        if !seen.insert(start) {
+            continue;
+        }
+        let mut stack = vec![start];
+        let mut n = 0;
+        while let Some(h) = stack.pop() {
+            n += 1;
+            for o in 0..6u8 {
+                if let Ok(Some(m)) = HexGrid::neighbor(h, o)
+                    && hexes.contains(&m)
+                    && seen.insert(m)
+                {
+                    stack.push(m);
+                }
+            }
+        }
+        best = best.max(n);
+    }
+    best
+}
+
+/// SHA-256 over everything a run hands the map builder.
+fn digest(sliced: &Sliced) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    let n = |h: &mut Sha256, v: i64| h.update(v.to_le_bytes());
+    for a in &sliced.art {
+        n(&mut h, a.category as i64);
+        n(&mut h, i64::from(a.width));
+        n(&mut h, i64::from(a.height));
+        n(&mut h, i64::from(a.shift[0]));
+        n(&mut h, i64::from(a.shift[1]));
+        h.update(&a.pixels);
+        h.update(a.source.as_bytes());
+    }
+    for p in &sliced.placements {
+        n(&mut h, p.art as i64);
+        n(&mut h, i64::from(p.hex));
+        n(&mut h, i64::from(p.displacement[0]));
+        n(&mut h, i64::from(p.displacement[1]));
+        n(&mut h, p.role as i64);
+        h.update(p.reference.as_bytes());
+        n(&mut h, i64::from(p.blocking));
+        let run = p.run.unwrap_or((-1, -1));
+        n(&mut h, i64::from(run.0));
+        n(&mut h, i64::from(run.1));
+    }
+    for o in &sliced.overlays {
+        n(&mut h, i64::from(o.origin[0]));
+        n(&mut h, i64::from(o.origin[1]));
+        n(&mut h, i64::from(o.width));
+        n(&mut h, i64::from(o.height));
+        h.update(&o.rgba);
+    }
+    for b in &sliced.blocked_hexes {
+        n(&mut h, i64::from(*b));
+    }
+    for s in &sliced.skipped {
+        h.update(s.reference.as_bytes());
+        h.update(s.reason.label().as_bytes());
+    }
+    let d = h.finalize();
+    d.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Engine placement of a frame's pixel (0, 0).

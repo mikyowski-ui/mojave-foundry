@@ -28,10 +28,10 @@ use crate::config::{ConvertError, Inputs};
 const STAGE_VERSION: &str = "map-8";
 /// Land textures are filtered one mip level finer than the pixel footprint
 /// asks for: crisper cracks and grain, judged on engine frames.
-const GROUND_LOD_BIAS: f32 = -1.0;
+pub(crate) const GROUND_LOD_BIAS: f32 = -1.0;
 /// How far from a teleporting door (hex steps) the navmesh overrides a
 /// building's bounding footprint.
-const DOOR_APPROACH: i32 = 6;
+pub(crate) const DOOR_APPROACH: i32 = 6;
 
 /// The layer's id in `vault-mod.toml`. A re-run replaces a folder only when
 /// it carries this id.
@@ -47,6 +47,8 @@ const EXTENDING_TILE_CAP: usize = 2000;
 /// The map stage's own record of the largest things it placed, beside the
 /// report: what `shots --auto` points the camera at.
 pub const FEATURES_FILE: &str = "map-features.json";
+/// A layer's per-map features: `<out>/features/<stem>.json`.
+pub const FEATURES_DIR: &str = "features";
 /// At most this many features are recorded.
 const MAX_FEATURES: usize = 64;
 
@@ -121,18 +123,18 @@ pub struct MapSummary {
     pub critters: usize,
 }
 
-fn io(path: &Path) -> impl FnOnce(std::io::Error) -> ConvertError + '_ {
+pub(crate) fn io(path: &Path) -> impl FnOnce(std::io::Error) -> ConvertError + '_ {
     move |source| ConvertError::Io {
         path: path.to_owned(),
         source,
     }
 }
 
-fn stage(error: impl std::fmt::Display) -> ConvertError {
+pub(crate) fn stage(error: impl std::fmt::Display) -> ConvertError {
     ConvertError::stage("map", error)
 }
 
-fn slicer_category(category: map_slicer::ArtCategory) -> map_builder::ArtCategory {
+pub(crate) fn slicer_category(category: map_slicer::ArtCategory) -> map_builder::ArtCategory {
     match category {
         map_slicer::ArtCategory::Walls => map_builder::ArtCategory::Walls,
         map_slicer::ArtCategory::Scenery => map_builder::ArtCategory::Scenery,
@@ -140,7 +142,7 @@ fn slicer_category(category: map_slicer::ArtCategory) -> map_builder::ArtCategor
     }
 }
 
-fn slicer_role(role: map_slicer::Role) -> map_builder::Role {
+pub(crate) fn slicer_role(role: map_slicer::Role) -> map_builder::Role {
     match role {
         map_slicer::Role::WallStrip => map_builder::Role::WallStrip,
         map_slicer::Role::Scenery => map_builder::Role::Scenery,
@@ -152,7 +154,7 @@ fn slicer_role(role: map_slicer::Role) -> map_builder::Role {
 }
 
 /// A map file stem the format accepts: at most eight of `[a-z0-9_-]`.
-fn map_stem(slice: &str) -> String {
+pub(crate) fn map_stem(slice: &str) -> String {
     let stem: String = slice
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
@@ -167,7 +169,7 @@ fn map_stem(slice: &str) -> String {
 }
 
 /// Everything the stage's output depends on, hashed.
-fn cache_key(
+pub(crate) fn cache_key(
     inputs: &Inputs,
     palette_bytes: &[u8],
     base: &BTreeMap<String, Vec<u8>>,
@@ -199,6 +201,13 @@ fn cache_key(
         hasher.update(format!("declutter={declutter}").as_bytes());
         // The preset itself, so that tuning it rebuilds.
         hasher.update(format!("{:?}", crate::declutter::readable_for(inputs.game)).as_bytes());
+    }
+    // Loot, only when on (the slice's own key is in its TOML above;
+    // `--loot` is not): the effective rebalance tables, not the file.
+    if inputs.loot_on() {
+        // Bumped whenever the catalogue's output for the same tables changes.
+        hasher.update(b"loot=on catalogue-3");
+        hasher.update(inputs.rebalance()?.digest().as_bytes());
     }
     // The critter stage's index names every sprite set by content key.
     let critters = inputs.critters_dir().join("index.json");
@@ -235,7 +244,7 @@ fn with_article(name: &str) -> String {
 }
 
 /// The display name of an actor entry: its name, else its editor id.
-fn person_name(entry: &crate::critters::CritterEntry) -> String {
+pub(crate) fn person_name(entry: &crate::critters::CritterEntry) -> String {
     entry
         .name
         .clone()
@@ -246,7 +255,7 @@ fn person_name(entry: &crate::critters::CritterEntry) -> String {
 
 /// The townsfolk the builder is given, and on an interior slice whoever
 /// was left out before it.
-type CritterInputs = (
+pub(crate) type CritterInputs = (
     Vec<map_builder::CritterArt>,
     Vec<map_builder::CritterPlacement>,
     Vec<PersonSkip>,
@@ -267,6 +276,22 @@ fn critter_inputs(
     cells: &[CellDoc],
     references: &[mir::Reference],
 ) -> Result<CritterInputs, ConvertError> {
+    let mut sets: BTreeMap<String, usize> = BTreeMap::new();
+    let mut art = Vec::new();
+    let (placements, skipped) =
+        critter_inputs_into(inputs, cells, references, &mut sets, &mut art)?;
+    Ok((art, placements, skipped))
+}
+
+/// [`critter_inputs`] into a layer's shared sprite sets: `sets` maps a set
+/// key to its index in `art`, which a set the call needs is added to.
+pub(crate) fn critter_inputs_into(
+    inputs: &Inputs,
+    cells: &[CellDoc],
+    references: &[mir::Reference],
+    sets: &mut BTreeMap<String, usize>,
+    art: &mut Vec<map_builder::CritterArt>,
+) -> Result<(Vec<map_builder::CritterPlacement>, Vec<PersonSkip>), ConvertError> {
     let interior = inputs.slice.is_interior();
     let place_disabled = interior && inputs.slice.place_disabled;
     let mut skipped: Vec<PersonSkip> = Vec::new();
@@ -290,8 +315,6 @@ fn critter_inputs(
             )
         })
         .collect();
-    let mut sets: BTreeMap<String, usize> = BTreeMap::new();
-    let mut art = Vec::new();
     let mut placements = Vec::new();
     for reference in references {
         let mut skip = |reason: String| {
@@ -381,13 +404,13 @@ fn critter_inputs(
             }
         }
     }
-    Ok((art, placements, skipped))
+    Ok((placements, skipped))
 }
 
 /// Paints the map as the engine draws it: floor tiles, then every object in
 /// ascending hex order, each frame bottom-centre at its hex centre plus
 /// shift and displacement.
-fn compose_preview(
+pub(crate) fn compose_preview(
     ground: &map_terrain::Ground,
     sliced: &map_slicer::Sliced,
 ) -> (Vec<u8>, u32, u32) {
@@ -430,7 +453,7 @@ fn compose_preview(
 /// The base game's files the builder takes (`map_builder::base_file_paths`),
 /// which the layer must ship whole. A synthetic install has none, and then
 /// everything starts empty.
-fn base_files(inputs: &Inputs) -> BTreeMap<String, Vec<u8>> {
+pub(crate) fn base_files(inputs: &Inputs) -> BTreeMap<String, Vec<u8>> {
     let mut base: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     for path in map_builder::base_file_paths() {
         if let Ok(bytes) = inputs.f2_file(path) {
@@ -490,37 +513,37 @@ pub fn slicer_defaults(game: mir::GameVariant) -> map_slicer::SlicerConfig {
 }
 
 /// The map window and everything the slicer needs about it.
-struct Scene {
-    projection: Projection,
-    window: MapWindow,
-    worldspace: String,
-    sampler: GroundSampler,
-    cells: Vec<CellDoc>,
-    references: Vec<mir::Reference>,
-    build_options: map_builder::BuildOptions,
-    slicer_config: map_slicer::SlicerConfig,
-    open: OpenHexes,
+pub(crate) struct Scene {
+    pub(crate) projection: Projection,
+    pub(crate) window: MapWindow,
+    pub(crate) worldspace: String,
+    pub(crate) sampler: GroundSampler,
+    pub(crate) cells: Vec<CellDoc>,
+    pub(crate) references: Vec<mir::Reference>,
+    pub(crate) build_options: map_builder::BuildOptions,
+    pub(crate) slicer_config: map_slicer::SlicerConfig,
+    pub(crate) open: OpenHexes,
     /// What an interior slice chose; `None` for an exterior window.
-    interior: Option<InteriorScene>,
+    pub(crate) interior: Option<InteriorScene>,
 }
 
 /// Where an interior slice's numbers came from, for the report.
 #[derive(Debug, Clone)]
-struct InteriorScene {
+pub(crate) struct InteriorScene {
     /// The cell's editor id as the slice names it, and its form key.
-    cell: String,
-    form: String,
-    floor_z: f32,
-    floor_from: &'static str,
-    storeys: Vec<mir::Storey>,
-    centre: [f32; 2],
-    centre_from: &'static str,
+    pub(crate) cell: String,
+    pub(crate) form: String,
+    pub(crate) floor_z: f32,
+    pub(crate) floor_from: &'static str,
+    pub(crate) storeys: Vec<mir::Storey>,
+    pub(crate) centre: [f32; 2],
+    pub(crate) centre_from: &'static str,
     /// The point the entrance is sought near, and what it is.
-    entrance_near: Option<[f32; 2]>,
-    entrance_from: String,
+    pub(crate) entrance_near: Option<[f32; 2]>,
+    pub(crate) entrance_from: String,
 }
 
-fn scene(inputs: &Inputs, mir: &Mir) -> Result<Scene, ConvertError> {
+pub(crate) fn scene(inputs: &Inputs, mir: &Mir) -> Result<Scene, ConvertError> {
     if let Some(id) = &inputs.slice.interior {
         return interior_scene(inputs, mir, id);
     }
@@ -630,7 +653,7 @@ fn scene(inputs: &Inputs, mir: &Mir) -> Result<Scene, ConvertError> {
 
 /// The scene of an interior slice (`SliceSpec::interior`): the one room,
 /// on a flat floor, the window centred on it, every standable hex open.
-fn interior_scene(inputs: &Inputs, mir: &Mir, id: &str) -> Result<Scene, ConvertError> {
+pub(crate) fn interior_scene(inputs: &Inputs, mir: &Mir, id: &str) -> Result<Scene, ConvertError> {
     let slice = &inputs.slice;
     let projection = Projection::new(&inputs.calibration).map_err(stage)?;
     let doc = mir.interior(id).map_err(stage)?.ok_or_else(|| {
@@ -751,16 +774,16 @@ fn interior_scene(inputs: &Inputs, mir: &Mir, id: &str) -> Result<Scene, Convert
 
 /// What the declutter wiring chose for a run, for the report.
 #[derive(Debug, Clone, Default)]
-struct DeclutterChoice {
+pub(crate) struct DeclutterChoice {
     /// The profile name (`off`, `readable`) and where it came from.
-    profile: String,
-    from: &'static str,
+    pub(crate) profile: String,
+    pub(crate) from: &'static str,
     /// References the quests and scripts point at, in the whole plugin
     /// list, and how many of them lie in the window.
-    referenced: usize,
-    referenced_here: usize,
+    pub(crate) referenced: usize,
+    pub(crate) referenced_here: usize,
     /// Keys handed to the builder as interactive.
-    interactive: usize,
+    pub(crate) interactive: usize,
 }
 
 /// Sets the scene's declutter profile (`crate::declutter::profile`) and,
@@ -768,7 +791,7 @@ struct DeclutterChoice {
 /// (quest and script targets) and every reference of the window whose
 /// base kind is protected (by the profile, or by the default list, which
 /// names every item kind) or that teleports. Off, nothing changes.
-fn apply_declutter(
+pub(crate) fn apply_declutter(
     inputs: &Inputs,
     mir: &Mir,
     scene: &mut Scene,
@@ -856,9 +879,67 @@ fn apply_declutter(
     Ok(choice)
 }
 
+/// The Fallout 3 shopping carts' model pattern, which the readable preset
+/// prunes as clutter unless `wire = true` draws them solid.
+pub(crate) const CART_PATTERN: &str = "*shoppingcart";
+
+/// The wire rule of `wire = true`: the slicer's defaults, with shopping
+/// carts named outright (their lattice is found by rendering too).
+pub(crate) fn wire_rule() -> map_slicer::WireRule {
+    map_slicer::WireRule {
+        patterns: vec![CART_PATTERN.to_owned(), "*wirebasket".to_owned()],
+        ..map_slicer::WireRule::default()
+    }
+}
+
+/// The slice keys of the layers pass that the single-map path honours as
+/// well, each only when present (absent, nothing changes): `wire`,
+/// `navmesh_coverage`, `sight`, `entrance_sight`, and `entrance` on an
+/// exterior.
+pub(crate) fn apply_slice_keys(slice: &crate::SliceSpec, scene: &mut Scene) {
+    if slice.wire == Some(true) {
+        scene.slicer_config.wire = Some(wire_rule());
+        // Drawn solid now: no longer pruned as clutter.
+        if let Some(clutter) = scene
+            .slicer_config
+            .declutter
+            .as_mut()
+            .and_then(|d| d.clutter.as_mut())
+        {
+            clutter.patterns.retain(|p| p != CART_PATTERN);
+        }
+    }
+    if slice.navmesh_coverage.is_some() {
+        scene.build_options.navmesh_coverage = slice.coverage();
+    }
+    let (readability, entrance) = slice.sight_rules();
+    if slice.sight.is_some() {
+        scene.build_options.readability_sight = readability;
+    }
+    if slice.entrance_sight.is_some() {
+        scene.build_options.entrance_sight = entrance;
+    }
+    if !slice.is_interior()
+        && let Some(point) = slice.entrance
+    {
+        scene.build_options.entrance_near = Some(point);
+    }
+}
+
+/// The terrain's tone: the profile's floor tone when the slice gives a
+/// `[tone.floor]` (with the declutter pass on); otherwise none, and the
+/// ground keeps its bytes.
+pub(crate) fn terrain_tone(
+    slice: &crate::SliceSpec,
+    config: &map_slicer::SlicerConfig,
+) -> Option<foundry_render::Tone> {
+    slice.tone.as_ref().and_then(|t| t.floor)?;
+    config.declutter.as_ref().map(|d| d.tones.floor)
+}
+
 /// The teleport door of `references` with the lowest form key: the door a
 /// player would usually arrive by (the cell's first).
-fn first_door(references: &[mir::Reference]) -> Option<&mir::Reference> {
+pub(crate) fn first_door(references: &[mir::Reference]) -> Option<&mir::Reference> {
     references
         .iter()
         .filter(|r| r.teleport.is_some() && !r.flags.deleted && r.transform.is_finite())
@@ -1159,7 +1240,34 @@ pub fn people_features(people: &[Person]) -> Vec<Feature> {
 impl MapFeatures {
     /// Reads `<out>/map-features.json`.
     pub fn read(out: &Path) -> Result<Self, ConvertError> {
-        let path = out.join(FEATURES_FILE);
+        Self::read_path(&out.join(FEATURES_FILE))
+    }
+
+    /// The features of map `map` (a file name under `maps/`): a layer's
+    /// `<out>/features/<stem>.json`, else `map-features.json` when it is
+    /// that map's.
+    pub fn read_for(out: &Path, map: &str) -> Result<Self, ConvertError> {
+        let file = map.trim_start_matches("maps/");
+        let stem = file.trim_end_matches(".map");
+        let per_map = out.join(FEATURES_DIR).join(format!("{stem}.json"));
+        if per_map.is_file() {
+            return Self::read_path(&per_map);
+        }
+        let features = Self::read(out)?;
+        if features.map_file.trim_start_matches("maps/") == file {
+            Ok(features)
+        } else {
+            Err(stage(format!(
+                "no features of {file}: {} is {}'s and {} does not exist",
+                FEATURES_FILE,
+                features.map_file,
+                per_map.display()
+            )))
+        }
+    }
+
+    fn read_path(path: &Path) -> Result<Self, ConvertError> {
+        let path = path.to_owned();
         let text = std::fs::read_to_string(&path).map_err(io(&path))?;
         serde_json::from_str(&text)
             .map_err(|e| ConvertError::stage("map", format!("{}: {e}", path.display())))
@@ -1309,6 +1417,10 @@ pub fn rank_features(features: &mut [Feature]) {
 /// Builds the slice's map and writes the mod layer.
 pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
     inputs.check_mode()?;
+    // Several maps, storeys or levels: the layer path (`crate::layer`).
+    if let Some(layer) = inputs.layer_spec() {
+        return crate::layer::map_layer(inputs, &layer);
+    }
     let mir = Mir::open(&inputs.mir_dir()).map_err(stage)?;
     let palette_bytes = inputs.f2_file("color.pal")?;
     let palette = inputs.palette()?;
@@ -1335,6 +1447,14 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
     let budgets = budgets(&base, inputs.standalone)?;
     let mut scene = scene(inputs, &mir)?;
     let declutter_choice = apply_declutter(inputs, &mir, &mut scene)?;
+    // `footprints = true`: the slicer finds the furniture and its placed
+    // footprints, the builder blocks the hexes under them.
+    let footprints_on = inputs.slice.footprints == Some(true);
+    if footprints_on {
+        scene.slicer_config.furniture = Some(map_slicer::FurnitureRule::default());
+    }
+    apply_slice_keys(&inputs.slice, &mut scene);
+    let ground_tone = terrain_tone(&inputs.slice, &scene.slicer_config);
     let Scene {
         projection,
         window,
@@ -1390,6 +1510,9 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
     // builder's own test.)
     build_options.protected_hexes = run_hexes(&sliced.placements);
     let protected = build_options.protected_hexes.len();
+    if footprints_on {
+        build_options.footprints = sliced.footprints.clone();
+    }
 
     let overlays: Vec<map_terrain::Overlay<'_>> = sliced
         .overlays
@@ -1415,6 +1538,7 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
         texture_lod_bias: GROUND_LOD_BIAS,
         // Indoors only the baked floor is drawn; the rest stays black.
         blank_without_land: interior.is_some(),
+        tone: ground_tone,
         ..map_terrain::TerrainOptions::default()
     };
     let ground = if interior.is_some() {
@@ -1482,9 +1606,29 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
         })
         .collect();
     let (critter_art, critters, people_skipped) = critter_inputs(inputs, &cells, &references)?;
+    // Items, loot, armed and sided people (`crate::catalogue`), when on.
+    let catalogue = if inputs.loot_on() {
+        let rebalance = inputs.rebalance()?;
+        let built = crate::catalogue::build(&crate::catalogue::CatalogueInput {
+            inputs,
+            mir: &mir,
+            rebalance: &rebalance,
+            references: &references,
+            art: &sliced.art,
+            placements: &sliced.placements,
+            critters: &critters,
+            base: &base,
+            palette_map: &palette_map,
+            palette_bytes: &palette_bytes,
+        })?;
+        build_options.catalogue = Some(std::sync::Arc::new(built.catalogue));
+        Some(built.report)
+    } else {
+        None
+    };
     let mut builder_cells = cells.clone();
     builder_cells.extend(interiors.into_values());
-    let stem = map_stem(&inputs.slice.name);
+    let stem = inputs.slice.map_stem();
     let layer_name = format!("Mojave Foundry: {}", inputs.slice.name);
     let built = map_builder::build_map(&map_builder::BuildInput {
         map_name: &stem,
@@ -1526,6 +1670,9 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
     let preview_path = gallery_dir.join(format!("map-{stem}.png"));
     let png = foundry_gallery::encode_png(&rgba, width, height).map_err(stage)?;
     std::fs::write(&preview_path, png).map_err(io(&preview_path))?;
+    if let Some(catalogue) = &catalogue {
+        crate::gallery::items_page(inputs, &catalogue.items, &palette)?;
+    }
 
     let report = &built.report;
     let summary = MapSummary {
@@ -1587,6 +1734,18 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
         let _ = writeln!(text, "- {line}");
     }
     let _ = writeln!(text);
+    write_loot_section(&mut text, built.loot.as_ref(), catalogue.as_ref());
+    let _ = writeln!(text, "## Furniture\n");
+    if !footprints_on {
+        let _ = writeln!(
+            text,
+            "- footprints off (slice key `footprints = true` turns them on)"
+        );
+    }
+    for line in built.furniture.summary() {
+        let _ = writeln!(text, "- {line}");
+    }
+    let _ = writeln!(text);
     let _ = writeln!(
         text,
         "## Map\n\n- file: `{}`, number {}\n- entry hex: {}\n- objects: {}, of which blockers: {}\n- maps in the layer: {:?}\n",
@@ -1629,6 +1788,7 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
         report.critter_ai_packet,
         report.critter_team
     );
+    write_critter_art(&mut text, report, &critter_art);
     for critter in &report.critters {
         let _ = writeln!(
             text,
@@ -1689,10 +1849,111 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
     Ok(summary)
 }
 
+/// `## Loot`: the builder's `loot_summary`, the catalogue's own lines and
+/// the people's sides and kit.
+pub(crate) fn write_loot_section(
+    text: &mut String,
+    loot: Option<&map_builder::LootReport>,
+    catalogue: Option<&crate::catalogue::CatalogueReport>,
+) {
+    let _ = writeln!(text, "## Loot\n");
+    let (Some(loot), Some(catalogue)) = (loot, catalogue) else {
+        let _ = writeln!(
+            text,
+            "- off: no item prototypes, containers stay empty, people unarmed (slice key \
+             `loot = true` or `--loot on`)\n"
+        );
+        return;
+    };
+    for line in loot.loot_summary() {
+        let _ = writeln!(text, "- {line}");
+    }
+    for line in catalogue.lines() {
+        let _ = writeln!(text, "- {line}");
+    }
+    let hostile: Vec<&str> = catalogue
+        .people
+        .iter()
+        .filter(|p| p.side.hostile)
+        .map(|p| p.name.as_str())
+        .collect();
+    let friendly: Vec<&str> = catalogue
+        .people
+        .iter()
+        .filter(|p| !p.side.hostile)
+        .map(|p| p.name.as_str())
+        .collect();
+    let _ = writeln!(
+        text,
+        "\nHostile ({}): {}.\n\nFriendly ({}): {}.\n",
+        hostile.len(),
+        if hostile.is_empty() {
+            "none".to_owned()
+        } else {
+            hostile.join(", ")
+        },
+        friendly.len(),
+        if friendly.is_empty() {
+            "none".to_owned()
+        } else {
+            friendly.join(", ")
+        }
+    );
+    let _ = writeln!(text, "{}", catalogue.people_table());
+    let _ = writeln!(text, "| item | kind | found | figures |\n|---|---|---|---|");
+    for item in &catalogue.items {
+        let _ = writeln!(
+            text,
+            "| {} | {} | {} | {} |",
+            item.name, item.kind, item.found, item.summary
+        );
+    }
+    let _ = writeln!(text);
+}
+
+/// The critter art the layer ships: per sprite set its row, files and
+/// bytes (every animation file of the set, weapon letters too), and the
+/// rows of `critters.lst` used against its 4,096.
+pub(crate) fn write_critter_art(
+    text: &mut String,
+    report: &map_builder::BuildReport,
+    art: &[map_builder::CritterArt],
+) {
+    let mut files = 0;
+    let mut bytes = 0u64;
+    let mut highest = None;
+    for set in &report.critter_sets {
+        let frms = art.get(set.art).map(|a| &a.frms);
+        let set_bytes: u64 = frms.map_or(0, |f| f.values().map(|b| b.len() as u64).sum());
+        files += set.files.len();
+        bytes += set_bytes;
+        highest = highest.max(Some(set.row));
+        let _ = writeln!(
+            text,
+            "- art: {} `{}` row {}: {} files, {:.1} MB",
+            set.label,
+            set.stem,
+            set.row,
+            set.files.len(),
+            set_bytes as f64 / 1e6
+        );
+    }
+    if let Some(row) = highest {
+        let _ = writeln!(
+            text,
+            "- critter art: {} sets, {files} files, {:.1} MB; the highest row of \
+             `art/critters/critters.lst` is {row} of the 4,096 the format addresses ({} free)",
+            report.critter_sets.len(),
+            bytes as f64 / 1e6,
+            4095u32.saturating_sub(u32::from(row))
+        );
+    }
+}
+
 /// `## Declutter`: the profile and where it came from, then what the pass
 /// did: pruned by rule, kept and pruned by kind, protected by reason, the
 /// cutaway, and the open floor before and after.
-fn write_declutter_section(
+pub(crate) fn write_declutter_section(
     text: &mut String,
     choice: &DeclutterChoice,
     sliced: &map_slicer::Sliced,
@@ -1761,7 +2022,7 @@ fn write_declutter_section(
 /// `## Interior`: the room, its floor and storeys, the cut, what the slicer
 /// and the builder did indoors, the doors not converted, and every person
 /// placed or left out with the reason.
-fn write_interior_section(
+pub(crate) fn write_interior_section(
     text: &mut String,
     scene: &InteriorScene,
     sliced: &map_slicer::Sliced,
@@ -1903,7 +2164,7 @@ fn write_interior_section(
 
 /// `## Art lists`: the mode, and every list the build loaded with its
 /// free entries before and after.
-fn write_list_section(
+pub(crate) fn write_list_section(
     text: &mut String,
     budgets: &Budgets,
     report: &map_builder::BuildReport,
@@ -1954,7 +2215,7 @@ fn write_list_section(
 }
 
 /// `## Budget ladder`, `## Landmarks` and `## Trigger volumes skipped`.
-fn write_slicer_sections(text: &mut String, sliced: &map_slicer::Sliced) {
+pub(crate) fn write_slicer_sections(text: &mut String, sliced: &map_slicer::Sliced) {
     let report = &sliced.report;
     let _ = writeln!(text, "## Budget ladder\n");
     if report.ladder.is_empty() {
@@ -2033,7 +2294,7 @@ fn write_slicer_sections(text: &mut String, sliced: &map_slicer::Sliced) {
 
 /// `## Ground`: the default-texture and missing-texture tallies, then
 /// every statistic.
-fn write_ground_section(text: &mut String, stats: &map_terrain::GroundStats) {
+pub(crate) fn write_ground_section(text: &mut String, stats: &map_terrain::GroundStats) {
     let _ = writeln!(text, "## Ground\n");
     let _ = writeln!(
         text,
@@ -2070,7 +2331,7 @@ fn write_ground_section(text: &mut String, stats: &map_terrain::GroundStats) {
 
 /// `## Open hexes`: which standable hexes a bounding footprint left open,
 /// and what the slicer and the passages were told.
-fn write_open_section(text: &mut String, open: &OpenHexes, protected: usize) {
+pub(crate) fn write_open_section(text: &mut String, open: &OpenHexes, protected: usize) {
     let _ = writeln!(text, "## Open hexes\n");
     let policy = match open.policy {
         OpenPolicy::Everywhere => "every standable hex (standalone)".to_owned(),
@@ -2087,7 +2348,7 @@ fn write_open_section(text: &mut String, open: &OpenHexes, protected: usize) {
 }
 
 /// `## Entrance`, `## Components`, `## Passages` and `## Islands left`.
-fn write_reach_sections(text: &mut String, report: &map_builder::BuildReport) {
+pub(crate) fn write_reach_sections(text: &mut String, report: &map_builder::BuildReport) {
     let entrance = &report.entrance;
     let _ = writeln!(
         text,
@@ -2177,7 +2438,7 @@ fn write_reach_sections(text: &mut String, report: &map_builder::BuildReport) {
 }
 
 impl MapSummary {
-    fn to_cache(&self) -> String {
+    pub(crate) fn to_cache(&self) -> String {
         format!(
             "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
             self.map_file,
@@ -2195,7 +2456,7 @@ impl MapSummary {
         )
     }
 
-    fn from_cache(text: &str) -> Option<Self> {
+    pub(crate) fn from_cache(text: &str) -> Option<Self> {
         let mut lines = text.lines();
         let map_file = lines.next()?.to_owned();
         let mut number = || lines.next()?.parse::<usize>().ok();

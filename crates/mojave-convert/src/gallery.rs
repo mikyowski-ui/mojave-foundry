@@ -238,6 +238,129 @@ fn critter_sheets(
     Ok(sheets.len())
 }
 
+/// Writes `<out>/gallery/items-NN.png`: one tile per item prototype of
+/// the map's catalogue (`crate::catalogue`), its ground sprite with its
+/// inventory icon beside it, its name, kind, where it was found and its
+/// key figures. Returns the pages written.
+pub fn items_page(
+    inputs: &Inputs,
+    items: &[crate::catalogue::ItemEntry],
+    palette: &vault_formats::Palette,
+) -> Result<usize, ConvertError> {
+    let stage = |e: &dyn std::fmt::Display| ConvertError::stage("gallery", e);
+    let dir = inputs.gallery_dir();
+    std::fs::create_dir_all(&dir).map_err(io(&dir))?;
+    if let Ok(read) = std::fs::read_dir(&dir) {
+        for file in read.flatten() {
+            let name = file.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("items-") && name.ends_with(".png") {
+                let _ = std::fs::remove_file(file.path());
+            }
+        }
+    }
+    struct Cell {
+        label: String,
+        metrics: Vec<(String, String)>,
+        ground: (Vec<u8>, u32, u32),
+        icon: Option<(Vec<u8>, u32, u32)>,
+    }
+    let rgba = |image: &(Vec<u8>, u32, u32)| {
+        foundry_gallery::indexed_to_rgba(&image.0, image.1, image.2, palette)
+            .ok()
+            .map(|rgba| (rgba, image.1, image.2))
+    };
+    let mut cells = Vec::new();
+    for item in items {
+        let Some(ground) = item.ground.as_ref().and_then(rgba) else {
+            continue;
+        };
+        cells.push(Cell {
+            label: item.name.clone(),
+            metrics: vec![
+                ("kind".to_owned(), format!("{} ({})", item.kind, item.found)),
+                ("stats".to_owned(), item.summary.clone()),
+            ],
+            ground,
+            icon: item.icon.as_ref().and_then(rgba),
+        });
+    }
+    if cells.is_empty() {
+        return Ok(0);
+    }
+    let tiles: Vec<Tile<'_>> = cells
+        .iter()
+        .map(|c| Tile {
+            label: &c.label,
+            metrics: &c.metrics,
+            rgba: &c.ground.0,
+            width: c.ground.1,
+            height: c.ground.2,
+            compare: c
+                .icon
+                .as_ref()
+                .map(|(rgba, w, h)| (rgba.as_slice(), *w, *h)),
+        })
+        .collect();
+    let options = SheetOptions {
+        columns: Columns::Auto { sheet_width: 1800 },
+        anchor: Anchor::Bottom,
+        scale: 2,
+        max_height: 2400,
+        title: Some(format!(
+            "{} items: ground sprite, inventory icon beside it",
+            inputs.slice.name
+        )),
+        ..SheetOptions::default()
+    };
+    let sheets = contact_sheets(&tiles, &options).map_err(|e| stage(&e))?;
+    for (page, sheet) in sheets.iter().enumerate() {
+        let path = dir.join(format!("items-{:02}.png", page + 1));
+        let png = sheet.to_png().map_err(|e| stage(&e))?;
+        std::fs::write(&path, png).map_err(io(&path))?;
+    }
+    Ok(sheets.len())
+}
+
+/// A page pairing the map previews (`gallery/map-<stem>.png`) of two `--out`
+/// directories side by side, labelled: the declutter pass before and
+/// after. Writes `dest`.
+pub fn before_after_page(
+    before: &Path,
+    after: &Path,
+    labels: [&str; 2],
+    dest: &Path,
+) -> Result<(), ConvertError> {
+    let pick = |out: &Path| -> Result<std::path::PathBuf, ConvertError> {
+        let dir = out.join("gallery");
+        let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .map_err(io(&dir))?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("map-") && n.ends_with(".png"))
+            })
+            .collect();
+        found.sort();
+        found.into_iter().next().ok_or_else(|| {
+            ConvertError::stage("gallery", format!("{}: no map preview", dir.display()))
+        })
+    };
+    let entries = vec![
+        (labels[0].to_owned(), pick(before)?),
+        (labels[1].to_owned(), pick(after)?),
+    ];
+    crate::shots::contact_page(
+        &entries,
+        Some("declutter: before and after"),
+        2,
+        [960, 960],
+        dest,
+    )
+}
+
 /// What [`character_pages`] draws.
 #[derive(Debug, Clone)]
 pub struct CharacterPages {

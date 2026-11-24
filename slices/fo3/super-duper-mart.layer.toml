@@ -1,0 +1,32 @@
+# The Super-Duper Mart (Fallout 3) as one layer: the car park outside and
+# the store, linked by its front doors both ways, the store's upper level
+# its second elevation (the stairs as exit grids). Coordinates and editor
+# ids only, through the two slice files. Run with --standalone; see
+# docs/running.md ("Layers").
+name = "super-duper-mart"
+start = "sdmart"
+
+# Laid over both slices: items and armed, sided people; the readable
+# declutter pass (door stubs, cutaway); shopping carts drawn solid.
+[all_maps]
+loot = true
+animations = "combat"
+wire = true
+sight = "visible"
+
+[all_maps.declutter]
+profile = "readable"
+
+[[maps]]
+slice = "super-duper-mart-exterior.toml"
+map = "sdmart"
+# In the car park in front of the doors (the window centre is inside the
+# store, whose footprint the car park's navmesh reaches under).
+entrance = [19800.0, -16800.0]
+
+[[maps]]
+slice = "super-duper-mart.toml"
+map = "sdmartin"
+storeys = "auto"
+footprints = true
+navmesh_coverage = "share:0.5"

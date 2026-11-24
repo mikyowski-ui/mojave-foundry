@@ -148,51 +148,75 @@ pub struct StoreySplit {
 }
 
 /// One readable triangle.
-struct Tri {
-    corners: [[f32; 3]; 3],
-    slope: f32,
-    area: f32,
-    centroid: [f32; 3],
+#[derive(Debug, Clone)]
+pub(crate) struct Tri {
+    pub corners: [[f32; 3]; 3],
+    pub slope: f32,
+    /// Seen from above.
+    pub area: f32,
+    pub centroid: [f32; 3],
+    /// Its navmesh's form key and its index there.
+    pub navmesh: String,
+    pub index: u32,
 }
 
-fn read(cells: &[CellDoc]) -> Vec<Tri> {
+impl Tri {
+    /// `None` for a triangle with a corner that is not finite or with no
+    /// area at all.
+    pub(crate) fn new(c: [[f32; 3]; 3], navmesh: &str, index: u32) -> Option<Tri> {
+        if !c.iter().flatten().all(|v| v.is_finite()) {
+            return None;
+        }
+        let u = [c[1][0] - c[0][0], c[1][1] - c[0][1], c[1][2] - c[0][2]];
+        let v = [c[2][0] - c[0][0], c[2][1] - c[0][1], c[2][2] - c[0][2]];
+        let n = [
+            f64::from(u[1] * v[2] - u[2] * v[1]),
+            f64::from(u[2] * v[0] - u[0] * v[2]),
+            f64::from(u[0] * v[1] - u[1] * v[0]),
+        ];
+        let horizontal = n[0].hypot(n[1]);
+        let length = horizontal.hypot(n[2]);
+        if length <= 0.0 {
+            return None;
+        }
+        let slope = if n[2].abs() <= 1e-9 * length {
+            f32::INFINITY
+        } else {
+            (horizontal / n[2].abs()) as f32
+        };
+        Some(Tri {
+            corners: c,
+            slope,
+            area: (0.5 * n[2].abs()) as f32,
+            centroid: std::array::from_fn(|k| (c[0][k] + c[1][k] + c[2][k]) / 3.0),
+            navmesh: navmesh.to_owned(),
+            index,
+        })
+    }
+}
+
+/// Every readable navmesh triangle of the interior (`interior`) or the
+/// exterior cells among `cells`, in cell, navmesh and triangle order.
+pub(crate) fn read_triangles(cells: &[CellDoc], interior: bool) -> Vec<Tri> {
     let mut out = Vec::new();
-    for cell in cells.iter().filter(|c| c.is_interior()) {
+    for cell in cells.iter().filter(|c| c.is_interior() == interior) {
         for navmesh in &cell.navmeshes {
+            let form = navmesh.form.to_string();
             for index in 0..navmesh.triangles.len() {
                 let Some(c) = navmesh.corners(index) else {
                     continue;
                 };
-                if !c.iter().flatten().all(|v| v.is_finite()) {
-                    continue;
+                if let Some(tri) = Tri::new(c, &form, index as u32) {
+                    out.push(tri);
                 }
-                let u = [c[1][0] - c[0][0], c[1][1] - c[0][1], c[1][2] - c[0][2]];
-                let v = [c[2][0] - c[0][0], c[2][1] - c[0][1], c[2][2] - c[0][2]];
-                let n = [
-                    f64::from(u[1] * v[2] - u[2] * v[1]),
-                    f64::from(u[2] * v[0] - u[0] * v[2]),
-                    f64::from(u[0] * v[1] - u[1] * v[0]),
-                ];
-                let horizontal = n[0].hypot(n[1]);
-                let length = horizontal.hypot(n[2]);
-                if length <= 0.0 {
-                    continue;
-                }
-                let slope = if n[2].abs() <= 1e-9 * length {
-                    f32::INFINITY
-                } else {
-                    (horizontal / n[2].abs()) as f32
-                };
-                out.push(Tri {
-                    corners: c,
-                    slope,
-                    area: (0.5 * n[2].abs()) as f32,
-                    centroid: std::array::from_fn(|k| (c[0][k] + c[1][k] + c[2][k]) / 3.0),
-                });
             }
         }
     }
     out
+}
+
+fn read(cells: &[CellDoc]) -> Vec<Tri> {
+    read_triangles(cells, true)
 }
 
 /// A corner's position key, half-unit precision.
@@ -201,7 +225,7 @@ fn key(p: [f32; 3]) -> [i64; 3] {
 }
 
 /// Neighbours across shared edges, sorted.
-fn neighbours(tris: &[Tri]) -> Vec<Vec<usize>> {
+pub(crate) fn neighbours(tris: &[Tri]) -> Vec<Vec<usize>> {
     let mut edges: BTreeMap<([i64; 3], [i64; 3]), Vec<usize>> = BTreeMap::new();
     for (i, t) in tris.iter().enumerate() {
         for k in 0..3 {
@@ -225,7 +249,7 @@ fn neighbours(tris: &[Tri]) -> Vec<Vec<usize>> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Class {
+pub(crate) enum Class {
     Floor,
     Connector,
     Undecided,
@@ -251,7 +275,7 @@ fn median_z(tris: &[Tri], members: &[usize]) -> f32 {
 
 /// Connected components of `members` through `adjacent` restricted to
 /// `keep`, in order of their lowest member.
-fn components(
+pub(crate) fn components(
     members: &[usize],
     adjacent: &[Vec<usize>],
     keep: &dyn Fn(usize) -> bool,
@@ -318,7 +342,7 @@ fn describe(tris: &[Tri], members: &[usize]) -> Floor {
 
 /// The height of triangle `t`'s plane at `(x, y)` (its mean height for a
 /// vertical one).
-fn plane_z(t: &Tri, x: f32, y: f32) -> f32 {
+pub(crate) fn plane_z(t: &Tri, x: f32, y: f32) -> f32 {
     let [a, b, c] = t.corners;
     let det = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1]);
     if det.abs() <= f32::EPSILON {
@@ -336,6 +360,23 @@ pub fn split_storeys(cells: &[CellDoc], options: &SplitOptions) -> StoreySplit {
     let adjacent = neighbours(&tris);
     let linked = adjacent.iter().any(|n| !n.is_empty());
     // 1. Classes with hysteresis.
+    let class = classify(&tris, &adjacent, options.flat_max, options.steep_min);
+    split_classified(tris, adjacent, linked, class, options)
+}
+
+/// The slope classes with hysteresis (module notes, 1): floor or
+/// connector for every triangle.
+pub(crate) fn classify(
+    tris: &[Tri],
+    adjacent: &[Vec<usize>],
+    flat_max: f32,
+    steep_min: f32,
+) -> Vec<Class> {
+    let options = SplitOptions {
+        flat_max,
+        steep_min,
+        ..SplitOptions::default()
+    };
     let mut class: Vec<Class> = tris
         .iter()
         .map(|t| {
@@ -388,6 +429,16 @@ pub fn split_storeys(cells: &[CellDoc], options: &SplitOptions) -> StoreySplit {
             };
         }
     }
+    class
+}
+
+fn split_classified(
+    tris: Vec<Tri>,
+    adjacent: Vec<Vec<usize>>,
+    linked: bool,
+    class: Vec<Class>,
+    options: &SplitOptions,
+) -> StoreySplit {
     let floor_tris: Vec<usize> = (0..tris.len())
         .filter(|i| class[*i] == Class::Floor)
         .collect();

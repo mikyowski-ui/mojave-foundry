@@ -177,6 +177,9 @@ pub struct Hop {
     /// From the hop's start to its end, both included (just the two ends
     /// when the route is not known).
     pub path: Vec<i32>,
+    /// The hop ends on an exit grid: the hex the player arrives on, on the
+    /// grid's map and elevation (a crossing; the next hop is on that map).
+    pub lands: Option<i32>,
 }
 
 /// A re-centre of the stationary camera, made before a hop starts.
@@ -305,7 +308,8 @@ pub fn plan_camera(start: i32, hops: &[Hop], canvas: [u32; 2], margin: f64) -> C
                 union(b, hex_box(*h))
             })
     };
-    // The bounding box of the run of hops from `first` that fits.
+    // The bounding box of the run of hops from `first` that fits; a run
+    // ends with a hop that crosses an exit grid (the next is elsewhere).
     let run = |first: usize, from: i32| {
         let mut bbox = hex_box(from);
         let mut at = from;
@@ -316,6 +320,9 @@ pub fn plan_camera(start: i32, hops: &[Hop], canvas: [u32; 2], margin: f64) -> C
             }
             bbox = next;
             at = hop.hex;
+            if hop.lands.is_some() {
+                break;
+            }
         }
         bbox
     };
@@ -327,9 +334,12 @@ pub fn plan_camera(start: i32, hops: &[Hop], canvas: [u32; 2], margin: f64) -> C
     let mut at = start;
     for (k, hop) in hops.iter().enumerate() {
         let seen = hop_box(at, hop).is_none_or(|b| inside(b, centre, half));
-        if k != planned_from && !seen {
+        // After a crossing the camera always re-centres: the engine loaded
+        // another map (or elevation) and centred its view on the player.
+        let crossed = k > 0 && hops[k - 1].lands.is_some();
+        if crossed || (k != planned_from && !seen) {
             let next = run(k, at).map_or(centre, middle);
-            if next != centre {
+            if next != centre || crossed {
                 centre = next;
                 recentres.push(Recentre {
                     before_hop: k,
@@ -340,7 +350,7 @@ pub fn plan_camera(start: i32, hops: &[Hop], canvas: [u32; 2], margin: f64) -> C
             }
             planned_from = k;
         }
-        at = hop.hex;
+        at = hop.lands.unwrap_or(hop.hex);
     }
     CameraPlan {
         start_hex: start,

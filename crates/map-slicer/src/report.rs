@@ -132,6 +132,22 @@ pub struct LandmarkStats {
     /// `max_canvas_pixels`, a piece beyond the FRM limits, a render error)
     /// and were baked into the ground as relief instead. Sorted.
     pub fallbacks: Vec<LandmarkFallback>,
+    /// Landmarks placed without the pixels that lie beyond the engine's
+    /// reach (`SlicerConfig::landmark_crop_unreachable`), which would
+    /// otherwise have fallen back to relief. Sorted.
+    pub unreachable: Vec<LandmarkCrop>,
+}
+
+/// A landmark placed upright without its unreachable pixels.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LandmarkCrop {
+    pub reference: String,
+    pub model: String,
+    /// Opaque pixels dropped: no hex lies near enough to anchor them.
+    pub pixels: u64,
+    /// Opaque pixels kept; 0 when the whole landmark lies beyond reach (it
+    /// is then skipped as outside the map).
+    pub kept: u64,
 }
 
 impl LandmarkStats {
@@ -221,6 +237,22 @@ pub struct CutawayStats {
     /// Walkers some strip hid, before and after the cut.
     pub walkers_covered_before: usize,
     pub walkers_covered_after: usize,
+    /// Doors and door-like statics the door rule looked at
+    /// ([`crate::DoorStub`]).
+    pub doors_considered: usize,
+    /// Of those, cropped to the door stub...
+    pub doors_trimmed: usize,
+    /// ...left whole as they stand in no cut wall...
+    pub doors_outside_cut: usize,
+    /// ...and left whole as they hide nobody.
+    pub doors_clear: usize,
+    /// Teleport doors whose stub grew to stay clickable.
+    pub doors_grown: usize,
+    /// Opaque pixels the cropped doors lost.
+    pub door_pixels_removed: u64,
+    /// Walkers some door hid, before and after.
+    pub door_walkers_before: usize,
+    pub door_walkers_after: usize,
 }
 
 /// How a run's floor reads ([`crate::floor_stats`]).
@@ -304,7 +336,23 @@ pub struct DeclutterStats {
     pub shells_kept_for_art: usize,
     /// Sprite placements drawn with the outline.
     pub outlined: usize,
+    /// Of those, by base kind (`?` without one). Outlines go by kind, not
+    /// by protection: an item no rule pruned is outlined whether or not it
+    /// was protected.
+    pub outlined_kinds: BTreeMap<String, usize>,
     pub cutaway: CutawayStats,
+    /// Sliced references the cutaway takes as walls.
+    pub cutaway_walls: usize,
+    /// Wall-shaped references it does not, by reason (`kind`, `opted out`,
+    /// `pattern`, `under the ceiling cut`, `low for the room`).
+    pub cutaway_excluded: BTreeMap<String, usize>,
+    /// The room's wall height the cutaway measured (the median wall-shaped
+    /// piece, clipped at the interior's cut), when there is one.
+    pub room_wall_height: Option<f32>,
+    /// Outdoors: references rendered without their roof over walkable
+    /// ground ([`crate::RoofCut`]), and the triangles left out.
+    pub roof_cut_references: usize,
+    pub roof_cut_triangles: usize,
     /// The floor of the same window without the pass
     /// (`measure_baseline`).
     pub floor_before: Option<FloorStats>,
@@ -398,6 +446,14 @@ pub struct BudgetReport {
     pub interior: Option<InteriorStats>,
     /// The declutter pass's tallies; `None` when it is off.
     pub declutter: Option<DeclutterStats>,
+    /// The furniture rule's choices; `None` when it is off.
+    pub furniture: Option<crate::FurnitureStats>,
+    /// Wire props rendered solid (or dropped), and references drawn with
+    /// both faces ([`crate::WireRule`]); zero when the rule is off.
+    pub wire_props: usize,
+    pub two_sided: usize,
+    /// The wire props by model.
+    pub wire_models: BTreeMap<String, usize>,
 }
 
 impl BudgetReport {
@@ -427,6 +483,10 @@ impl BudgetReport {
             ladder: Vec::new(),
             interior: None,
             declutter: None,
+            furniture: None,
+            wire_props: 0,
+            two_sided: 0,
+            wire_models: BTreeMap::new(),
         }
     }
 
@@ -651,6 +711,9 @@ impl fmt::Display for BudgetReport {
                  sprites outlined",
                 d.decals_faded, d.shell_cut_references, d.shells_kept_for_art, d.outlined
             );
+            if !d.outlined_kinds.is_empty() {
+                let _ = writeln!(out, "  outlined by kind: {}", list(&d.outlined_kinds));
+            }
             let c = &d.cutaway;
             let _ = writeln!(
                 out,
@@ -663,6 +726,44 @@ impl fmt::Display for BudgetReport {
                 c.walkers_covered_before,
                 c.walkers_covered_after
             );
+            if d.cutaway_walls > 0 || !d.cutaway_excluded.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "  cutaway walls: {} ({} not walls: {}){}",
+                    d.cutaway_walls,
+                    d.cutaway_excluded.values().sum::<usize>(),
+                    if d.cutaway_excluded.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        list(&d.cutaway_excluded)
+                    },
+                    d.room_wall_height
+                        .map(|h| format!("; room walls {h:.0} high"))
+                        .unwrap_or_default()
+                );
+            }
+            if c.doors_considered > 0 {
+                let _ = writeln!(
+                    out,
+                    "  doors: {} of {} cut to the stub ({} grown to stay clickable), {} in no cut \
+                     wall, {} hiding nobody; {} pixels removed; walkers hidden by doors {} -> {}",
+                    c.doors_trimmed,
+                    c.doors_considered,
+                    c.doors_grown,
+                    c.doors_outside_cut,
+                    c.doors_clear,
+                    c.door_pixels_removed,
+                    c.door_walkers_before,
+                    c.door_walkers_after
+                );
+            }
+            if d.roof_cut_references > 0 {
+                let _ = writeln!(
+                    out,
+                    "  roofs over walkable ground: {} triangles left out of {} references",
+                    d.roof_cut_triangles, d.roof_cut_references
+                );
+            }
             if let Some(before) = &d.floor_before {
                 let _ = writeln!(out, "  floor before: {before}");
             }
@@ -670,8 +771,38 @@ impl fmt::Display for BudgetReport {
                 let _ = writeln!(out, "  floor after: {after}");
             }
         }
+        if let Some(fu) = &self.furniture {
+            let reasons: Vec<String> = fu
+                .by_reason()
+                .iter()
+                .map(|(k, n)| format!("{n} {k}"))
+                .collect();
+            let _ = writeln!(
+                out,
+                "Furniture: {} footprints given; {} body hexes, {} of them open hexes blocked; \
+                 decided: {}",
+                fu.footprints,
+                fu.body_hexes,
+                fu.open_blocked,
+                if reasons.is_empty() {
+                    "none".to_owned()
+                } else {
+                    reasons.join(", ")
+                }
+            );
+        }
+        if self.wire_props > 0 || self.two_sided > 0 {
+            let _ = writeln!(
+                out,
+                "Wire props: {} drawn solid or dropped; {} references drawn with both faces",
+                self.wire_props, self.two_sided
+            );
+            for (model, n) in &self.wire_models {
+                let _ = writeln!(out, "  {n:>4}  {model}");
+            }
+        }
         let l = &self.landmarks;
-        if l.references > 0 || !l.fallbacks.is_empty() {
+        if l.references > 0 || !l.fallbacks.is_empty() || !l.unreachable.is_empty() {
             let _ = writeln!(
                 out,
                 "Landmarks: {} placed in {} pieces (scenery list), {} baked as relief instead",
@@ -691,6 +822,13 @@ impl fmt::Display for BudgetReport {
                     l.walkers,
                     l.hidden_walkers,
                     l.sealed_hexes
+                );
+            }
+            for crop in &l.unreachable {
+                let _ = writeln!(
+                    out,
+                    "  {} unreachable pixels dropped, {} kept upright: {} {}",
+                    crop.pixels, crop.kept, crop.reference, crop.model
                 );
             }
             for fb in &l.fallbacks {

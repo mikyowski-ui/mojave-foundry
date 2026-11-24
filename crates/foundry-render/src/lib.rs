@@ -24,7 +24,8 @@
 //! instances. Back faces are culled unless the material is two-sided; a
 //! visible back face is lit with its normal turned towards the viewer.
 //! `Mask` materials test alpha against their cutoff, `Blend` materials test
-//! at 0.5, `Opaque` ignores alpha. A missing texture renders flat mid-grey
+//! at 0.5, `Opaque` ignores alpha; an instance may override the cutoff and
+//! draw every face ([`Instance::alpha_cutoff`], [`Instance::two_sided`]). A missing texture renders flat mid-grey
 //! and is listed in [`RenderOutput::missing_textures`].
 
 mod calibration;
@@ -68,6 +69,17 @@ pub struct Instance<'a> {
     pub textures: &'a dyn TextureSource,
     /// Lit or pre-shaded.
     pub shading: Shading,
+    /// Draw both faces of every triangle, as if every material were
+    /// two-sided: a sign whose letters are open at the back reads solid
+    /// from behind. `false` (the default) keeps each material's own choice.
+    pub two_sided: bool,
+    /// The alpha test cutoff of every `Mask` and `Blend` material, instead
+    /// of the material's own. A low cutoff keeps a thin alpha-tested wire
+    /// or lattice texture once it is minified (its mip levels average the
+    /// wires into partial alpha): the lattice renders as a solid surface of
+    /// its colour instead of vanishing. `None` (the default) keeps the
+    /// material's.
+    pub alpha_cutoff: Option<f32>,
 }
 
 impl<'a> Instance<'a> {
@@ -89,12 +101,27 @@ impl<'a> Instance<'a> {
             transform,
             textures,
             shading: Shading::Lit,
+            two_sided: false,
+            alpha_cutoff: None,
         }
     }
 
     /// The same instance with another shading.
     pub fn with_shading(mut self, shading: Shading) -> Self {
         self.shading = shading;
+        self
+    }
+
+    /// The same instance with every face drawn ([`Instance::two_sided`]).
+    pub fn with_two_sided(mut self, two_sided: bool) -> Self {
+        self.two_sided = two_sided;
+        self
+    }
+
+    /// The same instance with an alpha cutoff of its own
+    /// ([`Instance::alpha_cutoff`]).
+    pub fn with_alpha_cutoff(mut self, cutoff: Option<f32>) -> Self {
+        self.alpha_cutoff = cutoff;
         self
     }
 }

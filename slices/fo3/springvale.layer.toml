@@ -1,0 +1,26 @@
+# Springvale (Fallout 3) and the bandit house its two doors lead into, as
+# one layer: the simple control of door links (one exterior, one interior
+# of one storey). Coordinates and editor ids only. Run with --standalone;
+# see docs/running.md ("Layers").
+name = "springvale"
+start = "springva"
+
+[all_maps]
+loot = true
+animations = "combat"
+wire = true
+sight = "visible"
+
+[all_maps.declutter]
+profile = "readable"
+
+[[maps]]
+slice = "springvale.toml"
+map = "springva"
+
+# No slice file: the exterior's keys, as an interior.
+[[maps]]
+interior = "zSpringvaleBanditHouse"
+map = "bandits"
+footprints = true
+navmesh_coverage = "share:0.5"

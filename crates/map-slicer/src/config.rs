@@ -225,6 +225,81 @@ pub struct SlicerConfig {
     /// Off (`None`, the default), nothing changes;
     /// [`crate::DeclutterProfile::readable`] is the preset.
     pub declutter: Option<crate::DeclutterProfile>,
+    /// Furniture footprints and blocking ([`crate::FurnitureRule`], the
+    /// `furniture` module): a footprint polygon per free-standing piece of
+    /// furniture in [`crate::Sliced::footprints`] for the map builder, and
+    /// open hexes that no longer free the hexes under a table or a counter.
+    /// Off (`None`, the default), nothing changes.
+    pub furniture: Option<crate::FurnitureRule>,
+    /// Wire and lattice props and open-backed signs ([`WireRule`]). Off
+    /// (`None`, the default), nothing changes.
+    pub wire: Option<WireRule>,
+    /// A landmark piece that lies beyond the engine's reach (no hex near
+    /// enough to anchor it, as for the top of a wall far above the map's
+    /// north edge) loses its unreachable pixels instead of turning the
+    /// whole landmark into ground relief. Only a landmark that would
+    /// otherwise fall back is cut again this way, so every other landmark
+    /// is placed exactly as before; the pixels dropped are counted in
+    /// [`crate::LandmarkStats::unreachable`]. On by default.
+    pub landmark_crop_unreachable: bool,
+    /// References (form keys) always flattened onto the ground, whatever
+    /// their model and height: the decks and walkways of an upper exterior
+    /// level, whose walking surface is that level's ground (the converter's
+    /// level runs). Items, doors and containers stay sprites. Empty (the
+    /// default), nothing changes.
+    pub flat_references: BTreeSet<String>,
+}
+
+/// Thin wire and lattice props (shopping carts, wire baskets, grates). A
+/// cart is one alpha-tested primitive whose texture is about half
+/// transparent; at the mip level a sprite a few dozen pixels across
+/// samples, the averaged alpha sits at the material's cutoff (0.502), so
+/// the basket fails the test and only the solid tubes of the frame are
+/// left: brown scribbles on the floor. A wire prop is found by rendering
+/// it twice (its materials' cutoffs against `cutoff`) and drawn at
+/// `cutoff`, whole (indoors none of it is baked into the floor), or
+/// dropped.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WireRule {
+    /// A scenery sprite whose surface is at least this share (by triangle
+    /// area) alpha-tested ([`crate::masked_share`])...
+    pub min_masked_share: f64,
+    /// ...and whose render with its materials' cutoffs keeps at most this
+    /// share of the opaque pixels a render at `cutoff` has (its lattice
+    /// vanishes under the alpha test; a poster's torn edge or a leaf card
+    /// keeps nearly all of them) is a wire prop...
+    pub max_kept: f64,
+    /// ...as is a sprite whose model matches these patterns.
+    pub patterns: Vec<String>,
+    /// A wire prop is rendered with this alpha cutoff instead of its
+    /// material's, so its lattice reads as a solid surface of its colour,
+    /// drawn whole (indoors, none of it is baked into the floor).
+    pub cutoff: f32,
+    /// Instead, drop wire props ([`crate::SkipReason::Wire`]).
+    pub drop: bool,
+    /// Model patterns that are never wire props: soft-edged decals, whose
+    /// alpha fades rather than cuts.
+    pub exclude_patterns: Vec<String>,
+    /// Outdoors, models drawn with both faces of every triangle (a sign a
+    /// fixed camera sees from behind). Indoors a sign's back faces a wall,
+    /// so they keep their materials' culling. Empty by default: the
+    /// store-roof letters this was meant for are part of the building's
+    /// own mesh, not a sign reference.
+    pub two_sided_patterns: Vec<String>,
+}
+
+impl Default for WireRule {
+    fn default() -> Self {
+        WireRule {
+            min_masked_share: 0.5,
+            max_kept: 0.6,
+            patterns: Vec::new(),
+            cutoff: 0.1,
+            drop: false,
+            exclude_patterns: strings(&["*blood", "*decal", "*stain", "*splatter", "*graf"]),
+            two_sided_patterns: Vec::new(),
+        }
+    }
 }
 
 fn strings(items: &[&str]) -> Vec<String> {
@@ -318,6 +393,10 @@ impl Default for SlicerConfig {
             floor_reach: 2,
             interior: None,
             declutter: None,
+            furniture: None,
+            wire: None,
+            landmark_crop_unreachable: true,
+            flat_references: BTreeSet::new(),
         }
     }
 }
@@ -382,6 +461,17 @@ impl SlicerConfig {
             interior
                 .validate()
                 .map_err(|e| crate::SliceError::Config(e.to_owned()))?;
+        }
+        if let Some(f) = &self.furniture {
+            f.validate().map_err(crate::SliceError::Config)?;
+        }
+        if let Some(w) = &self.wire
+            && !(w.min_masked_share.is_finite()
+                && w.cutoff.is_finite()
+                && w.max_kept.is_finite()
+                && (0.0..=1.0).contains(&w.cutoff))
+        {
+            return bad("wire min_masked_share must be finite and cutoff in 0..=1");
         }
         if let Some(profile) = &self.declutter {
             profile.validate().map_err(crate::SliceError::Config)?;

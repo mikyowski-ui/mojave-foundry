@@ -1,0 +1,503 @@
+# Rebalance table for Fallout 3: how source weapons, armour, ammunition, aid items
+# and people become Fallout 2 prototypes, and the converter's own tables
+# ([convert]: weapon classes, which side a person is on, loot draws).
+#
+# This file is a full copy of the built-in defaults (emit::rebalance and
+# mojave_convert::rebalance). mojave-convert reads it when it sits in a
+# rebalance/ directory beside the slice file or above it, or when it is
+# named with --rebalance <file>. Every key here overlays the default:
+# delete a key to keep its default, change one to tune it; an unknown key
+# is an error. Only the effective values are hashed into the map stage's
+# cache key (loot on), so an unchanged copy rebuilds nothing.
+#
+# Tuning: [damage] scale and spread set weapon damage; [ap] the action
+# point costs; [armor] how DR and DT become Fallout 2 resistances; [critter]
+# hit points, skills and experience of fighters; [classes.<class>] the
+# weapon code (art letter), attack modes and ranges of each class;
+# [convert.weapons] which class a weapon record takes; [convert.hostility]
+# the hostile team and AI packet; [convert.loot] the leveled-list level.
+
+game = "fallout3"
+default_class = "pistol"
+unknown_caliber = 199
+weight_scale = 1.0
+cost_scale = 1.0
+
+[damage]
+scale = 1.0
+spread = [0.6, 1.4]
+min = 1
+
+[ap]
+source_divisor = 4.0
+min = 1
+max = 9
+
+[ap.base]
+punch = 3
+kick = 3
+swing = 3
+thrust = 3
+throw = 4
+single = 5
+burst = 6
+continuous = 6
+
+[ap.extra]
+punch = 0
+kick = 0
+swing = 0
+thrust = 0
+throw = 0
+single = 0
+burst = 1
+continuous = 1
+
+[range]
+units_per_hex = 64.0
+max = 50
+
+[burst]
+seconds = 1.0
+min = 3
+max = 40
+
+[armor]
+dr_scale = 2.0
+dr_per_dt = 0.0
+dt_scale = 0.0
+dt_per_dr = 0.15
+ac_base = 0.0
+ac_per_dr = 1.0
+ac_per_dt = 0.0
+emp_dr = 100
+size = 10
+
+[armor.dr_factors]
+normal = 1.0
+laser = 0.8
+fire = 0.8
+plasma = 0.6
+electrical = 0.6
+emp = 0.0
+explosion = 0.8
+
+[armor.dt_factors]
+normal = 1.0
+laser = 0.8
+fire = 0.8
+plasma = 0.6
+electrical = 0.6
+emp = 0.0
+explosion = 0.8
+
+[ammo]
+default_pack = 20
+
+[aid]
+health_scale = 0.5
+radiation_scale = 0.5
+minutes_per_second = 0.5
+withdrawal_perk = 53
+withdrawal_onset = 1440
+
+[critter]
+hp_scale = 0.5
+hp_per_level = 1.0
+ap_divisor = 10.0
+ap_max = 10
+skill_scale = 1.0
+xp_base = 25
+xp_per_level = 10
+age = 25
+
+[classes.pistol]
+code = "pistol"
+modes = ["single", "none"]
+big_gun = false
+two_handed = false
+energy = false
+ranges = [20, 0]
+min_strength = 3
+size = 2
+burst = 0
+critical_failure = 0
+
+[classes.smg]
+code = "smg"
+modes = ["single", "burst"]
+big_gun = false
+two_handed = true
+energy = false
+ranges = [20, 15]
+min_strength = 4
+size = 3
+burst = 10
+critical_failure = 0
+
+[classes.rifle]
+code = "shotgun"
+modes = ["single", "none"]
+big_gun = false
+two_handed = true
+energy = false
+ranges = [40, 0]
+min_strength = 5
+size = 5
+burst = 0
+critical_failure = 0
+
+[classes.assault_rifle]
+code = "smg"
+modes = ["single", "burst"]
+big_gun = false
+two_handed = true
+energy = false
+ranges = [35, 25]
+min_strength = 5
+size = 5
+burst = 8
+critical_failure = 0
+
+[classes.shotgun]
+code = "shotgun"
+modes = ["single", "none"]
+big_gun = false
+two_handed = true
+energy = false
+ranges = [12, 0]
+min_strength = 4
+size = 4
+burst = 0
+critical_failure = 2
+
+[classes.minigun]
+code = "minigun"
+modes = ["burst", "none"]
+big_gun = true
+two_handed = true
+energy = false
+ranges = [30, 0]
+min_strength = 7
+size = 8
+burst = 30
+critical_failure = 2
+
+[classes.flamer]
+code = "minigun"
+modes = ["burst", "none"]
+big_gun = true
+two_handed = true
+energy = false
+ranges = [5, 0]
+min_strength = 6
+size = 7
+burst = 5
+critical_failure = 4
+
+[classes.launcher]
+code = "launcher"
+modes = ["single", "none"]
+big_gun = true
+two_handed = true
+energy = false
+ranges = [40, 0]
+min_strength = 6
+size = 8
+burst = 0
+critical_failure = 4
+
+[classes.energy_pistol]
+code = "pistol"
+modes = ["single", "none"]
+big_gun = false
+two_handed = false
+energy = true
+ranges = [30, 0]
+min_strength = 3
+size = 2
+burst = 0
+critical_failure = 0
+
+[classes.energy_rifle]
+code = "laser_rifle"
+modes = ["single", "none"]
+big_gun = false
+two_handed = true
+energy = true
+ranges = [45, 0]
+min_strength = 6
+size = 6
+burst = 0
+critical_failure = 0
+
+[classes.energy_heavy]
+code = "minigun"
+modes = ["burst", "none"]
+big_gun = true
+two_handed = true
+energy = true
+ranges = [30, 0]
+min_strength = 7
+size = 8
+burst = 20
+critical_failure = 0
+
+[classes.blade]
+code = "knife"
+modes = ["swing", "thrust"]
+big_gun = false
+two_handed = false
+energy = false
+ranges = [1, 1]
+min_strength = 2
+size = 1
+burst = 0
+critical_failure = 0
+
+[classes.blunt]
+code = "club"
+modes = ["swing", "thrust"]
+big_gun = false
+two_handed = false
+energy = false
+ranges = [1, 1]
+min_strength = 3
+size = 3
+burst = 0
+critical_failure = 0
+
+[classes.heavy_melee]
+code = "hammer"
+modes = ["swing", "none"]
+big_gun = false
+two_handed = true
+energy = false
+ranges = [1, 0]
+min_strength = 6
+size = 5
+burst = 0
+critical_failure = 0
+
+[classes.spear]
+code = "spear"
+modes = ["thrust", "throw"]
+big_gun = false
+two_handed = true
+energy = false
+ranges = [2, 15]
+min_strength = 4
+size = 4
+burst = 0
+critical_failure = 0
+
+[classes.unarmed]
+code = "unarmed"
+modes = ["punch", "none"]
+big_gun = false
+two_handed = false
+energy = false
+ranges = [1, 0]
+min_strength = 1
+size = 1
+burst = 0
+critical_failure = 0
+
+[classes.thrown]
+code = "unarmed"
+modes = ["throw", "none"]
+big_gun = false
+two_handed = false
+energy = false
+ranges = [15, 0]
+min_strength = 2
+size = 1
+burst = 0
+critical_failure = 0
+
+[classes.grenade]
+code = "unarmed"
+modes = ["throw", "none"]
+big_gun = false
+two_handed = false
+energy = false
+ranges = [15, 0]
+min_strength = 3
+size = 1
+burst = 0
+critical_failure = 0
+
+[calibers]
+10mm = 101
+127 = 121
+127mm = 121
+12ga = 106
+12gauge = 106
+20ga = 119
+20gauge = 119
+22 = 127
+22lr = 127
+25mm = 124
+25mmgrenade = 124
+2mm = 125
+2mmec = 125
+308 = 104
+308caliber = 104
+32 = 103
+32cal = 103
+32caliber = 103
+357 = 118
+357magnum = 118
+40mm = 123
+40mmgrenade = 123
+44 = 107
+44mag = 107
+44magnum = 107
+45 = 120
+4570 = 126
+4570gov = 126
+4570govt = 126
+45acp = 120
+45auto = 120
+50 = 122
+50bmg = 122
+50mg = 122
+556 = 102
+556mm = 102
+556x45 = 102
+5mm = 105
+9mm = 117
+alienpowercell = 116
+alienpowermodule = 116
+bb = 114
+bbs = 114
+ecp = 110
+electronchargepack = 110
+energycell = 108
+flamerfuel = 111
+fuel = 111
+mfc = 109
+mfcell = 109
+microfusioncell = 109
+mininuke = 113
+mininukes = 113
+missile = 112
+missiles = 112
+railwayspike = 115
+railwayspikes = 115
+rocket = 112
+rockets = 112
+sec = 108
+shell = 106
+shells = 106
+shotgunshell = 106
+shotgunshells = 106
+smallenergycell = 108
+
+[skills]
+barter = ["barter"]
+big_guns = ["big_guns"]
+energy_weapons = ["energy_weapons"]
+explosives = ["traps", "throwing"]
+lockpick = ["lockpick"]
+medicine = ["first_aid", "doctor"]
+melee_weapons = ["melee_weapons"]
+repair = ["repair"]
+science = ["science"]
+small_guns = ["small_guns"]
+sneak = ["sneak", "steal"]
+speech = ["speech"]
+survival = ["outdoorsman"]
+unarmed = ["unarmed"]
+
+# The converter's own tables: weapon classes, sides, loot draws.
+[convert.hostility]
+enemy_aggression = 1
+friendly_packet = ""
+friendly_patterns = []
+friendly_team = 0
+hostile_aggression = 2
+hostile_packet = "Merc Raider"
+hostile_packet_number = 136
+hostile_patterns = ["*raider*", "*talon*", "*supermutant*", "*slaver*", "*feral*"]
+hostile_team = 66
+player_faction = "PlayerFaction"
+
+[convert.loot]
+level = 1
+max_carried = 12
+max_contents = 24
+
+[convert.weapons]
+energy_skill = 34
+
+[convert.weapons.by_animation]
+0 = "unarmed"
+1 = "blunt"
+10 = "grenade"
+11 = "grenade"
+12 = "grenade"
+13 = "thrown"
+2 = "heavy_melee"
+3 = "pistol"
+4 = "energy_pistol"
+5 = "rifle"
+6 = "assault_rifle"
+7 = "energy_rifle"
+8 = "minigun"
+9 = "launcher"
+
+[[convert.weapons.rules]]
+animations = [1, 2]
+class = "blade"
+patterns = ["*knife*", "*blade*", "*sword*", "*machete*", "*ripper*", "*cleaver*", "*shishkebab*", "*razor*", "*katana*", "*axe*", "*scalpel*"]
+skills = []
+
+[[convert.weapons.rules]]
+animations = [1, 2]
+class = "spear"
+patterns = ["*spear*"]
+skills = []
+
+[[convert.weapons.rules]]
+animations = [5, 6]
+class = "shotgun"
+patterns = ["*shotgun*", "*combatshotgun*"]
+skills = []
+
+[[convert.weapons.rules]]
+animations = [5, 6]
+class = "smg"
+patterns = ["*smg*", "*submachine*"]
+skills = []
+
+[[convert.weapons.rules]]
+animations = [8]
+class = "flamer"
+damage = "fire"
+patterns = ["*flamer*", "*flame*", "*incinerator*"]
+skills = []
+
+[[convert.weapons.rules]]
+animations = []
+damage = "plasma"
+patterns = ["*plasma*"]
+skills = []
+
+[[convert.weapons.rules]]
+animations = []
+damage = "electric"
+patterns = ["*tesla*", "*arcwelder*"]
+skills = []
+
+[[convert.weapons.rules]]
+animations = []
+damage = "pulse"
+patterns = ["*pulse*"]
+skills = []
+
+[[convert.weapons.rules]]
+animations = [9, 10, 11, 12]
+damage = "explosive"
+patterns = []
+skills = []

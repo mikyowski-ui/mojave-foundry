@@ -10,7 +10,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 
-use crate::cover::{Cover, Sight};
+use crate::cover::{Cover, Sight, SightRule};
 use crate::walk::{HEXES, Verdict, neighbours};
 use crate::{InteractiveReport, Placement, ReadabilityReport, Role};
 
@@ -65,6 +65,7 @@ pub(crate) fn measure(
     blocking: &[bool],
     cover: &Cover,
     figure: [u32; 2],
+    rule: SightRule,
 ) -> ReadabilityReport {
     let mut report = ReadabilityReport {
         floor_hexes: verdicts
@@ -79,7 +80,7 @@ pub(crate) fn measure(
             continue;
         }
         report.walkable_hexes += 1;
-        match cover.sight(hex, figure) {
+        match cover.sight_by(hex, figure, rule) {
             Sight::Clear => report.clear += 1,
             Sight::Behind => report.behind += 1,
             Sight::Covered => report.covered += 1,

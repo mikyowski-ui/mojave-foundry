@@ -270,6 +270,35 @@ impl Shared<'_> {
     }
 }
 
+/// Everything but the mesh and its textures that a sprite's cache key
+/// hashes: the stage version, calibration, palette, render path, outline
+/// and (from Fallout 3 on) the game. The map stage's item sprites
+/// (`crate::catalogue`) key their files in `<out>/sprites/` the same way.
+pub(crate) fn key_prefix(
+    inputs: &Inputs,
+    backend: Backend,
+    palette_bytes: &[u8],
+) -> Result<Vec<u8>, ConvertError> {
+    let mut prefix = Sha256::new();
+    prefix.update(STAGE_VERSION.as_bytes());
+    prefix.update(
+        inputs
+            .calibration
+            .to_toml()
+            .map_err(|e| ConvertError::stage("sprites", e))?
+            .as_bytes(),
+    );
+    prefix.update(Sha256::digest(palette_bytes));
+    prefix.update(backend_name(backend).as_bytes());
+    prefix.update([u8::from(inputs.outline)]);
+    // The game is in the key from Fallout 3 on; a New Vegas run hashes
+    // nothing new, so its existing sprites stay valid.
+    if inputs.game != mir::GameVariant::FalloutNewVegas {
+        prefix.update(inputs.game.id().as_bytes());
+    }
+    Ok(prefix.finalize().to_vec())
+}
+
 /// Renders every prop mesh of the slice to `<out>/sprites/`.
 pub fn sprites(inputs: &Inputs) -> Result<SpritesSummary, ConvertError> {
     let stage = |e: &dyn std::fmt::Display| ConvertError::stage("sprites", e);
@@ -288,28 +317,11 @@ pub fn sprites(inputs: &Inputs) -> Result<SpritesSummary, ConvertError> {
             .backend(),
         other => other,
     };
-    let mut prefix = Sha256::new();
-    prefix.update(STAGE_VERSION.as_bytes());
-    prefix.update(
-        inputs
-            .calibration
-            .to_toml()
-            .map_err(|e| stage(&e))?
-            .as_bytes(),
-    );
-    prefix.update(Sha256::digest(&palette_bytes));
-    prefix.update(backend_name(backend).as_bytes());
-    prefix.update([u8::from(inputs.outline)]);
-    // The game is in the key from Fallout 3 on; a New Vegas run hashes
-    // nothing new, so its existing sprites stay valid.
-    if inputs.game != mir::GameVariant::FalloutNewVegas {
-        prefix.update(inputs.game.id().as_bytes());
-    }
     let shared = Shared {
         mir: &mir,
         inputs,
         map: &map,
-        key_prefix: prefix.finalize().to_vec(),
+        key_prefix: key_prefix(inputs, backend, &palette_bytes)?,
         dir: dir.clone(),
     };
 

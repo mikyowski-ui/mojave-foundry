@@ -209,6 +209,14 @@ fn render_window(
     }
 }
 
+/// How a mesh is drawn beyond its own materials (the wire rule,
+/// [`crate::WireRule`]): every face, and an alpha cutoff of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub(crate) struct Look {
+    pub two_sided: bool,
+    pub alpha_cutoff: Option<f32>,
+}
+
 /// Renders one mesh with `transform` in a scene anchored at the origin,
 /// so the mesh origin projects to screen `(0, 0)`, into one canvas.
 pub(crate) fn render_canonical(
@@ -219,6 +227,30 @@ pub(crate) fn render_canonical(
     textures: &dyn TextureSource,
     side: u32,
     max_pixels: u64,
+) -> Result<Option<Canvas>, CanvasError> {
+    render_canonical_with(
+        renderer,
+        projection,
+        mesh,
+        transform,
+        textures,
+        side,
+        max_pixels,
+        Look::default(),
+    )
+}
+
+/// [`render_canonical`] drawn with `look`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_canonical_with(
+    renderer: &mut dyn Renderer,
+    projection: &Projection,
+    mesh: &StaticMesh,
+    transform: [[f32; 4]; 3],
+    textures: &dyn TextureSource,
+    side: u32,
+    max_pixels: u64,
+    look: Look,
 ) -> Result<Option<Canvas>, CanvasError> {
     let anchor = [0.0; 3];
     let Some(bounds) = screen_bounds(projection, anchor, mesh, &transform) else {
@@ -241,7 +273,11 @@ pub(crate) fn render_canonical(
     };
     let scene = Scene {
         anchor,
-        instances: vec![Instance::new(mesh, transform, textures)],
+        instances: vec![
+            Instance::new(mesh, transform, textures)
+                .with_two_sided(look.two_sided)
+                .with_alpha_cutoff(look.alpha_cutoff),
+        ],
     };
     render_pieces(renderer, &scene, rect, side, &mut |out| {
         let ox = (i64::from(out.origin[0]) - rect[0]) as usize;

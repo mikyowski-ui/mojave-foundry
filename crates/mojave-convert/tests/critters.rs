@@ -15,7 +15,10 @@ use vault_formats::frm::FrmArchive;
 #[test]
 fn an_actor_becomes_a_sprite_set_and_a_critter_on_the_map() {
     let fixture = common::fixture();
-    let inputs = fixture.inputs("out", 2);
+    let mut inputs = fixture.inputs("out", 2);
+    // The combat level (a slice key; the run's default is the first
+    // wave's minimal level).
+    inputs.slice.animations = Some("combat".to_owned());
     let summary = pipeline::all(&inputs).expect("the pipeline runs");
     assert!(summary.critters.sets >= 1, "{:?}", summary.critters);
     assert_eq!(summary.critters.failed, 0);

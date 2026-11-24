@@ -649,6 +649,49 @@ fn furniture_footprints_block_the_counter_and_the_table() {
             }
         }
     }
+    // No furniture hex holds the entrance, a critter, an arrival, a link's
+    // destination or an opened passage.
+    let furniture: std::collections::BTreeSet<i32> = footprints()
+        .values()
+        .flat_map(|c| map_builder::furniture::footprint_hexes(&frame, c))
+        .collect();
+    assert!(!furniture.contains(&inside.report.entry_hex));
+    assert!(!inside.report.critters.is_empty());
+    for critter in &inside.report.critters {
+        assert!(!furniture.contains(&critter.hex), "{}", critter.reference);
+    }
+    for elevation in &inside.elevations {
+        for (what, hex, _) in &elevation.arrivals {
+            assert!(!furniture.contains(hex), "{what}");
+        }
+        for passage in &elevation.passages {
+            assert!(passage.opened.iter().all(|h| !furniture.contains(h)));
+        }
+    }
+    let into_mart: Vec<_> = fixed
+        .maps
+        .iter()
+        .flat_map(|m| &m.links)
+        .filter(|l| l.to_file == inside.file)
+        .collect();
+    assert!(!into_mart.is_empty());
+    for link in into_mart {
+        assert!(!furniture.contains(&link.to_hex), "{}", link.from);
+    }
+    // The linked interior's summary lists its links instead of claiming
+    // none.
+    let summary = inside.interior_summary();
+    assert!(
+        summary.iter().all(|l| !l.contains("no exits")),
+        "{summary:?}"
+    );
+    assert!(summary[0].starts_with("interior map:"), "{summary:?}");
+    assert!(
+        summary
+            .iter()
+            .any(|l| l.starts_with("door ") && l.contains("a link leads back")),
+        "{summary:?}"
+    );
     // The lot has none: its own walkability is unchanged (only its door's
     // arrival hex in the mart may move).
     assert_eq!(fixed.maps[0].furniture.footprints_given, 0);

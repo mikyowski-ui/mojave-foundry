@@ -89,6 +89,14 @@
 //! the walkable hex nearest the centre that holds no exit grid (the rule
 //! before components existed). [`BuildReport::entrance`] says which.
 //!
+//! **Exterior target.** With [`BuildOptions::entrance_near`] on an
+//! exterior map (the arrival point of the teleport that leads into the
+//! worldspace, such as a town gate) the rule runs in the component of the
+//! walkable hex nearest that point instead of the largest, nearest the
+//! point, and passages join islands to that component.
+//! [`BuildOptions::entrance_sight`] chooses how a figure is judged
+//! ([`cover::SightRule`]; the any-pixel rule by default).
+//!
 //! # Readability
 //!
 //! [`BuildReport::readability`] measures the written map for a player:
@@ -97,6 +105,13 @@
 //! ([`cover::Sight`]), the open-floor ratio (clear walkable hexes over
 //! floor hexes) and the share of walkable hexes within one step of a
 //! blocking placement. [`BuildReport::readability_summary`] prints them.
+//!
+//! [`BuildOptions::readability_sight`] chooses how a figure is judged:
+//! the default any-pixel rule keeps every earlier report but calls a figure
+//! covered for one pixel of a stool or kerb over its feet (94 to 100 % of
+//! the walkable hexes of a furnished room); [`cover::SightRule::VISIBLE`]
+//! calls it covered only when more than a quarter of its box lies under art
+//! drawn after it.
 //!
 //! **Blocking is never art height.** What blocks movement comes from
 //! [`BuildInput::blocked_hexes`], [`Placement::blocking`] and the role
@@ -180,6 +195,24 @@
 //! linked and the layer is checked to hold exactly its maps and no exit
 //! grid.
 //!
+//! # Exterior levels
+//!
+//! An exterior whose walkable surfaces lie over one another (a town of
+//! catwalks over a crater floor) is one map of up to three elevations:
+//! [`levels::split_levels`] assigns every navmesh triangle of the window's
+//! exterior cells to a level so that no two surfaces over one another with
+//! a person's height between them share one, and turns every place where
+//! the walker crosses from one level to the next (a ramp's head or foot,
+//! the edge of a deck) into a [`StairLink`] of the map with itself. Each
+//! [`ElevationInput::level`] then walks only its level's triangles, at any
+//! height above the terrain ([`walk::verdicts`]); critters go to the
+//! elevation whose surface they stand on, and door links arriving on the
+//! map to the elevation of their arrival point. The engine draws only the
+//! elevation the player is on: the floor under a catwalk is not seen from
+//! it, nor the catwalk from below unless the caller draws it there. The
+//! [`levels`] notes give the rule; `DESIGN-levels.md` section 4 what the
+//! caller supplies per elevation.
+//!
 //! # Loot
 //!
 //! With a [`loot::Catalogue`] ([`BuildOptions::catalogue`] for
@@ -209,6 +242,7 @@ pub mod exits;
 pub mod furniture;
 pub mod islands;
 mod layer;
+pub mod levels;
 mod links;
 pub mod loot;
 mod loot_build;
@@ -466,6 +500,51 @@ pub struct BuildOptions {
     /// floor pieces never), and a passage never opens it. Default empty:
     /// nothing changes.
     pub footprints: BTreeMap<String, Vec<[f32; 2]>>,
+    /// An exterior map's entrance target (crate notes, "Entrance"): a
+    /// source point `(x, y)` such as the arrival point of the teleport that
+    /// leads into the worldspace (the town gate). The entrance is then
+    /// chosen in the component of the walkable hex nearest it, nearest it,
+    /// and passages join islands to that component instead of the largest.
+    /// Ignored when the entrance elevation is an interior one (its
+    /// [`InteriorBuild::entrance_near`] rules there). Default `None`: the
+    /// largest component and the window centre, unchanged.
+    pub entrance_near: Option<[f32; 2]>,
+    /// How the entrance rule judges a figure ([`cover::Cover::sight_by`]).
+    /// Default [`cover::SightRule::AnyPixel`], the rule every earlier build
+    /// used; [`cover::SightRule::Share`] lets the entrance stand where a
+    /// kerb strip hides the feet.
+    pub entrance_sight: cover::SightRule,
+    /// How [`BuildReport::readability`] judges a figure. Default
+    /// [`cover::SightRule::AnyPixel`], which keeps every earlier report but
+    /// calls a figure covered for one pixel of art over it, so that nearly
+    /// every walkable hex of a furnished room is "covered" (crate notes,
+    /// "Readability"). [`cover::SightRule::VISIBLE`] is the metric to read:
+    /// "clear" is a figure at most a quarter of whose box art drawn over it
+    /// covers.
+    pub readability_sight: cover::SightRule,
+    /// Which hexes a navmesh triangle covers ([`walk::NavmeshCoverage`]).
+    /// Default [`walk::NavmeshCoverage::Tolerance`], the rule every earlier
+    /// build used.
+    pub navmesh_coverage: walk::NavmeshCoverage,
+    /// One level of a multi-level exterior (crate notes, "Exterior
+    /// levels"): the walkability functions ([`walk::verdicts`],
+    /// [`walk::standable_hexes`]) walk only its triangles. Set it to ask
+    /// for one level's standable hexes (the slicer's open hexes of that
+    /// elevation); in [`build_layer`] each [`ElevationInput::level`]
+    /// carries its own and a map's must be `None`. Default `None`.
+    pub level: Option<ExteriorLevel>,
+}
+
+/// One level of a multi-level exterior map ([`levels::LevelSplit::exterior_level`]):
+/// the navmesh triangles walked on that elevation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExteriorLevel {
+    /// The level, 0 to 2: 0 is the ground level, which keeps the exterior
+    /// rules off the navmesh (cells without a navmesh are judged by slope);
+    /// above it only the level's triangles are ground.
+    pub level: u8,
+    /// `(navmesh form key, triangle index)` of every triangle on it.
+    pub triangles: std::sync::Arc<BTreeSet<(String, u32)>>,
 }
 
 /// The default of [`InteriorBuild::below`]: source units under the floor
@@ -569,6 +648,11 @@ impl Default for BuildOptions {
             interactive: BTreeSet::new(),
             catalogue: None,
             footprints: BTreeMap::new(),
+            entrance_near: None,
+            entrance_sight: cover::SightRule::AnyPixel,
+            readability_sight: cover::SightRule::AnyPixel,
+            navmesh_coverage: walk::NavmeshCoverage::Tolerance,
+            level: None,
         }
     }
 }
@@ -828,6 +912,30 @@ impl ComponentReport {
             .count()
     }
 
+    /// Where critter `reference` stands: its component and whether that
+    /// is the main (the entrance's) component, so reachable from the
+    /// entrance. `None` when no placed critter has that reference.
+    pub fn critter_reach(&self, reference: &str) -> Option<(Option<usize>, bool)> {
+        self.critters
+            .iter()
+            .find(|c| c.reference == reference)
+            .map(|c| {
+                (
+                    c.component,
+                    c.component.is_some() && c.component == self.main,
+                )
+            })
+    }
+
+    /// Placed critters outside the main component: a walker coming from
+    /// the entrance cannot reach them.
+    pub fn stranded_critters(&self) -> Vec<&CritterComponent> {
+        self.critters
+            .iter()
+            .filter(|c| c.component.is_none() || c.component != self.main)
+            .collect()
+    }
+
     /// Return hexes outside the main component.
     pub fn stranded_returns(&self) -> usize {
         self.exits
@@ -1079,16 +1187,29 @@ impl BuildReport {
                 None => form.clone(),
             })
             .collect();
-        lines.push(format!(
-            "interior demo: {} (map {}) from {}; one map, no exits, no stub maps",
-            self.map_file,
-            self.map_number,
-            if cells.is_empty() {
-                "no interior cell".to_owned()
-            } else {
-                cells.join(", ")
-            }
-        ));
+        let from = if cells.is_empty() {
+            "no interior cell".to_owned()
+        } else {
+            cells.join(", ")
+        };
+        // An isolated demo is the layer's only map; in a layer of several
+        // maps the doors may be linked (`BuiltMap::interior_summary` lists
+        // the links).
+        if self.maps.len() <= 1 && self.exits.is_empty() {
+            lines.push(format!(
+                "interior demo: {} (map {}) from {from}; one map, no exits, no stub maps",
+                self.map_file, self.map_number,
+            ));
+        } else {
+            lines.push(format!(
+                "interior map: {} (map {}) from {from}; one of {} maps in the layer, {} exits to \
+                 stub maps",
+                self.map_file,
+                self.map_number,
+                self.maps.len(),
+                self.exits.len()
+            ));
+        }
         lines.push(format!(
             "floor level z {:.0}: navmesh from z {:.0} to {:.0}; {} walkable hexes, {} triangles \
              on other levels ignored",
@@ -1125,6 +1246,12 @@ impl BuildReport {
                 door.door
             ));
         }
+        let listed: BTreeSet<&str> = interior.doors.iter().map(|d| d.door.as_str()).collect();
+        for skipped in &self.skipped_teleports {
+            if !listed.contains(skipped.door.as_str()) {
+                lines.push(format!("not linked: {}: {}", skipped.door, skipped.reason));
+            }
+        }
         for critter in &self.critters {
             let clamped = interior
                 .clamped
@@ -1134,8 +1261,65 @@ impl BuildReport {
                     format!(", from another level (z {z:.0})")
                 });
             lines.push(format!(
-                "placed {} on hex {} ({} steps from its position{clamped})",
-                critter.reference, critter.hex, critter.steps
+                "placed {} on hex {} ({} steps from its position{clamped}; {})",
+                critter.reference,
+                critter.hex,
+                critter.steps,
+                self.reach_text(&critter.reference)
+            ));
+        }
+        for critter in &self.skipped_critters {
+            lines.push(format!("skipped {}: {}", critter.reference, critter.reason));
+        }
+        lines
+    }
+
+    /// Where a placed critter stands in [`BuildReport::components`]: its
+    /// component and whether a walker from the entrance reaches it.
+    fn reach_text(&self, reference: &str) -> String {
+        match self.components.critter_reach(reference) {
+            Some((Some(c), true)) => format!("component {c}, the entrance's"),
+            Some((Some(c), false)) => {
+                format!("component {c}, not reachable from the entrance")
+            }
+            Some((None, _)) => "in no walkable component, not reachable from the entrance".into(),
+            None => "not on the entrance elevation".into(),
+        }
+    }
+
+    /// One line per placed critter (name, reference, hex, component and
+    /// whether it is reachable from the entrance), then one per critter
+    /// left off the map with the reason; a first line counts the critters
+    /// outside the entrance's component, naming them.
+    pub fn critters_summary(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        let stranded = self.components.stranded_critters();
+        if !self.critters.is_empty() {
+            lines.push(if stranded.is_empty() {
+                format!(
+                    "{} critters placed, every one reachable from the entrance",
+                    self.critters.len()
+                )
+            } else {
+                format!(
+                    "{} critters placed, {} outside the entrance's component: {}",
+                    self.critters.len(),
+                    stranded.len(),
+                    stranded
+                        .iter()
+                        .map(|c| format!("{} (hex {})", c.reference, c.hex))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            });
+        }
+        for critter in &self.critters {
+            lines.push(format!(
+                "placed {} on hex {} ({} steps from its position; {})",
+                critter.reference,
+                critter.hex,
+                critter.steps,
+                self.reach_text(&critter.reference)
             ));
         }
         for critter in &self.skipped_critters {
@@ -1172,6 +1356,11 @@ pub struct ElevationInput<'a> {
     /// ([`walk::interior_verdicts`]) over this band. `None`: the exterior
     /// rules (navmesh, terrain slope).
     pub interior: Option<InteriorBuild>,
+    /// An exterior elevation's level ([`levels::split_levels`]): only its
+    /// navmesh triangles are walked (crate notes, "Exterior levels").
+    /// `None`: every exterior triangle, as a one-level exterior. Not with
+    /// [`ElevationInput::interior`].
+    pub level: Option<ExteriorLevel>,
 }
 
 /// One map of a layer: one to three elevations sharing a window.
@@ -1368,6 +1557,55 @@ pub struct BuiltMap {
     /// Furniture footprints used on this map, and upright art that does
     /// not block where a walker can stand.
     pub furniture: FurnitureReport,
+}
+
+impl BuiltMap {
+    /// [`BuildReport::interior_summary`] with this map's links: one line
+    /// per door or stairs whose grids lead to a map of the layer (where
+    /// from, where to, whether something leads back). Empty on a map whose
+    /// entrance elevation is not an interior one.
+    pub fn interior_summary(&self) -> Vec<String> {
+        let mut lines = self.report.interior_summary();
+        if lines.is_empty() {
+            return lines;
+        }
+        lines.extend(self.link_lines());
+        lines
+    }
+
+    /// One line per link of [`BuiltMap::links`].
+    pub fn link_lines(&self) -> Vec<String> {
+        self.links
+            .iter()
+            .map(|link| {
+                let kind = match link.kind {
+                    LinkKind::Door => "door",
+                    LinkKind::Stairs => "stairs",
+                };
+                let at = match link.door_hex {
+                    Some(hex) => format!(" on hex {hex}"),
+                    None => String::new(),
+                };
+                format!(
+                    "{kind} {}{at} (elevation {}): {} exit grids {} steps out, to {} (map {}) \
+                     elevation {} hex {}; {}",
+                    link.from,
+                    link.elevation,
+                    link.grid_hexes.len(),
+                    link.grid_steps,
+                    link.to_file,
+                    link.to_number,
+                    link.to_elevation,
+                    link.to_hex,
+                    if link.returns {
+                        "a link leads back"
+                    } else {
+                        "nothing leads back"
+                    }
+                )
+            })
+            .collect()
+    }
 }
 
 /// What [`build_layer`] returns.

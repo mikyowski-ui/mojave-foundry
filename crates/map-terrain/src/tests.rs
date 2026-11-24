@@ -1370,3 +1370,85 @@ fn each_interior_storey_builds_its_ground_from_its_own_overlays() {
     let other = first.compose_rect([4300, 700], 30, 30).expect("compose");
     assert!(other.iter().all(|&i| i == 0));
 }
+
+#[test]
+fn no_tone_and_the_identity_tone_change_no_byte() {
+    let world = gradient_world();
+    let cap = TerrainOptions {
+        library_cap: 977,
+        ..options()
+    };
+    let before = build(&world, &[], &cap);
+    let identity = build(
+        &world,
+        &[],
+        &TerrainOptions {
+            tone: Some(foundry_render::Tone::IDENTITY),
+            ..cap.clone()
+        },
+    );
+    assert_eq!(digest(&identity), digest(&before));
+    assert_eq!(identity.squares, before.squares);
+}
+
+#[test]
+fn the_tone_darkens_the_land_and_leaves_opaque_overlays_alone() {
+    let world = gradient_world();
+    let map = palette_map();
+    let plain = TerrainOptions {
+        dither_strength: 0.0,
+        library_cap: SQUARES,
+        ..options()
+    };
+    let dark = TerrainOptions {
+        tone: Some(foundry_render::Tone {
+            gain: 0.5,
+            ..foundry_render::Tone::IDENTITY
+        }),
+        ..plain.clone()
+    };
+    let blue = rgba_block([0, 0, 255, 255], 40, 20);
+    let overlays = [Overlay {
+        origin: [3900, 600],
+        width: 40,
+        height: 20,
+        rgba: &blue,
+    }];
+    let before = build(&world, &overlays, &plain);
+    let after = build(&world, &overlays, &dark);
+    let a = before.compose_rect([2000, 400], 200, 100).expect("compose");
+    let b = after.compose_rect([2000, 400], 200, 100).expect("compose");
+    assert_ne!(a, b, "the land is toned");
+    let palette = Palette::parse(&quantize::fixture::synthetic_palette())
+        .expect("palette")
+        .rgba8();
+    let brightness = |pixels: &[u8]| -> u64 {
+        pixels
+            .iter()
+            .map(|&i| {
+                palette[usize::from(i)][..3]
+                    .iter()
+                    .map(|c| u64::from(*c))
+                    .sum::<u64>()
+            })
+            .sum()
+    };
+    assert!(brightness(&b) < brightness(&a), "half the gain is darker");
+    // The opaque overlay is not toned (the slicer tones its own).
+    let over_a = before.compose_rect([3900, 600], 40, 20).expect("compose");
+    let over_b = after.compose_rect([3900, 600], 40, 20).expect("compose");
+    assert_eq!(over_a, over_b);
+    assert!(over_b.iter().all(|&i| i == map.nearest([0, 0, 255])));
+    // An invalid curve is an option error.
+    let bad = TerrainOptions {
+        tone: Some(foundry_render::Tone {
+            gain: 9.0,
+            ..foundry_render::Tone::IDENTITY
+        }),
+        ..plain
+    };
+    assert!(matches!(
+        bad.validate(),
+        Err(TerrainError::InvalidOption { key: "tone", .. })
+    ));
+}

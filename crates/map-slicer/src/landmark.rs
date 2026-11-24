@@ -121,6 +121,10 @@ pub(crate) struct PieceStats {
     /// Pieces left without an anchor late enough for every walker (their
     /// walkers are sealed).
     pub unresolved: usize,
+    /// Opaque pixels left out as unreachable (`Input::crop_unreachable`),
+    /// and those kept.
+    pub unreachable: u64,
+    pub reachable: u64,
 }
 
 /// One landmark reference's render and placement.
@@ -142,6 +146,9 @@ pub(crate) struct Input<'a> {
     /// no walker's concern. Open hexes are walkers either way.
     pub walkable: Option<&'a BTreeSet<i32>>,
     pub step_height: f32,
+    /// Leave out the pixels no hex lies near enough to anchor (a wall's top
+    /// far above the map's north edge) instead of failing.
+    pub crop_unreachable: bool,
 }
 
 /// Every hex whose centre lies in `rect` (inclusive), sorted.
@@ -350,15 +357,21 @@ pub(crate) fn cut(input: &Input<'_>, limits: &Limits) -> Result<Pieces, String> 
         }
     }
     blocked.retain(|h| !input.open.contains(h));
+    let base = [
+        input.ground[0] + i64::from(input.offset[0]) + i64::from(canvas.origin[0]),
+        input.ground[1] + i64::from(input.offset[1]) + i64::from(canvas.origin[1]),
+    ];
+    if input.crop_unreachable {
+        let before = pixels.len();
+        pixels = reachable(&pixels, width, base, limits);
+        result.stats.unreachable = (before - pixels.len()) as u64;
+        result.stats.reachable = pixels.len() as u64;
+    }
     if pixels.is_empty() {
         result.blocked = blocked;
         return Ok(result);
     }
 
-    let base = [
-        input.ground[0] + i64::from(input.offset[0]) + i64::from(canvas.origin[0]),
-        input.ground[1] + i64::from(input.offset[1]) + i64::from(canvas.origin[1]),
-    ];
     let mut cutter = Cutter {
         limits: *limits,
         width,
@@ -526,8 +539,22 @@ pub(crate) fn cut(input: &Input<'_>, limits: &Limits) -> Result<Pieces, String> 
                 result.stats.unresolved += 1;
                 match hexes_in_rect(window).last() {
                     Some(&a) => a,
-                    None => nearest_hex(window)
-                        .ok_or_else(|| format!("no hex near piece {:?}", piece.rect))?,
+                    None => match nearest_hex(window) {
+                        Some(a) => a,
+                        // Cropped, every pixel has a hex within reach, but
+                        // a large piece's window may hold none: the nearest
+                        // hex of a widening window then draws it from most
+                        // views.
+                        None if input.crop_unreachable => (1..=8)
+                            .find_map(|k| {
+                                let m = 64 * k;
+                                let wider =
+                                    [window[0] - m, window[1] - m, window[2] + m, window[3] + m];
+                                hexes_in_rect(wider).last().copied()
+                            })
+                            .ok_or_else(|| format!("no hex near piece {:?}", piece.rect))?,
+                        None => return Err(format!("no hex near piece {:?}", piece.rect)),
+                    },
                 }
             }
         };
@@ -560,6 +587,40 @@ pub(crate) fn cut(input: &Input<'_>, limits: &Limits) -> Result<Pieces, String> 
     blocked.extend(sealed);
     result.blocked = blocked;
     Ok(result)
+}
+
+/// Side of the screen cells [`reachable`] tests, pixels.
+const REACH_CELL: i64 = 8;
+
+/// The pixels of `pixels` (canvas indices, canvas pixel (0, 0) drawn at
+/// `base`) that some hex can anchor: those in a screen cell over a hex, or
+/// whose cell's anchor window (`Limits::window`) holds a hex centre. A
+/// pixel elsewhere is drawn from no view whose refresh visits its anchor.
+fn reachable(pixels: &[u32], width: usize, base: [i64; 2], limits: &Limits) -> Vec<u32> {
+    let mut verdict: BTreeMap<(i64, i64), bool> = BTreeMap::new();
+    let mut out = Vec::with_capacity(pixels.len());
+    for &p in pixels {
+        let i = p as usize;
+        let at = [base[0] + (i % width) as i64, base[1] + (i / width) as i64];
+        let cell = (at[0].div_euclid(REACH_CELL), at[1].div_euclid(REACH_CELL));
+        let ok = *verdict.entry(cell).or_insert_with(|| {
+            let rect = [
+                cell.0 * REACH_CELL,
+                cell.1 * REACH_CELL,
+                cell.0 * REACH_CELL + REACH_CELL - 1,
+                cell.1 * REACH_CELL + REACH_CELL - 1,
+            ];
+            let centre = [
+                (rect[0] + rect[2]) as f64 / 2.0,
+                (rect[1] + rect[3]) as f64 / 2.0,
+            ];
+            hex::pick(centre).is_some() || !hexes_in_rect(limits.window(rect)).is_empty()
+        });
+        if ok {
+            out.push(p);
+        }
+    }
+    out
 }
 
 /// The hex under the centre of `rect`, if any.

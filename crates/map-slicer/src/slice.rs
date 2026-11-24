@@ -82,6 +82,11 @@ pub(crate) struct RenderKey {
     /// Declutter, interior mode: a lower ceiling cut for a room shell,
     /// above the floor, rounded to a unit. `None`: the interior's own.
     cut: Option<i64>,
+    /// The wire rule's look: bit 0 the wire cutoff, bit 1 both faces.
+    look: u8,
+    /// Declutter, outdoors: a digest of the roof triangles left out over
+    /// walkable ground. `None`: none.
+    roof: Option<u64>,
 }
 
 impl RenderKey {
@@ -124,7 +129,29 @@ impl RenderKey {
             scale: q(reference.transform.scale, config.scale_quantum),
             lift: None,
             cut: None,
+            look: 0,
+            roof: None,
         })
+    }
+
+    /// The key of a render drawn with the wire rule's `look` bits.
+    pub(crate) fn with_look(self, look: u8) -> Self {
+        RenderKey { look, ..self }
+    }
+
+    /// The key of a render without the roof triangles whose digest is
+    /// `roof`.
+    pub(crate) fn with_roof(self, roof: Option<u64>) -> Self {
+        RenderKey { roof, ..self }
+    }
+
+    /// How the render is drawn.
+    pub(crate) fn look(&self, config: &SlicerConfig) -> render::Look {
+        render::Look {
+            two_sided: self.look & LOOK_TWO_SIDED != 0,
+            alpha_cutoff: (self.look & LOOK_WIRE != 0)
+                .then(|| config.wire.as_ref().map_or(0.1, |w| w.cutoff)),
+        }
     }
 
     /// The canonical transform: no translation.
@@ -139,6 +166,10 @@ impl RenderKey {
     }
 }
 
+/// [`RenderKey`] look bits.
+const LOOK_WIRE: u8 = 1;
+const LOOK_TWO_SIDED: u8 = 2;
+
 type MeshSlot = Result<(StaticMesh, MeshFacts), String>;
 
 /// References sorted and classified, with their meshes.
@@ -150,6 +181,8 @@ struct Prepared<'r> {
     plain: Vec<Class>,
     /// The declutter pass's decisions, when it is on.
     decision: Option<Decision>,
+    /// Floor square side, source units.
+    tile_units: f32,
 }
 
 impl Prepared<'_> {
@@ -249,6 +282,7 @@ fn prepare<'r>(
         classes,
         meshes,
         decision: None,
+        tile_units,
     }
 }
 
@@ -819,7 +853,14 @@ fn run_once(
     });
     let mut cut_stats = CutawayStats::default();
     let mut covered = (BTreeSet::new(), BTreeSet::new());
+    let mut door_covered = (BTreeSet::new(), BTreeSet::new());
     let mut outlined = 0usize;
+    let mut outlined_kinds: BTreeMap<String, usize> = BTreeMap::new();
+    // Hexes of strips the cutaway cut (doors near them get the stub).
+    let mut cut_hexes: BTreeSet<i32> = BTreeSet::new();
+    let door_rule = cutaway.and_then(|c| c.doors.as_ref());
+    let deferred = |i: usize| door_rule.is_some() && decision.is_some_and(|(_, d)| d.door_like[i]);
+    let mut roof_stats: Option<(usize, usize)> = decision.map(|_| (0, 0));
     // Floor meshes split off renders, and (floor mesh, reference) to bake.
     let mut floor_meshes: Vec<StaticMesh> = Vec::new();
     let mut floor_bake: Vec<(usize, usize)> = Vec::new();
@@ -837,6 +878,78 @@ fn run_once(
         });
     };
 
+    // The wire rule's looks, the roofs left out over walkable ground
+    // outdoors, and the furniture (each off unless configured).
+    let looks: Vec<u8> = {
+        let mut test = WireTest {
+            renderer: &mut *renderer,
+            verdicts: BTreeMap::new(),
+        };
+        (0..classes.len())
+            .map(|i| {
+                look_of(
+                    prepared,
+                    i,
+                    &classes[i],
+                    config,
+                    assets.textures(),
+                    projection,
+                    &mut test,
+                )
+            })
+            .collect()
+    };
+    let roof_rule = decision
+        .and_then(|(profile, _)| profile.roof_cut.as_ref())
+        .filter(|_| interior.is_none());
+    let mut roofs: BTreeMap<usize, u64> = BTreeMap::new();
+    let mut roof_masks: BTreeMap<u64, Vec<Vec<bool>>> = BTreeMap::new();
+    if let (Some(rule), Some(walkers)) = (roof_rule, &walkers) {
+        for (i, class) in classes.iter().enumerate() {
+            if !matches!(class, Class::Sliced | Class::Landmark) {
+                continue;
+            }
+            let r = prepared.refs[i];
+            let Some(Some(Ok((mesh, _)))) = r.mesh.as_ref().map(|h| prepared.meshes.get(h)) else {
+                continue;
+            };
+            let mask = roof_mask(plane, sampler, mesh, &r.transform.matrix(), walkers, rule);
+            let removed: usize = mask.iter().map(|m| m.iter().filter(|v| **v).count()).sum();
+            if removed == 0 {
+                continue;
+            }
+            let mut hasher = Sha256::new();
+            for (p, m) in mask.iter().enumerate() {
+                for (t, v) in m.iter().enumerate() {
+                    if *v {
+                        hasher.update((p as u64).to_le_bytes());
+                        hasher.update((t as u64).to_le_bytes());
+                    }
+                }
+            }
+            let digest: [u8; 32] = hasher.finalize().into();
+            let h = u64::from_le_bytes(digest[..8].try_into().unwrap_or([0; 8]));
+            roofs.insert(i, h);
+            roof_masks.insert(h, mask);
+            if let Some(d) = &mut roof_stats {
+                d.0 += 1;
+                d.1 += removed;
+            }
+        }
+    }
+    let mut furniture_choice: BTreeMap<usize, &'static str> = match &config.furniture {
+        Some(rule) => (0..classes.len())
+            .filter_map(|i| {
+                furniture_of(prepared, i, &classes[i], rule, config, sampler, decision)
+                    .map(|why| (i, why))
+            })
+            .collect(),
+        None => BTreeMap::new(),
+    };
+    let mut footprints: BTreeMap<String, Vec<[f32; 2]>> = BTreeMap::new();
+    let mut body_total: BTreeSet<i32> = BTreeSet::new();
+    let mut open_blocked: BTreeSet<i32> = BTreeSet::new();
+
     // Group the sprite, sliced and landmark references by render.
     let mut groups: BTreeMap<RenderKey, Vec<usize>> = BTreeMap::new();
     let mut flat = Vec::new();
@@ -848,13 +961,31 @@ fn run_once(
             Class::GroundFlat => flat.push(i),
             Class::GroundRelief => relief.push(i),
             Class::Sprite(_) | Class::Sliced | Class::Landmark => match RenderKey::of(r, config) {
+                Some(_)
+                    if looks[i] & LOOK_WIRE != 0
+                        && config.wire.as_ref().is_some_and(|w| w.drop) =>
+                {
+                    report.wire_props += 1;
+                    *report.wire_models.entry(model_of(r)).or_insert(0) += 1;
+                    skip(&mut skipped, r, SkipReason::Wire);
+                    demote(&mut report, class.kind());
+                }
                 Some(key) => {
+                    let look = looks[i];
+                    report.wire_props += usize::from(look & LOOK_WIRE != 0);
+                    if look & LOOK_WIRE != 0 {
+                        *report.wire_models.entry(model_of(r)).or_insert(0) += 1;
+                    }
+                    report.two_sided += usize::from(look & LOOK_TWO_SIDED != 0);
+                    // Wire props are drawn whole: none of their lattice is
+                    // floor.
                     let key = match interior {
-                        Some(indoors) if splits(class) => key
+                        Some(indoors) if splits(class) && look & LOOK_WIRE == 0 => key
                             .lifted(r.transform.position[2] - indoors.floor_z)
                             .with_cut(decision.and_then(|(_, d)| d.cuts[i])),
                         _ => key,
                     };
+                    let key = key.with_look(look).with_roof(roofs.get(&i).copied());
                     groups.entry(key).or_default().push(i)
                 }
                 None => skip(&mut skipped, r, SkipReason::NoMesh),
@@ -878,109 +1009,168 @@ fn run_once(
                 reason,
             });
         };
-    for (key, members) in &groups {
-        let Some(Ok((mesh, _))) = prepared.meshes.get(&key.mesh) else {
-            continue;
-        };
-        let first_kind = classes[members[0]].kind();
-        // Indoors: the floor leaves for the bake, the rest is cut at the
-        // ceiling, and only that is rendered upright.
-        let mut split = match (key.lift(), interior) {
-            (Some(lift), Some(indoors)) => Some(interior::split_at(
-                mesh,
-                &key.matrix(config),
-                lift,
-                indoors,
-                config.floor_min_up,
-                key.cut().unwrap_or(indoors.cut_height),
-            )),
-            _ => None,
-        };
-        let floor_index = split.as_mut().and_then(|s| s.floor.take()).map(|f| {
-            floor_meshes.push(f);
-            floor_meshes.len() - 1
-        });
-        let clipped = split.as_ref().is_some_and(|s| s.cut_triangles > 0);
-        if let (Some(s), Some(t)) = (&split, &mut indoor) {
-            t.cut_triangles += s.cut_triangles;
-            t.ceiling_triangles += s.ceiling_triangles;
-        }
-        // A placed member gives its floor to the bake.
-        let placed =
-            |i: usize, indoor: &mut Option<InteriorStats>, bake: &mut Vec<(usize, usize)>| {
-                if let Some(f) = floor_index {
-                    bake.push((f, i));
-                }
-                if let Some(t) = indoor
-                    && clipped
-                {
-                    t.clipped_references += 1;
-                }
+    // Doors the cutaway's door rule may crop come second, once every wall
+    // strip is cut.
+    for pass in 0..2u8 {
+        for (key, all) in &groups {
+            let members: Vec<usize> = all
+                .iter()
+                .copied()
+                .filter(|&i| deferred(i) == (pass == 1))
+                .collect();
+            if members.is_empty() {
+                continue;
+            }
+            let members = &members;
+            let Some(Ok((mesh, _))) = prepared.meshes.get(&key.mesh) else {
+                continue;
             };
-        // Members left with nothing upright: their floor is baked (when
-        // they stand on the map); without one, nothing is under the cut.
-        let floor_only = |skipped: &mut Vec<Skipped>,
-                          report: &mut BudgetReport,
-                          indoor: &mut Option<InteriorStats>,
-                          bake: &mut Vec<(usize, usize)>| {
-            for &i in members {
-                let r = prepared.refs[i];
-                if floor_index.is_none() {
-                    skip(skipped, r, SkipReason::AboveCut);
-                    demote(report, classes[i].kind());
-                } else if standing_on(projection, window, sampler, floor_z, r).is_none() {
-                    skip(skipped, r, SkipReason::OutsideMap);
-                    demote(report, classes[i].kind());
-                } else {
-                    placed(i, indoor, bake);
-                    if let Some(t) = indoor {
-                        t.floor_only += 1;
+            let roofless;
+            let mesh: &StaticMesh = match key.roof.and_then(|h| roof_masks.get(&h)) {
+                Some(mask) => {
+                    roofless = without_triangles(mesh, mask);
+                    &roofless
+                }
+                None => mesh,
+            };
+            let first_kind = classes[members[0]].kind();
+            // Indoors: the floor leaves for the bake, the rest is cut at the
+            // ceiling, and only that is rendered upright.
+            let mut split = match (key.lift(), interior) {
+                (Some(lift), Some(indoors)) => Some(interior::split_at(
+                    mesh,
+                    &key.matrix(config),
+                    lift,
+                    indoors,
+                    config.floor_min_up,
+                    key.cut().unwrap_or(indoors.cut_height),
+                )),
+                _ => None,
+            };
+            let floor_index = split.as_mut().and_then(|s| s.floor.take()).map(|f| {
+                floor_meshes.push(f);
+                floor_meshes.len() - 1
+            });
+            let clipped = split.as_ref().is_some_and(|s| s.cut_triangles > 0);
+            if let (Some(s), Some(t)) = (&split, &mut indoor) {
+                t.cut_triangles += s.cut_triangles;
+                t.ceiling_triangles += s.ceiling_triangles;
+            }
+            // A placed member gives its floor to the bake.
+            let placed =
+                |i: usize, indoor: &mut Option<InteriorStats>, bake: &mut Vec<(usize, usize)>| {
+                    if let Some(f) = floor_index {
+                        bake.push((f, i));
+                    }
+                    if let Some(t) = indoor
+                        && clipped
+                    {
+                        t.clipped_references += 1;
+                    }
+                };
+            // Members left with nothing upright: their floor is baked (when
+            // they stand on the map); without one, nothing is under the cut.
+            let floor_only = |skipped: &mut Vec<Skipped>,
+                              report: &mut BudgetReport,
+                              indoor: &mut Option<InteriorStats>,
+                              bake: &mut Vec<(usize, usize)>| {
+                for &i in members {
+                    let r = prepared.refs[i];
+                    if floor_index.is_none() {
+                        skip(skipped, r, SkipReason::AboveCut);
+                        demote(report, classes[i].kind());
+                    } else if standing_on(projection, window, sampler, floor_z, r).is_none() {
+                        skip(skipped, r, SkipReason::OutsideMap);
+                        demote(report, classes[i].kind());
+                    } else {
+                        placed(i, indoor, bake);
+                        if let Some(t) = indoor {
+                            t.floor_only += 1;
+                        }
                     }
                 }
-            }
-        };
-        let mesh: &StaticMesh = match &split {
-            None => mesh,
-            Some(Split {
-                walls: Some(walls), ..
-            }) => walls,
-            Some(_) => {
-                floor_only(&mut skipped, &mut report, &mut indoor, &mut floor_bake);
-                continue;
-            }
-        };
-        // Landmarks fall back to relief when `relief_ok`; the rest skip.
-        let mut fail_all = |reason: SkipReason,
-                            relief_ok: bool,
-                            skipped: &mut Vec<Skipped>,
-                            report: &mut BudgetReport,
-                            relief: &mut Vec<usize>| {
-            for &i in members {
-                if relief_ok && classes[i] == Class::Landmark {
-                    fall_back(i, reason.to_string(), report, relief);
-                } else {
-                    skip(skipped, prepared.refs[i], reason.clone());
-                    demote(report, classes[i].kind());
+            };
+            let mesh: &StaticMesh = match &split {
+                None => mesh,
+                Some(Split {
+                    walls: Some(walls), ..
+                }) => walls,
+                Some(_) => {
+                    floor_only(&mut skipped, &mut report, &mut indoor, &mut floor_bake);
+                    continue;
                 }
+            };
+            // Landmarks fall back to relief when `relief_ok`; the rest skip.
+            let mut fail_all = |reason: SkipReason,
+                                relief_ok: bool,
+                                skipped: &mut Vec<Skipped>,
+                                report: &mut BudgetReport,
+                                relief: &mut Vec<usize>| {
+                for &i in members {
+                    if relief_ok && classes[i] == Class::Landmark {
+                        fall_back(i, reason.to_string(), report, relief);
+                    } else {
+                        skip(skipped, prepared.refs[i], reason.clone());
+                        demote(report, classes[i].kind());
+                    }
+                }
+            };
+            let mut canvas = match render::render_canonical_with(
+                renderer,
+                projection,
+                mesh,
+                key.matrix(config),
+                textures,
+                config.render_tile,
+                config.max_canvas_pixels,
+                key.look(config),
+            ) {
+                Ok(Some(canvas)) => canvas,
+                Ok(None) if floor_index.is_some() => {
+                    floor_only(&mut skipped, &mut report, &mut indoor, &mut floor_bake);
+                    continue;
+                }
+                Ok(None) => {
+                    fail_all(
+                        SkipReason::NoGeometry,
+                        false,
+                        &mut skipped,
+                        &mut report,
+                        &mut relief,
+                    );
+                    continue;
+                }
+                Err(CanvasError::TooLarge) => {
+                    fail_all(
+                        SkipReason::TooLarge,
+                        true,
+                        &mut skipped,
+                        &mut report,
+                        &mut relief,
+                    );
+                    continue;
+                }
+                Err(CanvasError::Render(e)) => {
+                    fail_all(
+                        SkipReason::Failed(format!("render: {e}")),
+                        true,
+                        &mut skipped,
+                        &mut report,
+                        &mut relief,
+                    );
+                    continue;
+                }
+            };
+            if let Some((profile, _)) = decision {
+                profile.tones.props.apply(&mut canvas.rgba);
             }
-        };
-        let mut canvas = match render::render_canonical(
-            renderer,
-            projection,
-            mesh,
-            key.matrix(config),
-            textures,
-            config.render_tile,
-            config.max_canvas_pixels,
-        ) {
-            Ok(Some(canvas)) => canvas,
-            Ok(None) if floor_index.is_some() => {
-                floor_only(&mut skipped, &mut report, &mut indoor, &mut floor_bake);
-                continue;
-            }
-            Ok(None) => {
+            if !(0..canvas.width as usize * canvas.height as usize).any(|i| canvas.opaque(i)) {
+                if floor_index.is_some() {
+                    floor_only(&mut skipped, &mut report, &mut indoor, &mut floor_bake);
+                    continue;
+                }
                 fail_all(
-                    SkipReason::NoGeometry,
+                    SkipReason::EmptyRender,
                     false,
                     &mut skipped,
                     &mut report,
@@ -988,424 +1178,592 @@ fn run_once(
                 );
                 continue;
             }
-            Err(CanvasError::TooLarge) => {
-                fail_all(
-                    SkipReason::TooLarge,
-                    true,
-                    &mut skipped,
-                    &mut report,
-                    &mut relief,
-                );
-                continue;
-            }
-            Err(CanvasError::Render(e)) => {
-                fail_all(
-                    SkipReason::Failed(format!("render: {e}")),
-                    true,
-                    &mut skipped,
-                    &mut report,
-                    &mut relief,
-                );
-                continue;
-            }
-        };
-        if let Some((profile, _)) = decision {
-            profile.tones.props.apply(&mut canvas.rgba);
-        }
-        if !(0..canvas.width as usize * canvas.height as usize).any(|i| canvas.opaque(i)) {
-            if floor_index.is_some() {
-                floor_only(&mut skipped, &mut report, &mut indoor, &mut floor_bake);
-                continue;
-            }
-            fail_all(
-                SkipReason::EmptyRender,
-                false,
-                &mut skipped,
-                &mut report,
-                &mut relief,
-            );
-            continue;
-        }
-        let indexed = match quantize::quantize(
-            &canvas.rgba,
-            canvas.width,
-            canvas.height,
-            map,
-            Dither::None,
-        ) {
-            Ok(indexed) => indexed,
-            Err(e) => {
-                fail_all(
-                    SkipReason::Failed(format!("quantize: {e}")),
-                    true,
-                    &mut skipped,
-                    &mut report,
-                    &mut relief,
-                );
-                continue;
-            }
-        };
-        report.class_mut(first_kind).renders += 1;
-        let mut sprite_frame: Option<Result<PlacedFrame, String>> = None;
-        let mut outlined_frame: Option<Result<PlacedFrame, String>> = None;
-
-        for &i in members {
-            let r = prepared.refs[i];
-            let class = &classes[i];
-            let model = model_of(r);
-            let Some((ground, offset, ground_z)) =
-                standing_on(projection, window, sampler, floor_z, r)
-            else {
-                skip(&mut skipped, r, SkipReason::OutsideMap);
-                demote(&mut report, class.kind());
-                continue;
+            let indexed = match quantize::quantize(
+                &canvas.rgba,
+                canvas.width,
+                canvas.height,
+                map,
+                Dither::None,
+            ) {
+                Ok(indexed) => indexed,
+                Err(e) => {
+                    fail_all(
+                        SkipReason::Failed(format!("quantize: {e}")),
+                        true,
+                        &mut skipped,
+                        &mut report,
+                        &mut relief,
+                    );
+                    continue;
+                }
             };
-            match class {
-                Class::Sprite(role) => {
-                    let Some(h) = hex::pick([ground[0] as f64, ground[1] as f64]) else {
-                        skip(&mut skipped, r, SkipReason::OutsideMap);
-                        demote(&mut report, class.kind());
-                        continue;
-                    };
-                    let rim = decision
-                        .filter(|(_, d)| d.outlined[i])
-                        .and_then(|(profile, _)| profile.outline);
-                    let frame = match rim {
-                        None => sprite_frame.get_or_insert_with(|| {
-                            emit::placed_frame(&indexed, canvas.width, canvas.height, canvas.origin)
-                                .map_err(|e| e.to_string())
-                        }),
-                        Some(rim) => outlined_frame.get_or_insert_with(|| {
-                            let rimmed =
-                                quantize::rim(&indexed, canvas.width, canvas.height, map, &rim)
-                                    .map_err(|e| e.to_string())?;
-                            let origin = [
-                                canvas.origin[0] + rimmed.offset[0],
-                                canvas.origin[1] + rimmed.offset[1],
-                            ];
-                            emit::placed_frame(&rimmed.pixels, rimmed.width, rimmed.height, origin)
-                                .map_err(|e| e.to_string())
-                        }),
-                    };
-                    if rim.is_some() && frame.is_ok() {
-                        outlined += 1;
-                    }
-                    let frame = match frame {
-                        Ok(frame) => frame,
-                        Err(e) => {
-                            skip(&mut skipped, r, SkipReason::Failed(format!("frame: {e}")));
-                            demote(&mut report, class.kind());
-                            continue;
-                        }
-                    };
-                    let Some(centre) = hex::center(h) else {
-                        continue;
-                    };
-                    let displacement = [
-                        ground[0] + i64::from(offset[0]) - centre[0],
-                        ground[1] + i64::from(offset[1]) - centre[1],
-                    ];
-                    let (Ok(dx), Ok(dy)) = (
-                        i32::try_from(displacement[0]),
-                        i32::try_from(displacement[1]),
-                    ) else {
-                        skip(&mut skipped, r, SkipReason::OutsideMap);
-                        demote(&mut report, class.kind());
-                        continue;
-                    };
-                    let category = role.category();
-                    let (art, new) = store.add(category, frame, &model, ClassKind::Sprite);
-                    if new {
-                        report.class_mut(ClassKind::Sprite).entries += 1;
-                    }
-                    store.note_reference(category, &model, ClassKind::Sprite);
-                    placements.push(Placement {
-                        art,
-                        hex: h,
-                        displacement: [dx, dy],
-                        role: *role,
-                        reference: r.form.to_string(),
-                        blocking: role.blocking(),
-                        run: None,
-                    });
-                    placed(i, &mut indoor, &mut floor_bake);
-                }
-                Class::Landmark => {
-                    // Its footprint blocks (see the `landmark` module),
-                    // except where the source lets an actor stand.
-                    let mut under = BTreeSet::new();
-                    if interior.is_some() {
-                        interior::blocked_by_walls(
-                            plane,
-                            mesh,
-                            &r.transform.matrix(),
-                            ground_z,
-                            config.step_height,
-                            BLOCK_REACH,
-                            &mut under,
-                        );
-                    } else {
-                        overlay::blocked_under(
-                            plane,
-                            sampler,
-                            mesh,
-                            &r.transform.matrix(),
-                            ground_z,
-                            config.step_height,
-                            &mut under,
-                        );
-                    }
-                    let input = landmark::Input {
-                        canvas: &canvas,
-                        indexed: &indexed,
-                        ground,
-                        offset,
-                        lift: r.transform.position[2] - ground_z,
-                        projection,
-                        under: &under,
-                        open: &config.open_hexes,
-                        walkable: config.landmark_walkers.as_ref(),
-                        step_height: config.step_height,
-                    };
-                    let cut = match landmark::cut(&input, &landmark::Limits::of(config)) {
-                        Ok(cut) => cut,
-                        Err(e) => {
-                            fall_back(i, format!("pieces: {e}"), &mut report, &mut relief);
-                            continue;
-                        }
-                    };
-                    if cut.strips.is_empty() {
-                        skip(&mut skipped, r, SkipReason::OutsideMap);
-                        demote(&mut report, class.kind());
-                        continue;
-                    }
-                    report.strips.dropped_pixels += cut.dropped;
-                    report.landmarks.add(&cut.stats);
-                    let mut under = cut.blocked;
-                    store.note_reference(ArtCategory::Scenery, &model, ClassKind::Landmark);
-                    for piece in &cut.strips {
-                        let (art, new) = store.add(
-                            ArtCategory::Scenery,
-                            &piece.frame,
-                            &model,
-                            ClassKind::Landmark,
-                        );
-                        if new {
-                            report.class_mut(ClassKind::Landmark).entries += 1;
-                        }
-                        let blocking = under.remove(&piece.hex);
-                        placements.push(Placement {
-                            art,
-                            hex: piece.hex,
-                            displacement: offset,
-                            role: Role::Scenery,
-                            reference: r.form.to_string(),
-                            blocking,
-                            run: None,
-                        });
-                        report.landmarks.pieces += 1;
-                    }
-                    blocked.extend(under);
-                    report.landmarks.references += 1;
-                    placed(i, &mut indoor, &mut floor_bake);
-                }
-                Class::Sliced => {
-                    let footprint = prepared
-                        .meshes
-                        .get(&key.mesh)
-                        .and_then(|m| m.as_ref().ok())
-                        .and_then(|(_, facts)| facts.bounds)
-                        .map(|b| Footprint::of(&r.transform, b));
-                    let polygon: Vec<[f64; 2]> = footprint
-                        .as_ref()
-                        .map(|f| f.polygon.as_slice())
-                        .unwrap_or_default()
-                        .iter()
-                        .map(|p| plane.tile_of_source(*p))
-                        .collect();
-                    let blocks = |h: i32| {
-                        !config.open_hexes.contains(&h)
-                            && plane
-                                .hex_tile(h)
-                                .is_some_and(|c| distance_to_polygon(&polygon, c) <= BLOCK_REACH)
-                    };
-                    // Walking surfaces by an open hex leave the strips (see
-                    // the `floor` module). Indoors the floor is baked
-                    // instead, and higher surfaces stay with the object.
-                    let has_open = interior.is_none()
-                        && config.open_hexes.iter().any(|&h| {
-                            plane
-                                .hex_tile(h)
-                                .is_some_and(|c| distance_to_polygon(&polygon, c) <= BLOCK_REACH)
-                        });
-                    let floors = if has_open {
-                        floor::pieces(
-                            renderer,
-                            projection,
-                            mesh,
-                            key.matrix(config),
-                            r.transform.position[2] - ground_z,
-                            textures,
-                            map,
-                            ground,
-                            &near_open,
-                            config,
-                        )
-                    } else {
-                        None
-                    };
-                    let without_floors = floors.as_ref().map(|floors| {
-                        let mut canvas = canvas.clone();
-                        let mut indexed = indexed.clone();
-                        floor::clear_from(&mut canvas, &mut indexed, &floors.canvas);
-                        (canvas, indexed)
-                    });
-                    let (strip_canvas, strip_indexed) = match &without_floors {
-                        Some((canvas, indexed)) => (canvas, indexed),
-                        None => (&canvas, &indexed),
-                    };
-                    let floor_pieces = floors.map(|f| f.pieces).unwrap_or_default();
-                    let options = strips::CutOptions {
-                        min_pixels: config.min_strip_pixels,
-                        merge_interior: config.merge_interior_runs,
-                        max_perimeter_run: config.max_perimeter_run,
-                        blocks: &blocks,
-                    };
-                    // The foreground cutaway crops the strips of walls that
-                    // hide walkers (the `cutaway` module).
-                    let trim = match (cutaway, &walkers) {
-                        (Some(settings), Some(walkers))
-                            if decision.is_some_and(|(_, d)| d.cutaway[i]) =>
-                        {
-                            Some(cutaway::Trim {
-                                settings,
-                                walkers,
-                                walker_box: config.walker_box.map(i64::from),
-                                offset,
-                                // The kerb stands on the wall's own foot
-                                // (a raised ring, a sunken pit), never
-                                // below the floor band or the terrain.
-                                lift: r.transform.position[2]
-                                    - footprint.as_ref().map_or(ground_z, |f| {
-                                        f.z[0].max(match interior {
-                                            Some(indoors) => ground_z + indoors.floor_band[0],
-                                            None => ground_z,
-                                        })
-                                    }),
-                            })
-                        }
-                        _ => None,
-                    };
-                    let mut trimmed = None;
-                    let cut = match &trim {
-                        None => {
-                            strips::cut(strip_canvas, strip_indexed, ground, projection, &options)
-                        }
-                        Some(t) => strips::cut_with(
-                            strip_canvas,
-                            strip_indexed,
-                            ground,
-                            projection,
-                            &options,
-                            &mut |owner| {
-                                trimmed =
-                                    Some(cutaway::trim(strip_canvas, owner, ground, projection, t));
-                            },
-                        ),
-                    };
-                    let emptied = trimmed.as_ref().is_some_and(|t| !t.emptied.is_empty());
-                    if let Some(t) = trimmed {
-                        cut_stats.strips_considered += t.considered;
-                        cut_stats.strips_cut += t.cut;
-                        cut_stats.pixels_removed += t.pixels_removed;
-                        cut_stats.strips_emptied += t.emptied.len();
-                        covered.0.extend(t.covered_before);
-                        covered.1.extend(t.covered_after);
-                        // A strip cut to nothing still blocks its hex.
-                        blocked.extend(t.emptied.into_iter().filter(|&h| blocks(h)));
-                    }
-                    let cut = match cut {
-                        Ok(cut) => cut,
-                        Err(e) => {
-                            skip(&mut skipped, r, SkipReason::Failed(e));
-                            demote(&mut report, class.kind());
-                            continue;
-                        }
-                    };
-                    report.strips.dropped_pixels += cut.dropped;
-                    if cut.strips.is_empty() && floor_pieces.is_empty() && !emptied {
-                        if floor_index.is_some() {
-                            // Indoors, its walls are off the map but its
-                            // floor may not be.
-                            placed(i, &mut indoor, &mut floor_bake);
-                            if let Some(t) = &mut indoor {
-                                t.floor_only += 1;
-                            }
-                        } else {
+            report.class_mut(first_kind).renders += 1;
+            let mut sprite_frame: Option<Result<PlacedFrame, String>> = None;
+            let mut outlined_frame: Option<Result<PlacedFrame, String>> = None;
+
+            for &i in members {
+                let r = prepared.refs[i];
+                let class = &classes[i];
+                let model = model_of(r);
+                let Some((ground, offset, ground_z)) =
+                    standing_on(projection, window, sampler, floor_z, r)
+                else {
+                    skip(&mut skipped, r, SkipReason::OutsideMap);
+                    demote(&mut report, class.kind());
+                    continue;
+                };
+                match class {
+                    Class::Sprite(role) => {
+                        let Some(h) = hex::pick([ground[0] as f64, ground[1] as f64]) else {
                             skip(&mut skipped, r, SkipReason::OutsideMap);
                             demote(&mut report, class.kind());
-                        }
-                        continue;
-                    }
-                    report.strips.merged_tiny += cut.merged_tiny;
-                    report.strips.folded += cut.folded;
-                    blocked.extend(cut.run_hexes.iter().copied());
-                    store.note_reference(ArtCategory::Walls, &model, ClassKind::Sliced);
-                    for strip in &cut.strips {
-                        let (art, new) =
-                            store.add(ArtCategory::Walls, &strip.frame, &model, ClassKind::Sliced);
-                        if new {
-                            report.class_mut(ClassKind::Sliced).entries += 1;
-                            if strip.run.is_none() {
-                                store
-                                    .single_sizes
-                                    .0
-                                    .push(u32::from(strip.frame.frame.width));
-                                store
-                                    .single_sizes
-                                    .1
-                                    .push(u32::from(strip.frame.frame.height));
+                            continue;
+                        };
+                        let rim = decision
+                            .filter(|(_, d)| d.outlined[i])
+                            .and_then(|(profile, _)| profile.outline);
+                        // The door rule: a door in a cut wall that hides
+                        // someone keeps a stub (the `cutaway` module).
+                        let mut door_frame: Option<Result<PlacedFrame, String>> = None;
+                        if let (true, Some(stub), Some(settings), Some(walkers)) =
+                            (pass == 1, door_rule, cutaway, &walkers)
+                        {
+                            cut_stats.doors_considered += 1;
+                            let near = cut_hexes
+                                .range(h.saturating_sub(400 * (stub.reach + 1))..)
+                                .any(|&c| hex::distance(c, h) <= stub.reach);
+                            if !near {
+                                cut_stats.doors_outside_cut += 1;
+                            } else {
+                                let foot = prepared
+                                    .meshes
+                                    .get(&key.mesh)
+                                    .and_then(|m| m.as_ref().ok())
+                                    .and_then(|(_, facts)| facts.bounds)
+                                    .map(|b| Footprint::of(&r.transform, b).z[0]);
+                                let floor = match interior {
+                                    Some(indoors) => ground_z + indoors.floor_band[0],
+                                    None => ground_z,
+                                };
+                                let trim = cutaway::Trim {
+                                    settings,
+                                    walkers,
+                                    walker_box: config.walker_box.map(i64::from),
+                                    offset,
+                                    lift: r.transform.position[2]
+                                        - foot.map_or(floor, |z| z.max(floor)),
+                                };
+                                let cut = cutaway::trim_door(
+                                    &canvas,
+                                    h,
+                                    ground,
+                                    projection,
+                                    &trim,
+                                    stub.stub_height,
+                                    r.teleport.is_some().then_some(stub.min_click_pixels),
+                                );
+                                door_covered.0.extend(cut.before.iter().copied());
+                                door_covered.1.extend(cut.after.iter().copied());
+                                if cut.before.len() <= settings.max_walkers {
+                                    cut_stats.doors_clear += 1;
+                                } else if !cut.cleared.is_empty() {
+                                    cut_stats.doors_trimmed += 1;
+                                    cut_stats.doors_grown += usize::from(cut.grown);
+                                    cut_stats.door_pixels_removed += cut.cleared.len() as u64;
+                                    let mut stubbed = indexed.clone();
+                                    for &c in &cut.cleared {
+                                        stubbed[c] = 0;
+                                    }
+                                    door_frame = Some(match rim {
+                                        None => emit::placed_frame(
+                                            &stubbed,
+                                            canvas.width,
+                                            canvas.height,
+                                            canvas.origin,
+                                        )
+                                        .map_err(|e| e.to_string()),
+                                        Some(rim) => quantize::rim(
+                                            &stubbed,
+                                            canvas.width,
+                                            canvas.height,
+                                            map,
+                                            &rim,
+                                        )
+                                        .map_err(|e| e.to_string())
+                                        .and_then(|rimmed| {
+                                            let origin = [
+                                                canvas.origin[0] + rimmed.offset[0],
+                                                canvas.origin[1] + rimmed.offset[1],
+                                            ];
+                                            emit::placed_frame(
+                                                &rimmed.pixels,
+                                                rimmed.width,
+                                                rimmed.height,
+                                                origin,
+                                            )
+                                            .map_err(|e| e.to_string())
+                                        }),
+                                    });
+                                } else {
+                                    cut_stats.doors_grown += usize::from(cut.grown);
+                                }
                             }
                         }
-                        if strip.run.is_some() {
-                            strip_runs += 1;
+                        let frame = match (&door_frame, rim) {
+                            (Some(frame), _) => frame,
+                            (None, None) => sprite_frame.get_or_insert_with(|| {
+                                emit::placed_frame(
+                                    &indexed,
+                                    canvas.width,
+                                    canvas.height,
+                                    canvas.origin,
+                                )
+                                .map_err(|e| e.to_string())
+                            }),
+                            (None, Some(rim)) => outlined_frame.get_or_insert_with(|| {
+                                let rimmed =
+                                    quantize::rim(&indexed, canvas.width, canvas.height, map, &rim)
+                                        .map_err(|e| e.to_string())?;
+                                let origin = [
+                                    canvas.origin[0] + rimmed.offset[0],
+                                    canvas.origin[1] + rimmed.offset[1],
+                                ];
+                                emit::placed_frame(
+                                    &rimmed.pixels,
+                                    rimmed.width,
+                                    rimmed.height,
+                                    origin,
+                                )
+                                .map_err(|e| e.to_string())
+                            }),
+                        };
+                        if rim.is_some() && frame.is_ok() {
+                            outlined += 1;
+                            *outlined_kinds
+                                .entry(r.base_kind.clone().unwrap_or_else(|| "?".to_owned()))
+                                .or_insert(0) += 1;
                         }
-                        let blocking = strip.run.is_some() || blocks(strip.hex);
+                        let frame = match frame {
+                            Ok(frame) => frame,
+                            Err(e) => {
+                                skip(&mut skipped, r, SkipReason::Failed(format!("frame: {e}")));
+                                demote(&mut report, class.kind());
+                                continue;
+                            }
+                        };
+                        let Some(centre) = hex::center(h) else {
+                            continue;
+                        };
+                        let displacement = [
+                            ground[0] + i64::from(offset[0]) - centre[0],
+                            ground[1] + i64::from(offset[1]) - centre[1],
+                        ];
+                        let (Ok(dx), Ok(dy)) = (
+                            i32::try_from(displacement[0]),
+                            i32::try_from(displacement[1]),
+                        ) else {
+                            skip(&mut skipped, r, SkipReason::OutsideMap);
+                            demote(&mut report, class.kind());
+                            continue;
+                        };
+                        let category = role.category();
+                        let (art, new) = store.add(category, frame, &model, ClassKind::Sprite);
+                        if new {
+                            report.class_mut(ClassKind::Sprite).entries += 1;
+                        }
+                        store.note_reference(category, &model, ClassKind::Sprite);
                         placements.push(Placement {
                             art,
-                            hex: strip.hex,
-                            displacement: offset,
-                            role: Role::WallStrip,
+                            hex: h,
+                            displacement: [dx, dy],
+                            role: *role,
                             reference: r.form.to_string(),
-                            blocking,
-                            run: strip.run,
-                        });
-                        report.strips.placed += 1;
-                    }
-                    if !floor_pieces.is_empty() {
-                        store.note_reference(ArtCategory::Scenery, &model, ClassKind::Sliced);
-                    }
-                    for piece in &floor_pieces {
-                        let (art, _) = store.add(
-                            ArtCategory::Scenery,
-                            &piece.frame,
-                            &model,
-                            ClassKind::Sliced,
-                        );
-                        placements.push(Placement {
-                            art,
-                            hex: piece.hex,
-                            displacement: offset,
-                            role: Role::FloorPiece,
-                            reference: r.form.to_string(),
-                            blocking: false,
+                            blocking: role.blocking(),
                             run: None,
                         });
-                        report.strips.floor_pieces += 1;
+                        if config.furniture.as_ref().is_some_and(|f| f.footprints)
+                            && furniture_choice
+                                .get(&i)
+                                .is_some_and(|why| is_furniture(why))
+                            && let Some(polygon) = footprint_of(prepared, i)
+                        {
+                            footprints.insert(r.form.to_string(), polygon);
+                        }
+                        placed(i, &mut indoor, &mut floor_bake);
                     }
-                    placed(i, &mut indoor, &mut floor_bake);
+                    Class::Landmark => {
+                        // Its footprint blocks (see the `landmark` module),
+                        // except where the source lets an actor stand.
+                        let mut under = BTreeSet::new();
+                        if interior.is_some() {
+                            interior::blocked_by_walls(
+                                plane,
+                                mesh,
+                                &r.transform.matrix(),
+                                ground_z,
+                                config.step_height,
+                                BLOCK_REACH,
+                                &mut under,
+                            );
+                        } else {
+                            overlay::blocked_under(
+                                plane,
+                                sampler,
+                                mesh,
+                                &r.transform.matrix(),
+                                ground_z,
+                                config.step_height,
+                                &mut under,
+                            );
+                        }
+                        let input = landmark::Input {
+                            canvas: &canvas,
+                            indexed: &indexed,
+                            ground,
+                            offset,
+                            lift: r.transform.position[2] - ground_z,
+                            projection,
+                            under: &under,
+                            open: &config.open_hexes,
+                            walkable: config.landmark_walkers.as_ref(),
+                            step_height: config.step_height,
+                            crop_unreachable: false,
+                        };
+                        let limits = landmark::Limits::of(config);
+                        // A landmark with pieces beyond the engine's reach is
+                        // cut again without them, rather than flattened whole.
+                        let cut = match landmark::cut(&input, &limits) {
+                            Err(e)
+                                if config.landmark_crop_unreachable
+                                    && e.starts_with("no hex near") =>
+                            {
+                                landmark::cut(
+                                    &landmark::Input {
+                                        crop_unreachable: true,
+                                        ..input
+                                    },
+                                    &limits,
+                                )
+                                .map_err(|again| format!("{e}; cropped: {again}"))
+                            }
+                            other => other,
+                        };
+                        let cut = match cut {
+                            Ok(cut) => cut,
+                            Err(e) => {
+                                fall_back(i, format!("pieces: {e}"), &mut report, &mut relief);
+                                continue;
+                            }
+                        };
+                        if cut.stats.unreachable > 0 {
+                            report
+                                .landmarks
+                                .unreachable
+                                .push(crate::report::LandmarkCrop {
+                                    reference: r.form.to_string(),
+                                    model: model.clone(),
+                                    pixels: cut.stats.unreachable,
+                                    kept: cut.stats.reachable,
+                                });
+                        }
+                        if cut.strips.is_empty() {
+                            skip(&mut skipped, r, SkipReason::OutsideMap);
+                            demote(&mut report, class.kind());
+                            continue;
+                        }
+                        report.strips.dropped_pixels += cut.dropped;
+                        report.landmarks.add(&cut.stats);
+                        let mut under = cut.blocked;
+                        store.note_reference(ArtCategory::Scenery, &model, ClassKind::Landmark);
+                        for piece in &cut.strips {
+                            let (art, new) = store.add(
+                                ArtCategory::Scenery,
+                                &piece.frame,
+                                &model,
+                                ClassKind::Landmark,
+                            );
+                            if new {
+                                report.class_mut(ClassKind::Landmark).entries += 1;
+                            }
+                            let blocking = under.remove(&piece.hex);
+                            placements.push(Placement {
+                                art,
+                                hex: piece.hex,
+                                displacement: offset,
+                                role: Role::Scenery,
+                                reference: r.form.to_string(),
+                                blocking,
+                                run: None,
+                            });
+                            report.landmarks.pieces += 1;
+                        }
+                        blocked.extend(under);
+                        report.landmarks.references += 1;
+                        placed(i, &mut indoor, &mut floor_bake);
+                    }
+                    Class::Sliced => {
+                        let footprint = prepared
+                            .meshes
+                            .get(&key.mesh)
+                            .and_then(|m| m.as_ref().ok())
+                            .and_then(|(_, facts)| facts.bounds)
+                            .map(|b| Footprint::of(&r.transform, b));
+                        let polygon: Vec<[f64; 2]> = footprint
+                            .as_ref()
+                            .map(|f| f.polygon.as_slice())
+                            .unwrap_or_default()
+                            .iter()
+                            .map(|p| plane.tile_of_source(*p))
+                            .collect();
+                        // Furniture (the `furniture` module): its body blocks,
+                        // open hex or not.
+                        let furniture = config.furniture.as_ref().filter(|_| {
+                            furniture_choice
+                                .get(&i)
+                                .is_some_and(|why| is_furniture(why))
+                        });
+                        let body: BTreeSet<i32> = match furniture {
+                            Some(rule) => {
+                                let mut body = BTreeSet::new();
+                                crate::furniture::body_hexes(
+                                    plane,
+                                    mesh,
+                                    &r.transform.matrix(),
+                                    ground_z,
+                                    config.step_height,
+                                    rule.head_height,
+                                    rule.reach,
+                                    &mut body,
+                                );
+                                body
+                            }
+                            None => BTreeSet::new(),
+                        };
+                        let body_blocks = furniture.is_some_and(|f| f.block_open);
+                        let blocks = |h: i32| {
+                            (!config.open_hexes.contains(&h) || (body_blocks && body.contains(&h)))
+                                && plane.hex_tile(h).is_some_and(|c| {
+                                    distance_to_polygon(&polygon, c) <= BLOCK_REACH
+                                })
+                        };
+                        if let Some(rule) = furniture {
+                            // Its footprint, when its body fills its box.
+                            let inside: BTreeSet<i32> =
+                                plane.hexes_in(&polygon).into_iter().collect();
+                            let fill = if inside.is_empty() {
+                                if body.is_empty() { 0.0 } else { 1.0 }
+                            } else {
+                                inside.intersection(&body).count() as f64 / inside.len() as f64
+                            };
+                            if fill < rule.min_fill {
+                                furniture_choice.insert(i, "hollow");
+                            } else if rule.footprints
+                                && let Some(polygon) = footprint_of(prepared, i)
+                            {
+                                footprints.insert(r.form.to_string(), polygon);
+                            }
+                            if rule.block_open {
+                                open_blocked.extend(
+                                    body.iter()
+                                        .copied()
+                                        .filter(|h| config.open_hexes.contains(h)),
+                                );
+                                blocked.extend(body.iter().copied());
+                            }
+                            body_total.extend(body.iter().copied());
+                        }
+                        // Walking surfaces by an open hex leave the strips (see
+                        // the `floor` module). Indoors the floor is baked
+                        // instead, and higher surfaces stay with the object.
+                        let has_open = interior.is_none()
+                            && config.open_hexes.iter().any(|&h| {
+                                plane.hex_tile(h).is_some_and(|c| {
+                                    distance_to_polygon(&polygon, c) <= BLOCK_REACH
+                                })
+                            });
+                        let floors = if has_open {
+                            floor::pieces(
+                                renderer,
+                                projection,
+                                mesh,
+                                key.matrix(config),
+                                r.transform.position[2] - ground_z,
+                                textures,
+                                map,
+                                ground,
+                                &near_open,
+                                config,
+                            )
+                        } else {
+                            None
+                        };
+                        let without_floors = floors.as_ref().map(|floors| {
+                            let mut canvas = canvas.clone();
+                            let mut indexed = indexed.clone();
+                            floor::clear_from(&mut canvas, &mut indexed, &floors.canvas);
+                            (canvas, indexed)
+                        });
+                        let (strip_canvas, strip_indexed) = match &without_floors {
+                            Some((canvas, indexed)) => (canvas, indexed),
+                            None => (&canvas, &indexed),
+                        };
+                        let floor_pieces = floors.map(|f| f.pieces).unwrap_or_default();
+                        let options = strips::CutOptions {
+                            min_pixels: config.min_strip_pixels,
+                            merge_interior: config.merge_interior_runs,
+                            max_perimeter_run: config.max_perimeter_run,
+                            blocks: &blocks,
+                        };
+                        // The foreground cutaway crops the strips of walls that
+                        // hide walkers (the `cutaway` module).
+                        let trim = match (cutaway, &walkers) {
+                            (Some(settings), Some(walkers))
+                                if decision.is_some_and(|(_, d)| d.cutaway[i]) =>
+                            {
+                                Some(cutaway::Trim {
+                                    settings,
+                                    walkers,
+                                    walker_box: config.walker_box.map(i64::from),
+                                    offset,
+                                    // The kerb stands on the wall's own foot
+                                    // (a raised ring, a sunken pit), never
+                                    // below the floor band or the terrain.
+                                    lift: r.transform.position[2]
+                                        - footprint.as_ref().map_or(ground_z, |f| {
+                                            f.z[0].max(match interior {
+                                                Some(indoors) => ground_z + indoors.floor_band[0],
+                                                None => ground_z,
+                                            })
+                                        }),
+                                })
+                            }
+                            _ => None,
+                        };
+                        let mut trimmed = None;
+                        let cut = match &trim {
+                            None => strips::cut(
+                                strip_canvas,
+                                strip_indexed,
+                                ground,
+                                projection,
+                                &options,
+                            ),
+                            Some(t) => strips::cut_with(
+                                strip_canvas,
+                                strip_indexed,
+                                ground,
+                                projection,
+                                &options,
+                                &mut |owner| {
+                                    trimmed = Some(cutaway::trim(
+                                        strip_canvas,
+                                        owner,
+                                        ground,
+                                        projection,
+                                        t,
+                                    ));
+                                },
+                            ),
+                        };
+                        let emptied = trimmed.as_ref().is_some_and(|t| !t.emptied.is_empty());
+                        if let Some(t) = trimmed {
+                            cut_stats.strips_considered += t.considered;
+                            cut_stats.strips_cut += t.cut;
+                            cut_stats.pixels_removed += t.pixels_removed;
+                            cut_stats.strips_emptied += t.emptied.len();
+                            covered.0.extend(t.covered_before);
+                            covered.1.extend(t.covered_after);
+                            cut_hexes.extend(t.cut_hexes.iter().copied());
+                            // A strip cut to nothing still blocks its hex.
+                            blocked.extend(t.emptied.into_iter().filter(|&h| blocks(h)));
+                        }
+                        let cut = match cut {
+                            Ok(cut) => cut,
+                            Err(e) => {
+                                skip(&mut skipped, r, SkipReason::Failed(e));
+                                demote(&mut report, class.kind());
+                                continue;
+                            }
+                        };
+                        report.strips.dropped_pixels += cut.dropped;
+                        if cut.strips.is_empty() && floor_pieces.is_empty() && !emptied {
+                            if floor_index.is_some() {
+                                // Indoors, its walls are off the map but its
+                                // floor may not be.
+                                placed(i, &mut indoor, &mut floor_bake);
+                                if let Some(t) = &mut indoor {
+                                    t.floor_only += 1;
+                                }
+                            } else {
+                                skip(&mut skipped, r, SkipReason::OutsideMap);
+                                demote(&mut report, class.kind());
+                            }
+                            continue;
+                        }
+                        report.strips.merged_tiny += cut.merged_tiny;
+                        report.strips.folded += cut.folded;
+                        blocked.extend(cut.run_hexes.iter().copied());
+                        store.note_reference(ArtCategory::Walls, &model, ClassKind::Sliced);
+                        for strip in &cut.strips {
+                            let (art, new) = store.add(
+                                ArtCategory::Walls,
+                                &strip.frame,
+                                &model,
+                                ClassKind::Sliced,
+                            );
+                            if new {
+                                report.class_mut(ClassKind::Sliced).entries += 1;
+                                if strip.run.is_none() {
+                                    store
+                                        .single_sizes
+                                        .0
+                                        .push(u32::from(strip.frame.frame.width));
+                                    store
+                                        .single_sizes
+                                        .1
+                                        .push(u32::from(strip.frame.frame.height));
+                                }
+                            }
+                            if strip.run.is_some() {
+                                strip_runs += 1;
+                            }
+                            let blocking = strip.run.is_some() || blocks(strip.hex);
+                            placements.push(Placement {
+                                art,
+                                hex: strip.hex,
+                                displacement: offset,
+                                role: Role::WallStrip,
+                                reference: r.form.to_string(),
+                                blocking,
+                                run: strip.run,
+                            });
+                            report.strips.placed += 1;
+                        }
+                        if !floor_pieces.is_empty() {
+                            store.note_reference(ArtCategory::Scenery, &model, ClassKind::Sliced);
+                        }
+                        for piece in &floor_pieces {
+                            let (art, _) = store.add(
+                                ArtCategory::Scenery,
+                                &piece.frame,
+                                &model,
+                                ClassKind::Sliced,
+                            );
+                            placements.push(Placement {
+                                art,
+                                hex: piece.hex,
+                                displacement: offset,
+                                role: Role::FloorPiece,
+                                reference: r.form.to_string(),
+                                blocking: false,
+                                run: None,
+                            });
+                            report.strips.floor_pieces += 1;
+                        }
+                        placed(i, &mut indoor, &mut floor_bake);
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
     }
@@ -1618,9 +1976,74 @@ fn run_once(
         let mut stats = d.stats.clone();
         cut_stats.walkers_covered_before = covered.0.len();
         cut_stats.walkers_covered_after = covered.1.len();
+        cut_stats.door_walkers_before = door_covered.0.len();
+        cut_stats.door_walkers_after = door_covered.1.len();
         stats.cutaway = cut_stats;
         stats.outlined = outlined;
+        stats.outlined_kinds = outlined_kinds;
+        if let Some((references, triangles)) = roof_stats {
+            stats.roof_cut_references = references;
+            stats.roof_cut_triangles = triangles;
+        }
         report.declutter = Some(stats);
+    }
+    report.landmarks.unreachable.sort();
+    if config.furniture.is_some() {
+        // A footprint that would cut the open floor in two (a shelf's box
+        // across a narrow passage) is not given: the reachable floor must
+        // not fall apart.
+        let mut free: BTreeSet<i32> = config
+            .open_hexes
+            .iter()
+            .copied()
+            .filter(|h| !blocked.contains(h))
+            .collect();
+        for p in &placements {
+            if p.blocking {
+                free.remove(&p.hex);
+            }
+        }
+        let keys: Vec<String> = footprints.keys().cloned().collect();
+        for reference in keys {
+            let hexes = footprint_cover(plane, &footprints[&reference]);
+            let taken: BTreeSet<i32> = hexes.intersection(&free).copied().collect();
+            if taken.is_empty() {
+                continue;
+            }
+            let before = components(&free);
+            let after_free: BTreeSet<i32> = free.difference(&taken).copied().collect();
+            if components(&after_free) > before {
+                footprints.remove(&reference);
+                if let Some(i) = prepared
+                    .refs
+                    .iter()
+                    .position(|r| r.form.to_string() == reference)
+                {
+                    furniture_choice.insert(i, "keeps a passage open");
+                }
+            } else {
+                free = after_free;
+            }
+        }
+        let mut choices: Vec<crate::FurnitureChoice> = furniture_choice
+            .iter()
+            .map(|(&i, why)| {
+                let r = prepared.refs[i];
+                crate::FurnitureChoice {
+                    reference: r.form.to_string(),
+                    model: model_of(r),
+                    reason: (*why).to_owned(),
+                    footprint: footprints.contains_key(&r.form.to_string()),
+                }
+            })
+            .collect();
+        choices.sort();
+        report.furniture = Some(crate::FurnitureStats {
+            choices,
+            footprints: footprints.len(),
+            body_hexes: body_total.len(),
+            open_blocked: open_blocked.len(),
+        });
     }
     report.overlays = overlays.len();
     report.blocked_hexes = blocked.len();
@@ -1642,9 +2065,383 @@ fn run_once(
             blocked_hexes: blocked.into_iter().collect(),
             skipped,
             report,
+            footprints,
         },
         contributors,
     })
+}
+
+/// The facts of reference `i`'s mesh, when it was read.
+fn facts_of(prepared: &Prepared<'_>, i: usize) -> Option<MeshFacts> {
+    let r = prepared.refs[i];
+    match r.mesh.as_ref().map(|h| prepared.meshes.get(h)) {
+        Some(Some(Ok((_, facts)))) => Some(*facts),
+        _ => None,
+    }
+}
+
+/// The normalised model path of a reference.
+fn model_path(r: &Reference) -> String {
+    r.model
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .replace('/', "\\")
+}
+
+/// Whether a wire candidate's render loses its lattice to the alpha test:
+/// rendered with its materials' cutoffs, it keeps at most `max_kept` of the
+/// opaque pixels it has at the wire cutoff. Cached by render.
+struct WireTest<'a> {
+    renderer: &'a mut dyn Renderer,
+    verdicts: BTreeMap<RenderKey, bool>,
+}
+
+impl WireTest<'_> {
+    fn vanishes(
+        &mut self,
+        key: &RenderKey,
+        mesh: &StaticMesh,
+        textures: &dyn foundry_render::TextureSource,
+        projection: &Projection,
+        rule: &crate::WireRule,
+        config: &SlicerConfig,
+    ) -> bool {
+        if let Some(&v) = self.verdicts.get(key) {
+            return v;
+        }
+        let opaque = |renderer: &mut dyn Renderer, cutoff: Option<f32>| {
+            render::render_canonical_with(
+                renderer,
+                projection,
+                mesh,
+                key.matrix(config),
+                textures,
+                config.render_tile,
+                config.max_canvas_pixels,
+                render::Look {
+                    two_sided: false,
+                    alpha_cutoff: cutoff,
+                },
+            )
+            .ok()
+            .flatten()
+            .map_or(0, |c| {
+                (0..c.width as usize * c.height as usize)
+                    .filter(|&i| c.opaque(i))
+                    .count()
+            })
+        };
+        let wire = opaque(self.renderer, Some(rule.cutoff));
+        let plain = opaque(self.renderer, None);
+        let v = wire > 0 && (plain as f64) <= rule.max_kept * wire as f64;
+        self.verdicts.insert(key.clone(), v);
+        v
+    }
+}
+
+/// The wire rule's look bits for reference `i` ([`crate::WireRule`]).
+#[allow(clippy::too_many_arguments)]
+fn look_of(
+    prepared: &Prepared<'_>,
+    i: usize,
+    class: &Class,
+    config: &SlicerConfig,
+    textures: &dyn foundry_render::TextureSource,
+    projection: &Projection,
+    test: &mut WireTest<'_>,
+) -> u8 {
+    let Some(rule) = &config.wire else {
+        return 0;
+    };
+    let r = prepared.refs[i];
+    let model = model_path(r);
+    let mut look = 0;
+    let mesh = match r.mesh.as_ref().map(|h| prepared.meshes.get(h)) {
+        Some(Some(Ok((mesh, _)))) => Some(mesh),
+        _ => None,
+    };
+    if *class == Class::Sprite(Role::Scenery)
+        && let (Some(mesh), Some(key)) = (mesh, RenderKey::of(r, config))
+    {
+        let candidate =
+            crate::classify::masked_share(mesh).is_some_and(|share| share >= rule.min_masked_share);
+        if config.matches(&rule.exclude_patterns, &model).is_none()
+            && (config.matches(&rule.patterns, &model).is_some()
+                || (candidate && test.vanishes(&key, mesh, textures, projection, rule, config)))
+        {
+            look |= LOOK_WIRE;
+        }
+    }
+    if config.interior.is_none()
+        && matches!(class, Class::Sprite(_) | Class::Sliced | Class::Landmark)
+        && config.matches(&rule.two_sided_patterns, &model).is_some()
+    {
+        look |= LOOK_TWO_SIDED;
+    }
+    look
+}
+
+/// Per primitive and triangle of `mesh` placed by `matrix`, whether it is
+/// roof over walkable ground ([`crate::RoofCut`]): every corner more than
+/// `clearance` above the terrain, its ground outline within `reach` of a
+/// walker's hex centre.
+fn roof_mask(
+    plane: &Plane,
+    sampler: &GroundSampler,
+    mesh: &StaticMesh,
+    matrix: &[[f32; 4]; 3],
+    walkers: &BTreeSet<i32>,
+    rule: &crate::RoofCut,
+) -> Vec<Vec<bool>> {
+    let origin_ground = sampler
+        .height(matrix[0][3], matrix[1][3])
+        .unwrap_or(matrix[2][3]);
+    mesh.primitives
+        .iter()
+        .map(|primitive| {
+            if !primitive.is_well_formed() {
+                return Vec::new();
+            }
+            let placed: Vec<[f64; 3]> = primitive
+                .positions
+                .iter()
+                .map(|p| {
+                    [0, 1, 2].map(|r| {
+                        f64::from(
+                            matrix[r][0] * p[0]
+                                + matrix[r][1] * p[1]
+                                + matrix[r][2] * p[2]
+                                + matrix[r][3],
+                        )
+                    })
+                })
+                .collect();
+            primitive
+                .indices
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|triangle| {
+                    let corners = triangle.map(|i| placed[i as usize]);
+                    if corners.iter().flatten().any(|v| !v.is_finite()) {
+                        return false;
+                    }
+                    let high = corners.iter().all(|p| {
+                        let ground = sampler
+                            .height(p[0] as f32, p[1] as f32)
+                            .unwrap_or(origin_ground);
+                        p[2] - f64::from(ground) > f64::from(rule.clearance)
+                    });
+                    if !high {
+                        return false;
+                    }
+                    // Roofs, canopies and soffits face up or down and go
+                    // within `reach`; a wall beside the walker is not over
+                    // it, so steep triangles go only within `wall_reach`
+                    // (a fascia or a post right over the hex).
+                    let u = [0, 1, 2].map(|k| corners[1][k] - corners[0][k]);
+                    let v = [0, 1, 2].map(|k| corners[2][k] - corners[0][k]);
+                    let n = [
+                        u[1] * v[2] - u[2] * v[1],
+                        u[2] * v[0] - u[0] * v[2],
+                        u[0] * v[1] - u[1] * v[0],
+                    ];
+                    let length = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+                    let flat = length > 0.0 && (n[2] / length).abs() >= rule.min_tilt_cos;
+                    let reach = if flat { rule.reach } else { rule.wall_reach };
+                    let tile = corners.map(|p| plane.tile_of_source([p[0], p[1]]));
+                    let (mut lo, mut hi) = ([f64::MAX; 2], [f64::MIN; 2]);
+                    for p in &tile {
+                        for k in 0..2 {
+                            lo[k] = lo[k].min(p[k] - reach);
+                            hi[k] = hi[k].max(p[k] + reach);
+                        }
+                    }
+                    let around = [
+                        [lo[0], lo[1]],
+                        [hi[0], lo[1]],
+                        [hi[0], hi[1]],
+                        [lo[0], hi[1]],
+                    ];
+                    plane.hexes_in(&around).into_iter().any(|h| {
+                        walkers.contains(&h)
+                            && plane
+                                .hex_tile(h)
+                                .is_some_and(|c| distance_to_polygon(&tile, c) <= reach)
+                    })
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// `mesh` without the triangles `mask` marks.
+fn without_triangles(mesh: &StaticMesh, mask: &[Vec<bool>]) -> StaticMesh {
+    let primitives = mesh
+        .primitives
+        .iter()
+        .enumerate()
+        .filter_map(|(p, primitive)| {
+            let Some(m) = mask.get(p).filter(|m| !m.is_empty()) else {
+                return Some(primitive.clone());
+            };
+            let indices: Vec<u32> = primitive
+                .indices
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .enumerate()
+                .filter(|(t, _)| !m.get(*t).copied().unwrap_or(false))
+                .flat_map(|(_, tri)| tri.iter().copied())
+                .collect();
+            (!indices.is_empty()).then(|| nif::Primitive {
+                indices,
+                ..primitive.clone()
+            })
+        })
+        .collect();
+    StaticMesh {
+        primitives,
+        collision: mesh.collision.clone(),
+        skipped_blocks: mesh.skipped_blocks.clone(),
+    }
+}
+
+/// Furniture reasons that are furniture (the others say why not).
+const FURNITURE: [&str; 3] = ["scenery sprite", "container", "sliced"];
+
+fn is_furniture(why: &str) -> bool {
+    FURNITURE.contains(&why)
+}
+
+/// What the furniture rule makes of reference `i` (the `furniture`
+/// module): one of [`FURNITURE`], a reason it is not, or `None` when it is
+/// not considered at all (doors, items, ground art, landmarks).
+fn furniture_of(
+    prepared: &Prepared<'_>,
+    i: usize,
+    class: &Class,
+    rule: &crate::FurnitureRule,
+    config: &SlicerConfig,
+    sampler: &GroundSampler,
+    decision: Option<(&declutter::DeclutterProfile, &Decision)>,
+) -> Option<&'static str> {
+    let kind = match class {
+        Class::Sprite(Role::Scenery) => "scenery sprite",
+        Class::Sprite(Role::Container) => "container",
+        Class::Sliced => "sliced",
+        _ => return None,
+    };
+    let r = prepared.refs[i];
+    let model = model_path(r);
+    let facts = facts_of(prepared, i)?;
+    let bounds = facts.bounds?;
+    if !r.transform.is_finite() {
+        return None;
+    }
+    let f = Footprint::of(&r.transform, bounds);
+    let [x, y, z] = r.transform.position;
+    let floor = match &config.interior {
+        Some(indoors) => indoors.floor_z,
+        None => sampler.height(x, y).unwrap_or(z),
+    };
+    let why = if rule.exclude_refs.contains(&r.form.to_string())
+        || config.matches(&rule.exclude_patterns, &model).is_some()
+    {
+        "excluded"
+    } else if config
+        .door_kinds
+        .iter()
+        .any(|k| r.base_kind.as_deref() == Some(k.as_str()))
+    {
+        "door"
+    } else if f.z[0] - floor > rule.max_lift {
+        "raised"
+    } else if kind == "scenery sprite" && config.matches(&config.sprite_patterns, &model).is_some()
+    {
+        "vegetation"
+    } else if kind != "sliced" && f.width() <= 8.0 && f.longest_side() >= 20.0 {
+        "wall plate"
+    } else if (kind == "sliced" && decision.is_some_and(|(_, d)| d.cutaway[i]))
+        || config
+            .interior
+            .as_ref()
+            .is_some_and(|indoors| f.z[1] - indoors.floor_z >= indoors.cut_height - 16.0)
+        || f.height() > rule.max_height
+    {
+        // A wall, or a post or corner piece of one (often a sprite): its
+        // box would close the doorway beside it.
+        "structural"
+    } else if f.area > 0.0 && f.hexes(prepared.tile_units) > rule.max_hexes {
+        "too large"
+    } else {
+        kind
+    };
+    Some(why)
+}
+
+/// The hexes a footprint (source corners) covers as the map builder takes
+/// it: centre inside, or within 0.15 floor squares
+/// (`map_builder::furniture::FOOTPRINT_REACH`).
+fn footprint_cover(plane: &Plane, corners: &[[f32; 2]]) -> BTreeSet<i32> {
+    const REACH: f64 = 0.15;
+    let tile: Vec<[f64; 2]> = corners
+        .iter()
+        .map(|c| plane.tile_of_source([f64::from(c[0]), f64::from(c[1])]))
+        .collect();
+    let (mut lo, mut hi) = ([f64::MAX; 2], [f64::MIN; 2]);
+    for p in &tile {
+        for k in 0..2 {
+            lo[k] = lo[k].min(p[k] - REACH);
+            hi[k] = hi[k].max(p[k] + REACH);
+        }
+    }
+    let around = [
+        [lo[0], lo[1]],
+        [hi[0], lo[1]],
+        [hi[0], hi[1]],
+        [lo[0], hi[1]],
+    ];
+    plane
+        .hexes_in(&around)
+        .into_iter()
+        .filter(|&h| {
+            plane
+                .hex_tile(h)
+                .is_some_and(|c| distance_to_polygon(&tile, c) <= REACH)
+        })
+        .collect()
+}
+
+/// Connected components (six neighbours) of a set of hexes.
+fn components(hexes: &BTreeSet<i32>) -> usize {
+    let mut seen: BTreeSet<i32> = BTreeSet::new();
+    let mut count = 0;
+    for &start in hexes {
+        if !seen.insert(start) {
+            continue;
+        }
+        count += 1;
+        let mut stack = vec![start];
+        while let Some(h) = stack.pop() {
+            for n in hex::neighbours(h).into_iter().flatten() {
+                if hexes.contains(&n) && seen.insert(n) {
+                    stack.push(n);
+                }
+            }
+        }
+    }
+    count
+}
+
+/// Reference `i`'s placed footprint polygon, source `x, y`, as the builder
+/// takes it.
+fn footprint_of(prepared: &Prepared<'_>, i: usize) -> Option<Vec<[f32; 2]>> {
+    let r = prepared.refs[i];
+    let bounds = facts_of(prepared, i)?.bounds?;
+    let polygon = Footprint::of(&r.transform, bounds).polygon;
+    (polygon.len() >= 3).then(|| polygon.iter().map(|p| [p[0] as f32, p[1] as f32]).collect())
 }
 
 /// [`estimate`] over any [`Assets`].

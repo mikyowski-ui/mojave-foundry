@@ -11,3 +11,7 @@ x = [-2, 0]
 y = [-8, -6]
 interior_depth = 1
 map_center = [-2048.0, -26624.0]
+# Phase B: items and loot on, people drawn at the combat level (their
+# fights' animations and the weapon in hand). See docs/running.md.
+loot = true
+animations = "combat"

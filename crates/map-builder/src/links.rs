@@ -177,6 +177,15 @@ type DoorAt = (usize, usize, i32);
 fn elevation_for(plan: &MapPlan, point: [f32; 3]) -> Option<(usize, f32)> {
     plan.frame
         .hex_of_source(f64::from(point[0]), f64::from(point[1]))?;
+    // An exterior map of levels: the elevation whose surface the point is
+    // on.
+    if let Some(e) = plan
+        .level_geometry
+        .as_ref()
+        .and_then(|g| g.elevation_of(point))
+    {
+        return Some((e, 0.0));
+    }
     plan.elevations
         .iter()
         .enumerate()

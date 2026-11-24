@@ -129,6 +129,7 @@ fn elevation(scene: &Scene) -> ElevationInput<'_> {
         placements: &scene.placements,
         blocked_hexes: &scene.blocked,
         interior: scene.options.interior.clone(),
+        level: None,
     }
 }
 
@@ -687,6 +688,7 @@ fn tower_maps(t: &Tower) -> Vec<MapInput<'_>> {
                     placements: &t.placements[*f],
                     blocked_hexes: &[],
                     interior: Some(t.split.floors[*f].interior_build(&SplitOptions::default())),
+                    level: None,
                 })
                 .collect(),
             entrance_elevation: None,

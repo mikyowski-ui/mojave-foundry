@@ -3,13 +3,16 @@
 //! thin argument parser over these stages, so integration tests can run
 //! either.
 
+pub mod catalogue;
 pub mod config;
 pub mod critters;
 pub mod declutter;
 pub mod gallery;
+pub mod layer;
 pub mod map;
 pub mod pipeline;
 pub mod probe;
+pub mod rebalance;
 pub mod replay;
 pub mod route;
 pub mod sequence;

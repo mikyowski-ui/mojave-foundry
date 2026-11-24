@@ -6,7 +6,9 @@
 //! slices (or the built-in Goodsprings one), and places everyone.
 //!
 //! New Vegas slices are in `slices/`, Fallout 3 slices in `slices/fo3/`;
-//! each says (or its plugins imply) its own game.
+//! each says (or its plugins imply) its own game. Layer files
+//! (`*.layer.toml`) beside them resolve to slices of one game and
+//! worldspace with distinct map stems.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -28,7 +30,9 @@ fn read_dir(sub: &str, game: GameVariant) -> BTreeMap<String, SliceSpec> {
     let mut out = BTreeMap::new();
     for entry in std::fs::read_dir(&dir).expect("slices/ exists") {
         let path = entry.expect("an entry").path();
-        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+        if path.extension().and_then(|e| e.to_str()) != Some("toml")
+            || mojave_convert::layer::is_layer_file(&path.to_string_lossy())
+        {
             continue;
         }
         let text = std::fs::read_to_string(&path).expect("readable");
@@ -258,4 +262,63 @@ fn the_built_in_slices_are_per_game() {
     // The built-in Springvale is the checked-in file.
     let springvale = SliceSpec::preset("springvale").expect("built in");
     assert_eq!(springvale, read_fo3_slices()["springvale"]);
+}
+
+#[test]
+fn every_checked_in_layer_resolves() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../slices");
+    let mut found = BTreeMap::new();
+    for (sub, game) in [
+        ("", GameVariant::FalloutNewVegas),
+        ("fo3", GameVariant::Fallout3),
+    ] {
+        let dir = root.join(sub);
+        for entry in std::fs::read_dir(&dir).expect("slices/ exists") {
+            let path = entry.expect("an entry").path();
+            if !mojave_convert::layer::is_layer_file(&path.to_string_lossy()) {
+                continue;
+            }
+            let layer = mojave_convert::layer::LayerSpec::load(&path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let stem = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_suffix(".layer.toml"))
+                .expect("a layer file name");
+            assert_eq!(layer.name, stem, "{}", path.display());
+            for map in &layer.maps {
+                assert_eq!(map.slice.stated_game(), Some(game), "{stem}");
+                assert!(
+                    map.slice.loot == Some(true),
+                    "{stem}: loot on in every layer"
+                );
+            }
+            let stems: Vec<String> = layer.maps.iter().map(|m| m.slice.map_stem()).collect();
+            found.insert(stem.to_owned(), stems);
+        }
+    }
+    assert_eq!(
+        found,
+        BTreeMap::from([
+            (
+                "goodsprings-linked".to_owned(),
+                vec!["goodspri".to_owned(), "saloon".to_owned()]
+            ),
+            (
+                "megaton".to_owned(),
+                vec!["megaton", "moriarty", "crater", "clinic"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            ),
+            (
+                "springvale".to_owned(),
+                vec!["springva".to_owned(), "bandits".to_owned()]
+            ),
+            (
+                "super-duper-mart".to_owned(),
+                vec!["sdmart".to_owned(), "sdmartin".to_owned()]
+            ),
+        ])
+    );
 }

@@ -464,6 +464,37 @@ pub fn f2(dir: &Path) -> Result<(), String> {
     let palette = Palette::parse(&bytes).map_err(|e| format!("palette: {e}"))?;
     let mapped = (0..=255u8).filter(|i| palette.is_mapped(*i)).count();
     println!("color.pal: {} bytes, {mapped} mapped indices", bytes.len());
+    // The AI packets a converted critter may name (the loot wiring picks
+    // its hostile and friendly packets from these).
+    match archive.read("data/ai.txt") {
+        Ok(bytes) => match vault_formats::ai::Packets::parse_for(
+            &bytes,
+            vault_formats::GameProfile::Fallout2,
+        ) {
+            Ok(packets) => {
+                println!(
+                    "data/ai.txt: {} packets (number, name, min_hp, aggression, chance, \
+                     min_to_hit, max_dist)",
+                    packets.packets.len()
+                );
+                for p in &packets.packets {
+                    println!(
+                        "  {:>3} {:<28} min_hp {:>3} aggression {:>3} chance {:>3} to_hit {:>3} \
+                         dist {:>3}",
+                        p.packet_num,
+                        String::from_utf8_lossy(&p.name),
+                        p.min_hp,
+                        p.aggression,
+                        p.chance,
+                        p.min_to_hit,
+                        p.max_dist
+                    );
+                }
+            }
+            Err(e) => println!("data/ai.txt: does not parse: {e}"),
+        },
+        Err(e) => println!("data/ai.txt: {e}"),
+    }
     Ok(())
 }
 
@@ -474,24 +505,42 @@ pub fn f2(dir: &Path) -> Result<(), String> {
 /// engine's capped route search. For each hex in `from` (the points other
 /// maps' exits arrive at) it then reports what can be reached without
 /// stepping on an exit grid.
-pub fn walk(layer_dir: &Path, map: &str, hop: usize, from: &[i32]) -> Result<(), String> {
+pub fn walk(
+    layer_dir: &Path,
+    map: &str,
+    elevation: usize,
+    hop: usize,
+    from: &[i32],
+) -> Result<(), String> {
     use crate::route::{self, HEXES, WalkMap};
 
-    let walk_map = WalkMap::load(layer_dir, map)?;
+    let walk_map = WalkMap::load_elevation(layer_dir, map, elevation)?;
     let path = &walk_map.path;
     let blocked = &walk_map.blocked;
     let entry = walk_map.entry;
     let parent = walk_map.flood_from_entry();
     let reached = parent.iter().filter(|p| **p != -2).count();
     println!(
-        "{path}: {} objects on elevation 0, {} stop movement, {} hexes blocked",
+        "{path}: {} objects on elevation {elevation}, {} stop movement, {} hexes blocked",
         walk_map.objects,
         walk_map.blockers,
         blocked.iter().filter(|b| **b).count()
     );
-    println!("entry hex {entry}: {reached} hexes reachable");
+    if elevation == walk_map.entry_elevation {
+        println!("entry hex {entry}: {reached} hexes reachable");
+    } else {
+        println!(
+            "start hex {entry} (the first arrival of the map's stairs on elevation {elevation};              arrivals {:?}): {reached} hexes reachable",
+            walk_map.arrivals
+        );
+    }
     for exit in &walk_map.exits {
         let (hex, to, at) = (exit.hex, exit.to_map, exit.to_hex);
+        let at = if exit.to_elevation == 0 {
+            at.to_string()
+        } else {
+            format!("{at} elevation {}", exit.to_elevation)
+        };
         let route = route::path_to(&parent, hex);
         if route.is_empty() {
             println!("exit {hex} -> map {to} hex {at}: NOT reachable from the entry");

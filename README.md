@@ -13,7 +13,22 @@ it tells them apart by the master plugin the install holds.
 [`vault-engine`]: https://github.com/mikyowski-ui/vault-engine
 
 It is a proof of concept, not a game: towns, landmarks and rooms you can
-walk through, with the people who live there standing in them.
+walk through, with the people who live there standing in them. What it
+converts today:
+
+- **Fallout 3 first, New Vegas beside it**: Springvale, Megaton and the
+  Super-Duper Mart; Goodsprings, the Strip and other Mojave towns.
+- **Outdoor towns and indoor rooms** as Fallout 2 hex maps: ground tiles,
+  buildings sliced into walls that sort as you walk behind them, the
+  game's own walkable areas.
+- **Linked doors**: a town and the rooms its doors open on in one layer,
+  each door leading through to the other side and back.
+- **Floors above floors**: a store's upper level, a saloon's balcony, a
+  town of walkways over a crater, each its own Fallout 2 elevation with the
+  stairs and ramps between them.
+- **People, items and loot**: residents posed from the game's skeletons
+  and animations, raiders armed and hostile, containers filled, doors
+  locked, every item with a ground sprite and an inventory icon.
 
 ## Ground rules
 
@@ -31,7 +46,8 @@ The foundry runs as a line of stations. Each one reads what the last one
 wrote, and skips work whose inputs have not changed.
 
 1. **Extract.** Open the game's archives and plugin, and pull out one
-   slice of the world: a block of outdoor cells, or a single room. Meshes,
+   slice of the world: a block of outdoor cells, a single room, or a town
+   and its rooms together. Meshes,
    textures, placed objects, walkable areas and the people in them are
    written to a neutral intermediate format.
 2. **Render sprites.** Every prop, wall and building is rendered from its
@@ -44,7 +60,9 @@ wrote, and skips work whose inputs have not changed.
    into wall pieces that sort correctly as you walk behind them. The
    original walkable areas decide which hexes are open, and everything is
    fitted into Fallout 2's limits on art and map size. Indoors, floors are
-   baked from the room's own pieces and the ceiling is cut away.
+   baked from the room's own pieces and the ceiling is cut away. Upper
+   storeys and raised walkways become elevations of their own, and doors
+   and stairs become exit grids between maps and elevations.
 5. **Emit the layer.** Maps, art, prototypes and lists are written as a mod
    layer the engine loads on top of Fallout 2.
 6. **Prove it.** The layer is loaded in the engine with no window, walked

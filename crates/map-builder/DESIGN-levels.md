@@ -1,7 +1,9 @@
 # Levels: one layer, several maps, several elevations
 
 Status: **built**, 2026-11-23 (steps 0 to 6 of (g); step 7, the wiring in
-`mojave-convert`, is the lead's). Section 3 below is the as-built account:
+`mojave-convert`, is the lead's). Section 4 adds **exterior levels** (an
+exterior map of up to three elevations, Megaton) and the other builder
+fixes of the same evening; its wiring is the lead's too. Section 3 below is the as-built account:
 the public API, what the caller supplies, and every place the code departs
 from the plan in sections 1 and 2, which are kept as written (their
 `file:line` references are to the code before the refactor). References
@@ -652,3 +654,250 @@ number with a non-zero hex (asserted by the tests and by
 That reload is the path where autoplay once reported an `AuditMismatch`
 (handoff 9): autoplay over a linked layer, crossing stairs both ways, is
 the acceptance test.
+
+## 4. Exterior levels and the second pass of 2026-11-23
+
+### What was wrong
+
+Megaton (`MegatonWorld`) is a town of decks, catwalks and ramps over a
+crater floor. One flat level drops every navmesh triangle whose corners
+all stand more than `navmesh_max_height` (160) above the terrain (572 of
+its 1,568 triangles) and merges what is left: the town splits into
+islands, and the entrance goes to the largest component, which is the
+slope-only ground of the cells without a navmesh outside the wall. On
+this data "height above terrain" means little anyway: the land under two
+of the nine cells lies some 10,000 units below the walkways, and the
+heights of the rest climb continuously from 11,650 to 13,670.
+
+### The rule (`src/levels.rs`)
+
+Fallout 2 draws one elevation at a time and changes elevation only through
+exit grids. Two surfaces may share an elevation exactly when they never lie
+over one another (in plan, with more than a person's height between them);
+everything else about height can be flattened as the one-level map already
+flattens the terrain. So the split is by **overlap**, not by height bands
+or height above terrain:
+
+1. Triangles of the exterior cells, neighbours by shared edge position
+   (`storeys` rule), slope classes with hysteresis (`storeys::classify`).
+2. Regions: connected triangles of one class (floor: terrain, a deck, a
+   roof; connector: a ramp, stairs). No band split of floors: an exterior
+   floor follows its land.
+3. Overlap: every triangle rasterized onto the hexes whose centre it holds
+   (no tolerance, so a ramp beside the floor does not overlap it along the
+   edge), with its plane's height there. Regions conflict on 2 or more
+   common hexes with more than `clearance` (120) between them; the lower
+   is below. A region over itself is cut by height bands.
+4. Levels: the longest chain of regions below (0 when nothing walkable is
+   under it, so a platform over solid ground stays on the ground level);
+   then, largest first, a region moves to the level most of its
+   neighbours are on when every conflict stays ordered; a chain longer
+   than three goes to a conflict-free level (order aside), else one
+   reached by moving the regions in its way, else is unplaced and
+   reported.
+5. Transitions: every contact (shared corners) between neighbouring
+   triangles of different levels, grouped by region pair and distance
+   (210 units), is a `LevelLink`; its ends lie 35 units into each side, so
+   the grids stand on each elevation's last walkable hexes before the cut:
+   at the **head** of a ramp that has nothing under it (the ramp stays on
+   the ground level) or at its **foot** when it rises over other ground
+   (the ramp goes up with its deck). `LevelSplit::stair_links(map)` gives
+   them as `StairLink`s of the map with itself, which the layer turns into
+   paired exit grids exactly as for interior storeys (section 3, 13).
+
+Walkability of a level (`walk::verdicts` with `BuildOptions::level`, or
+`ElevationInput::level` in a layer): only the level's triangles, at any
+height (no "too high" filter), a covered hex walkable unless blocked (the
+terrain slope under a deck plays no part); a hex in a cell without a
+navmesh keeps the slope rule on level 0 and is `NoGround` above it;
+passages never open off-navmesh hexes above level 0.
+
+### API (`src/levels.rs`, `src/lib.rs`)
+
+- `LevelOptions` (`flat_max` 0.25, `steep_min` 0.45, `clearance` 120,
+  `min_conflict_hexes` 2, `tolerance` 24, `step_z` 40, `link_radius` 210,
+  `nudge` 35, `max_levels` 3); `split_levels(cells, &frame, &sampler,
+  &options) -> LevelSplit` (`frame` is `walk::Frame::new(&window,
+  projection)`; the sampler only reports heights above terrain).
+- `LevelSplit`: `regions` (`LevelRegion`: kind, level, chain, triangles,
+  area, z range, mean z, plan box, hexes, height above terrain, split),
+  `links` (`LevelLink`: label, regions, levels, points, contacts),
+  `levels` (`LevelSummary` per level), `conflicts`, `conflict_pairs`,
+  `needed_levels`, `unplaced`; `exterior_level(level) -> ExteriorLevel`,
+  `level_count()`, `stair_links(map)`, `level_of_point(p)` (the surface
+  under the point nearest in height, else within `NEAR_RADIUS` 160 in
+  plan: doors standing in their walls, critters, arrival points),
+  `reference_level(p)` (the highest surface at or below the point: where a
+  placed reference is drawn), `surface_height(level, x, y)`, `summary()`.
+- `ExteriorLevel { level, triangles: Arc<BTreeSet<(navmesh form, index)>> }`;
+  `ElevationInput::level` (layers; not with `interior`) and
+  `BuildOptions::level` (the walk functions; a map's must be `None` in a
+  layer, an input error otherwise; `build_map` moves it onto its one
+  elevation).
+- Critters of a map with levels go to the elevation whose surface their
+  reference stands on (`LevelGeometry`, the `level_of_point` rule over each
+  elevation's triangles; unknown references to the entrance elevation). A
+  door link arriving on such a map without a partner placement takes the
+  elevation of its arrival point the same way.
+
+### What the converter and the slicer must supply per elevation
+
+For an exterior slice built as levels (a `[levels]` key or a per-slice
+switch; the default stays one level and byte-identical):
+
+1. **Split once per map.** `split_levels(&window_exterior_cells, &frame,
+   &sampler, &LevelOptions::default())`; report `summary()`. With
+   `level_count() == 1` build as today.
+2. **One `ElevationInput` per level `k`** (`elevations[k]`, `level:
+   Some(split.exterior_level(k))`, `interior: None`), all sharing the map's
+   window, projection and `cells`:
+   - `sampler`: the worldspace sampler on every elevation (only level 0
+     reads its slope).
+   - **References per level**: each reference goes to
+     `split.reference_level(position).unwrap_or(0)` (the highest surface at
+     or below its origin). Doors: `split.level_of_point(position)` (a door
+     stands in its wall, beside its surface); a door's placement must be in
+     that elevation's `placements` only: its exit grids, stub return and
+     door links are then on that elevation by construction.
+   - `art`, `placements`, `blocked_hexes`: one `map-slicer` run per level
+     with that level's references only. Level 0 is today's exterior run
+     (terrain ground, relief, landmarks). On levels 1 and 2 there is no
+     terrain: references are anchored on the level's surface
+     (`split.surface_height(k, x, y)` under their origin, instead of the
+     terrain height of contracts 9 "Ground-relative height"), and the
+     deck meshes themselves are baked as floor (the slicer's floor bake of
+     interiors, cut at a height above the level's surface as an interior's
+     `cut_height` is above its floor) rather than sliced as walls.
+   - `SlicerConfig::open_hexes` of level `k`: `walk::standable_hexes(&frame,
+     &sampler, &cells, &BuildOptions { level: Some(split.exterior_level(k)),
+     ..options })`; `landmark_walkers` likewise from `walk::verdicts`.
+   - `ground`: level 0 is today's `build_ground` over the terrain. Levels 1
+     and 2: `build_ground_from(&MemoryLand::default(), ...)` with
+     `blank_without_land` and that level's floor bake as overlays (the
+     interior recipe of contracts 9.5); every `Ground::is_blank` square
+     becomes `BLANK_SQUARE`. An upper level has floor only under its decks.
+   - The art budget is the layer's (section 3): estimate every level and
+     split `available()` among them.
+3. **Stairs**: `LayerInput::stairs = split.stair_links(index of the map)`.
+4. **Entrance**: `BuildOptions::entrance_near` = the arrival point of the
+   teleport that leads into the worldspace (the gate door's partner in the
+   parent worldspace: its `TeleportDoc::position`, which is in this
+   worldspace's coordinates), else a slice key; `MapInput::entrance_elevation
+   = split.level_of_point([x, y, z])`, else 0.
+5. **Critters**: all of the map's; the builder assigns elevations.
+
+**How the levels look.** The engine shows only the elevation the player
+is on, so a walker on a catwalk does not see the crater floor below
+(blank, drawn black where level 1 has no deck), and a walker on the floor
+sees the decks above only if level 0's slicer run draws them (as it does
+today: with every reference on level 0 they stand over the floor as
+strips, cut by the see-through circle). Proposed: level 0 keeps drawing
+the references of the upper levels (the town reads from the ground, as on
+today's map); a later pass could put the decks in level 0's roof tiles,
+which the engine hides over the player. Transitions reload the map (section
+3, "Risk"): autoplay across the ramps both ways is the acceptance test.
+
+### Megaton, measured (`examples/levels.rs`, 2026-11-23)
+
+`cargo run --release -p map-builder --example levels -- out/fo3/megaton/mir
+megatonworld -9048 -19624 -3055,-22100` (the window of the slice; the
+entrance point is inside the gate, by the gate door `003b2c`):
+
+| | level 0 | level 1 | level 2 |
+|---|---|---|---|
+| regions | 65 | 21 | 7 |
+| triangles | 1,111 | 341 | 116 |
+| area (units²) | 14,952,459 | 4,714,986 | 1,951,936 |
+| hexes (centre inside; walkable with the 24-unit tolerance) | 3,031 (3,536) | 954 (1,184) | 396 (496) |
+| z range | 11,652 to 13,669 | 11,683 to 13,674 | 11,802 to 13,038 |
+| teleport doors (`level_of_point`) | 13: Moriarty's front, Water Processing, Jericho, Brass Lantern, Burke, Armory, Clinic, Common House, Lucas Simms (both), Player House, the two gate doors | 5: Craterside Supply, Men's Restroom, Lucy West, Billy Creel, Moriarty's second | 3: Nathan and Manya, Women's Restroom, Children of Atom |
+
+- 93 regions (467 of 1,568 triangles are connectors), 38 overlapping
+  pairs; the longest chain is 3, so **Megaton fits three elevations**
+  with no region unplaced. With 1-hex conflicts it asks for four and one
+  deck of 60 hexes (z 12,561 to 12,617, three surfaces under it) is left
+  unplaced; clearance 80 or 200 also gives three.
+- 33 transitions: 20 between levels 0 and 1, 11 between 0 and 2, 2
+  between 1 and 2; most have 1 to 3 contact points (narrow ramp heads).
+- Reach with nothing blocked, through the transitions, from the gate:
+  level 0 all 3,536 navmesh hexes, level 1 1,134 of 1,184, level 2 all
+  496: **99.0 % of the 5,216 navmesh hexes**. The 6,644 slope-only hexes
+  of the cells without a navmesh outside the wall stay walkable and
+  unreachable, so of every walkable hex 43.6 % (today 37.6 %, all of it
+  outside the wall). Once the slicer blocks its strips and passages
+  rejoin the islands, expect most of the navmesh share to hold; to be
+  measured on the written layer with `probe walk`.
+
+### The other fixes
+
+- **Entrance target** (`BuildOptions::entrance_near`, default `None`):
+  `plan::reconnect` and `plan::entrance` (crate notes "Entrance").
+- **Coverage rule** (`BuildOptions::navmesh_coverage`, `walk::NavmeshCoverage`
+  `Tolerance` (default) / `Centre` / `Share(f)`, the hex's own screen
+  pixels sampled every 4 pixels; `examples/coverage.rs`). Measured with
+  each written map's blockers:
+
+  | | tolerance (default) | centre inside | share 0.25 | share 0.5 | share 0.75 |
+  |---|---|---|---|---|---|
+  | Prospector Saloon, hexes covered | 244 | 181 | 217 | 185 | 144 |
+  | reachable from the entrance | 197 | 153 | 176 | 158 | 119 |
+  | doors with a reachable doorstep (of 6) | 6 | 5 | 5 | 5 | 3 |
+  | Super-Duper Mart, hexes covered | 2,996 | 2,585 | 2,886 | 2,621 | 2,330 |
+  | reachable | 2,751 | 2,427 | 2,675 | 2,454 | 2,130 |
+  | doors (of 21) | 21 | 21 | 21 | 21 | 9 |
+  | Moriarty's Saloon, hexes covered | 155 | 112 | 140 | 117 | 92 |
+  | reachable | 110 | 86 | 105 | 90 | 41 |
+  | doors (of 3) | 3 | 3 | 3 | 3 | 1 |
+
+  Every rule keeps each room one navmesh component up to 0.5; at 0.75
+  aisles and doorways break. The saloon door on hex 18091 loses its
+  doorstep under every stricter rule (its doorway is covered only within
+  the tolerance); the builder then finds a doorstep further out
+  (`door_reach`) when it converts the door. Recommended for interiors with
+  the slicer's footprints: `Share(0.5)`. These counts use the blockers the
+  tolerance rule's run wrote; a rerun with the slicer's own open hexes will
+  differ.
+- **Footprints** confirmed: `tests/loot.rs` asserts that no footprint hex
+  is walkable, holds the entrance, a critter, an arrival, a link's
+  destination or a passage.
+- **Readability** (`cover::Cover::shares`, `SightRule`,
+  `BuildOptions::readability_sight` and `entrance_sight`, both
+  `AnyPixel` by default: the golden report digests pin the old counts).
+  The any-pixel rule counts a few pixels as covering: on the people's
+  hexes of the readable saloon, 1 to 6 % of the box under stool and table
+  tops one to four rows south, over the figure's feet and legs (box rows
+  46 to 71 of 72). In `out/interiors/saloon-readable/shots/saloon-00-classic.png`
+  seven of the eight people stand on hexes it calls `Covered` and all of
+  them are in plain view (the eighth, the player, is `Behind`); the share
+  rule calls six of them clear and one covered (the Settler at the bar, 26
+  %, on the frame's left edge, which the frame cannot confirm). With
+  `SightRule::VISIBLE` (covered = more than a quarter of the 32 x 72 box
+  under art drawn after the figure; art behind never hides), on the
+  walkable hexes of the written maps (`examples/sight.rs`): Prospector
+  Saloon 68.5 % covered (plain) and 40.7 % (readable), against 97.6 and
+  94.3 % by any pixel; Super-Duper Mart 54.7 and 36.4 % (any pixel
+  71.8 % readable); Moriarty's 52.7 and 40.9 % (85.3 %). The slicer's
+  floor metric says 29.7, 27.9 and 37.1 % hidden after declutter: same
+  direction, the box being larger than a figure. As an entrance rule it
+  moves one golden scene's entrance (`saloon-clamped`, hex 20698 to
+  20700; `tests/sight_rules.rs`).
+- **Linked interiors**: `BuildReport::interior_summary` says "interior map
+  ... one of N maps in the layer" instead of "one map, no exits" when the
+  layer holds more than its map, and lists doors not linked;
+  `BuiltMap::interior_summary` adds `BuiltMap::link_lines`.
+- **Critter components**: `ComponentReport::critter_reach`,
+  `stranded_critters`, `BuildReport::critters_summary`; interior summary
+  lines name each critter's component and whether the entrance reaches
+  it.
+- **`map-terrain` tone**: `TerrainOptions::tone: Option<foundry_render::Tone>`
+  (default `None`; `IDENTITY` changes no byte), on the land colour before
+  the overlays, which the slicer tones itself.
+
+### Not done
+
+- The converter wiring of levels (the per-level slicer runs, references
+  per level, surface-anchored slicing above level 0, the budget split).
+- Upper-level decks in level 0's roof tiles.
+- An option to drop slope-only hexes of cells without a navmesh when the
+  window has a navmesh elsewhere (Megaton's unreachable outside ground).
+- A doorstep exemption for the stricter coverage rules.

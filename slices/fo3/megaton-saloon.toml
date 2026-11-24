@@ -16,3 +16,12 @@ interior_depth = 1
 interior = "MegatonMoriartysSaloon"
 place_disabled = true
 cut_height = 120.0
+# Phase B: items and loot on, people drawn at the combat level (their
+# fights' animations and the weapon in hand). See docs/running.md.
+loot = true
+animations = "combat"
+# No furniture footprints here: with them the bar and the tables close the
+# passage to the back (63 of 95 hexes reachable, 110 of 110 without).
+
+[declutter]
+profile = "readable"

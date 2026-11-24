@@ -119,7 +119,11 @@
 //! Recomposing the pieces at their anchors reproduces the render exactly.
 //! A landmark that cannot be rendered (over `max_canvas_pixels`, a piece
 //! beyond the FRM limits, a render error) is baked as relief instead and
-//! listed in [`LandmarkStats::fallbacks`].
+//! listed in [`LandmarkStats::fallbacks`]. One with pixels no hex lies near
+//! enough to anchor (a wall towering far above the map's north edge) is
+//! placed without them instead ([`SlicerConfig::landmark_crop_unreachable`],
+//! [`LandmarkStats::unreachable`]); if nothing is left, it is skipped as
+//! outside the map.
 //!
 //! # Interiors
 //!
@@ -143,6 +147,15 @@
 //! carries [`DeclutterStats`] with the open-floor ratio before and after.
 //! The `declutter` module has the rules. Off (the default), nothing
 //! changes.
+//!
+//! # Furniture, wire props
+//!
+//! [`SlicerConfig::furniture`] ([`FurnitureRule`], the `furniture` module)
+//! gives the map builder a footprint per piece of furniture
+//! ([`Sliced::footprints`]) and lets a sliced table's or counter's body
+//! block its hexes over open hexes. [`SlicerConfig::wire`] ([`WireRule`])
+//! draws wire and lattice props (shopping carts) solid, or drops them.
+//! Both off by default.
 //!
 //! # Budget
 //!
@@ -175,6 +188,8 @@
 //! classifies and counts footprints without rendering, as a fast
 //! pre-check; it does not climb the ladder.
 
+use std::collections::BTreeMap;
+
 mod classify;
 mod config;
 mod cutaway;
@@ -182,6 +197,7 @@ mod declutter;
 pub mod engine_view;
 mod error;
 mod floor;
+mod furniture;
 mod hex;
 mod interior;
 mod landmark;
@@ -195,19 +211,20 @@ mod strips;
 #[cfg(test)]
 mod tests;
 
-pub use classify::{Class, ClassKind, Footprint, MeshFacts, SkipReason, classify};
-pub use config::{Budget, BudgetLadder, SlicerConfig};
+pub use classify::{Class, ClassKind, Footprint, MeshFacts, SkipReason, classify, masked_share};
+pub use config::{Budget, BudgetLadder, SlicerConfig, WireRule};
 pub use declutter::{
-    ClutterRules, Cutaway, DecalMode, DeclutterProfile, DensityRule, OverhangRule, Protection,
-    ShellCut, WalkerCover, floor_stats, walker_cover,
+    ClutterRules, Cutaway, DecalMode, DeclutterProfile, DensityRule, DoorStub, OverhangRule,
+    Protection, RoofCut, ShellCut, WalkerCover, floor_stats, walker_cover,
 };
 pub use error::SliceError;
+pub use furniture::{FurnitureChoice, FurnitureRule, FurnitureStats};
 pub use interior::InteriorSlice;
 pub use render::{Assets, MirAssets};
 pub use report::{
     BudgetReport, CategoryUse, ClassCount, Contributor, CutawayStats, DeclutterStats, FloorStats,
-    InteriorStats, KindTally, LadderKind, LadderStep, LandmarkFallback, LandmarkStats, Spread,
-    StripStats,
+    InteriorStats, KindTally, LadderKind, LadderStep, LandmarkCrop, LandmarkFallback,
+    LandmarkStats, Spread, StripStats,
 };
 pub use slice::{estimate, estimate_with, slice_statics, slice_with};
 
@@ -332,4 +349,10 @@ pub struct Sliced {
     /// Sorted by reference.
     pub skipped: Vec<Skipped>,
     pub report: BudgetReport,
+    /// With [`SlicerConfig::furniture`] (and its `footprints`): the placed
+    /// bounding footprint of each piece of furniture, by form key, as
+    /// `map_builder::BuildOptions::footprints` takes it: the corners
+    /// `[x east, y north]` (source units) of [`Footprint::of`]`(transform,
+    /// bounds).polygon`, counter-clockwise. Empty otherwise.
+    pub footprints: BTreeMap<String, Vec<[f32; 2]>>,
 }
