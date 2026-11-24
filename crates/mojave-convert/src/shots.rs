@@ -424,11 +424,30 @@ fn inside_margin(hex: i32) -> bool {
     })
 }
 
+/// Warnings for explicit viewpoints (`--at`) that are exit grids: the walk
+/// is honoured and steps onto the grid, so the shot is taken after the
+/// transition, on the other map or elevation.
+pub fn at_warnings(at: &[i32], map: &WalkMap) -> Vec<String> {
+    at.iter()
+        .filter_map(|hex| {
+            let exit = map.exits.iter().find(|e| e.hex == *hex)?;
+            Some(format!(
+                "--at {hex} is an exit grid (to map {} elevation {}, hex {}): the walk steps \
+                 onto it, so the shot is taken after the transition",
+                exit.to_map, exit.to_elevation, exit.to_hex
+            ))
+        })
+        .collect()
+}
+
 /// The viewpoints of a run: the entry; each `at` hex in order; then, while
 /// fewer than `auto` have been picked in all, the hexes reachable nearest
 /// the largest features (largest first), each at least `spread` hex steps
 /// from every viewpoint already picked ([`PERSON_SPREAD`] for a person).
-/// Features whose viewpoint lies
+/// An automatic viewpoint is never an exit grid, and keeps
+/// [`route::GRID_CLEARANCE`] steps from the grids where it can
+/// ([`WalkMap::route_to_clear`]); an explicit one is honoured as given
+/// ([`at_warnings`]). Features whose viewpoint lies
 /// within [`EDGE_MARGIN`] of the border are taken only when the others run
 /// out, and a model already picked only when every other model has been
 /// tried.
@@ -460,7 +479,7 @@ pub fn pick_viewpoints(
     let routes: Vec<(&Feature, Route)> = features
         .iter()
         .filter(|f| tried.insert(f.hex))
-        .filter_map(|f| map.route_to(f.hex).map(|route| (f, route)))
+        .filter_map(|f| map.route_to_clear(f.hex).map(|route| (f, route)))
         .collect();
     let inner = routes.iter().filter(|(_, r)| inside_margin(r.destination));
     let outer = routes.iter().filter(|(_, r)| !inside_margin(r.destination));
@@ -774,6 +793,9 @@ pub fn shots(options: &ShotsOptions) -> Result<ShotsSummary, ConvertError> {
     } else {
         DEFAULT_SPREAD
     });
+    for warning in at_warnings(&options.at, &walk_map) {
+        eprintln!("shots: warning: {warning}");
+    }
     let viewpoints = pick_viewpoints(&walk_map, &features, &options.at, options.auto, spread);
     let wide_zoom = options.wide_zoom.unwrap_or(if interior {
         INTERIOR_WIDE_ZOOM
@@ -1333,6 +1355,60 @@ mod tests {
         let picked = pick_viewpoints(&map, &features, &[entry + 5], 0, 30);
         let labels: Vec<String> = picked.iter().map(|v| v.label.clone()).collect();
         assert_eq!(labels, ["entry".to_owned(), format!("at {}", entry + 5)]);
+    }
+
+    #[test]
+    fn automatic_viewpoints_avoid_exit_grids_and_explicit_ones_warn() {
+        let entry = 100 + 200 * 100;
+        let mut map = open_map(entry);
+        // A stair's grids at (140, 100) and its neighbour, where a feature
+        // stands, and a second feature one step from them.
+        let stairs = 140 + 200 * 100;
+        for hex in [stairs, stairs + 1] {
+            map.exits.push(route::Exit {
+                hex,
+                to_map: 152,
+                to_hex: 5000,
+                to_elevation: 1,
+            });
+        }
+        let features = vec![
+            feature(stairs, "architecture\\stairs01.nif"),
+            feature(stairs + 2, "beside.nif"),
+        ];
+        let picked = pick_viewpoints(&map, &features, &[], 3, 1);
+        assert_eq!(picked.len(), 3);
+        let grids: Vec<i32> = map.exits.iter().map(|e| e.hex).collect();
+        for v in &picked {
+            for g in &grids {
+                assert_ne!(v.route.destination, *g, "{}", v.label);
+                assert!(!v.route.path[1..].contains(g), "{}", v.label);
+            }
+        }
+        for v in &picked[1..] {
+            for g in &grids {
+                assert!(
+                    HexGrid::lattice_distance(v.route.destination, *g).unwrap()
+                        >= route::GRID_CLEARANCE,
+                    "{} ends on {}",
+                    v.label,
+                    v.route.destination
+                );
+            }
+        }
+        // Explicitly asked for, the grid is honoured, with a warning.
+        let picked = pick_viewpoints(&map, &features, &[stairs], 0, 30);
+        assert_eq!(picked[1].route.destination, stairs);
+        let warnings = at_warnings(&[stairs, entry + 5], &map);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains(&format!("--at {stairs} is an exit grid")));
+        // The hops toward a viewpoint beside a grid still never cross one.
+        let exits = grids.clone();
+        for v in pick_viewpoints(&map, &features, &[], 3, 1) {
+            for hop in route_hops(&v.route, 15, &exits, hop_ticks) {
+                assert!(!exits.contains(&hop.hex), "{}", v.label);
+            }
+        }
     }
 
     #[test]

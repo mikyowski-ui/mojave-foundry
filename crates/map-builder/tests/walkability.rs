@@ -161,3 +161,114 @@ fn the_slope_limit_and_blocked_hexes() {
     assert!(walkable.iter().all(|w| !w));
     assert_eq!(stats.rejected_no_ground, HEXES - stats.rejected_navmesh);
 }
+
+#[test]
+fn navmesh_only_closes_the_cells_without_a_navmesh() {
+    let projection = projection();
+    let window = window(&projection);
+    let frame = frame(&window, &projection);
+    let sampler = sampler(&window, flat);
+    let mut cell = exterior_cell(0, 0);
+    cell.navmeshes.push(navmesh(
+        0x2000,
+        &rectangle(1000.0, 1000.0, 3000.0, 3000.0),
+        100.0,
+    ));
+    let cells = vec![cell];
+    let blocked = vec![false; HEXES];
+    let inside = frame.hex_of_source(2000.0, 2000.0).unwrap();
+    let elsewhere = frame.hex_of_source(-2000.0, 5000.0).unwrap();
+    let (plain, _) = grid(&cells, &sampler, &frame, &blocked, &BuildOptions::default());
+    assert!(plain[inside as usize] && plain[elsewhere as usize]);
+    let only = BuildOptions {
+        navmesh_only: true,
+        ..BuildOptions::default()
+    };
+    let (closed, stats) = grid(&cells, &sampler, &frame, &blocked, &only);
+    assert!(closed[inside as usize]);
+    assert!(!closed[elsewhere as usize], "slope alone no longer walks");
+    assert_eq!(stats.slope_only, 0);
+    // A window with no navmesh at all keeps the slope rule.
+    let bare = vec![exterior_cell(0, 0)];
+    let (slope, _) = grid(&bare, &sampler, &frame, &blocked, &only);
+    assert!(slope[elsewhere as usize]);
+}
+
+#[test]
+fn coverage_bridges_join_what_a_strict_rule_cuts_apart() {
+    use map_builder::walk::{self, NavmeshCoverage, Verdict};
+    let projection = projection();
+    let window = window(&projection);
+    let frame = frame(&window, &projection);
+    let sampler = sampler(&window, flat);
+    // Two rooms joined by a corridor 40 units wide: no hex has half its
+    // ground on it, but the tolerance rule covers its hexes.
+    let mut triangles = Vec::new();
+    triangles.extend(rectangle(1000.0, 1000.0, 1800.0, 1800.0));
+    triangles.extend(rectangle(1800.0, 1380.0, 2600.0, 1420.0));
+    triangles.extend(rectangle(2600.0, 1000.0, 3400.0, 1800.0));
+    let mut cell = exterior_cell(0, 0);
+    cell.navmeshes.push(navmesh(0x2000, &triangles, 100.0));
+    let cells = vec![cell];
+    let blocked = vec![false; HEXES];
+    let strict = BuildOptions {
+        navmesh_coverage: NavmeshCoverage::Share(0.5),
+        ..BuildOptions::default()
+    };
+    let west = frame.hex_of_source(1400.0, 1400.0).unwrap();
+    let east = frame.hex_of_source(3000.0, 1400.0).unwrap();
+    let parts = |v: &[Verdict]| {
+        let comps = map_builder::islands::components(|h| {
+            v[h as usize] == Verdict::Walkable
+                && frame.hex_centre_tile(h).is_some_and(|c| {
+                    let [x, _] = frame.source_of_tile(c);
+                    (900.0..3500.0).contains(&x)
+                })
+        });
+        (comps.of(west), comps.of(east))
+    };
+    let (mut verdicts, _) = walk::verdicts(&frame, &sampler, &cells, &blocked, &strict);
+    let (a, b) = parts(&verdicts);
+    assert!(
+        a.is_some() && b.is_some() && a != b,
+        "cut apart: {a:?} {b:?}"
+    );
+    let added = walk::bridge_coverage(
+        &frame,
+        &sampler,
+        &cells,
+        &blocked,
+        &strict,
+        &mut verdicts,
+        walk::BRIDGE_MAX_LENGTH,
+    );
+    assert!(!added.is_empty() && added.len() <= walk::BRIDGE_MAX_LENGTH);
+    let (a, b) = parts(&verdicts);
+    assert!(a.is_some() && a == b, "joined");
+    // Deterministic, and nothing under the tolerance rule itself.
+    let (mut again, _) = walk::verdicts(&frame, &sampler, &cells, &blocked, &strict);
+    let added_again = walk::bridge_coverage(
+        &frame,
+        &sampler,
+        &cells,
+        &blocked,
+        &strict,
+        &mut again,
+        walk::BRIDGE_MAX_LENGTH,
+    );
+    assert_eq!(added, added_again);
+    let (mut loose, _) =
+        walk::verdicts(&frame, &sampler, &cells, &blocked, &BuildOptions::default());
+    assert!(
+        walk::bridge_coverage(
+            &frame,
+            &sampler,
+            &cells,
+            &blocked,
+            &BuildOptions::default(),
+            &mut loose,
+            8
+        )
+        .is_empty()
+    );
+}

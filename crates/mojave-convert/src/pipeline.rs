@@ -37,11 +37,23 @@ pub struct AllSummary {
 pub fn all(inputs: &Inputs) -> Result<AllSummary, ConvertError> {
     // An interior slice without --standalone stops before extract.
     inputs.check_mode()?;
-    let extract = extract(inputs)?;
-    let sprites = crate::sprites::sprites(inputs)?;
-    let critters = crate::critters::critters(inputs)?;
+    let extract = {
+        let _t = crate::timings::span("extract");
+        extract(inputs)?
+    };
+    let sprites = {
+        let _t = crate::timings::span("sprites");
+        crate::sprites::sprites(inputs)?
+    };
+    let critters = {
+        let _t = crate::timings::span("critters");
+        crate::critters::critters(inputs)?
+    };
     let map = crate::map::map(inputs)?;
-    let gallery = crate::gallery::gallery(inputs, "")?;
+    let gallery = {
+        let _t = crate::timings::span("gallery");
+        crate::gallery::gallery(inputs, "")?
+    };
     Ok(AllSummary {
         extract,
         sprites,

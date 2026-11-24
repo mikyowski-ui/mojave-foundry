@@ -252,7 +252,14 @@ fn prepare<'r>(
             && let (Some(_), Some(hash)) = (&r.model, &r.mesh)
         {
             let slot = meshes.entry(hash.clone()).or_insert_with(|| {
-                assets.mesh(hash).map(|mesh| {
+                assets.mesh(hash).map(|mut mesh| {
+                    if config.skip_blend_shapes {
+                        mesh.primitives
+                            .retain(|p| !crate::config::blends_onto_scene(&p.material));
+                    }
+                    if config.skip_flat_fills {
+                        mesh.primitives.retain(|p| !crate::config::fills_flat(p));
+                    }
                     let facts = MeshFacts::of(&mesh);
                     (mesh, facts)
                 })

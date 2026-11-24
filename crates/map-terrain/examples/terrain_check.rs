@@ -11,7 +11,7 @@
 //! - `TERRAIN_WORLDSPACE` (default `WastelandNV`);
 //! - `TERRAIN_CENTER` as `x,y` source units (default `-71680,2048`);
 //! - `TERRAIN_CAP` (2000), `TERRAIN_REPEAT` (512), `TERRAIN_JOBS` (4),
-//!   `TERRAIN_RELIEF` (1), `TERRAIN_DITHER` (default strength),
+//!   `TERRAIN_RELIEF` (1), `TERRAIN_VERTEX_FLOOR` (0), `TERRAIN_DITHER` (default strength),
 //!   `TERRAIN_SNAP` (`true`: snap the repeat to whole squares),
 //!   `TERRAIN_SEAM` (1, the seam weight);
 //!   `TERRAIN_LOD` (0, the texture LOD bias; the map stage uses -1),
@@ -501,6 +501,7 @@ fn run() -> Result<(), String> {
         snap_repeat_to_tiles: parse("TERRAIN_SNAP", true)?,
         seam_weight: parse("TERRAIN_SEAM", 1.0)?,
         relief: parse("TERRAIN_RELIEF", 1.0)?,
+        vertex_color_floor: parse("TERRAIN_VERTEX_FLOOR", 0.0)?,
         dither_strength: parse("TERRAIN_DITHER", quantize::Dither::DEFAULT_STRENGTH)?,
         texture_lod_bias: parse("TERRAIN_LOD", 0.0)?,
         cluster_iterations: parse("TERRAIN_ITERATIONS", 8)?,

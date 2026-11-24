@@ -1166,3 +1166,103 @@ Megaton past the engine's audit; Craterside's and the clinic's interiors
 in pictures; a full build with `--with-interiors` (on Springvale its
 `estimate` finds the school, three storeys, as `spring02` and the bandit
 house as `zspringv`, and splits the budget; no map was built that way).
+
+## 12. Pass 1.5 (stabilization)
+
+What is known so far; written 2026-11-24 while the pass is still open.
+Figures below are from the lead's runs of the Phase B layers and were not
+re-measured when this section was written.
+
+**Gate.** `scripts/gate.sh` is the local gate (format, clippy
+`-D warnings`, tests, the clean-room brief linter, then byte-identity of the
+Goodsprings and Prospector Saloon conversions against local baselines); see
+the "Gate" section of `docs/running.md` for its inputs, variables and the
+`--fast` and `briefs` modes.
+
+**Reach fixes.** The islands of section 11's layer table are now diagnosed
+(`map_builder::reach`, `ElevationReport::islands`, `reached`, `closed`), and
+the pass added four tools against them: storeys walk their own floors'
+triangles (`InteriorBuild::triangles`) instead of the height band;
+`navmesh_only` makes the ground outside Megaton's wall not walkable;
+`coverage_bridges` joins what a strict coverage rule cuts out of one floor;
+and `close_unreached` closes what no walk from the start map's entrance
+reaches. The numbers below came with them.
+
+| Elevation | Before | After |
+|---|---|---|
+| Super-Duper Mart, upper floor | main component 71.7 % of its walkable hexes | 100 % |
+| Megaton, level 0 | three components, 34.2 % in the main one | one component |
+| Megaton, level 1 | islands of 197, 88 and 48 hexes | fully reached through the stairs, except one 49-hex deck, which is closed; closing it drops one sentry placed on it |
+
+**Rendering.** The white plane in Megaton and the white box of Moriarty's
+Saloon were two kinds of shape drawn with ordinary blending: untextured
+multiply planes and additive glows (`skip_blend_shapes`), and fill boxes
+sampling one texel (`skip_flat_fills`). Both are skipped for Fallout 3
+(`docs/contracts.md` section 9).
+
+**Two readable defaults.** With the readable declutter profile: decorative
+`MISC` items are pruned (`prune_misc`, at most 1 cap and weight 1, only
+unreferenced, non-persistent, no editor id, no linked reference, no script
+on the base), and, above the minimal animation level, critters are drawn with
+the readable look (a dark 1-pixel rim and the figures tone; `figure_look =
+"default"` turns it off). Both in `docs/running.md`.
+
+**The raiders that were never fought (section 11, "Engine acceptance" (c)).**
+Diagnosed from real runs. Stairs between elevations are written as walk-over
+exit grids. In a real store map a ground item lay exactly on a stair grid hex,
+and more along the approach, so the engine's autoplay bot, which collects
+items first, stepped onto the grid, was carried upstairs and never fought the
+raiders on the ground floor. This was the layer, not the bot. The builder now
+keeps every link's grids clear (`map_builder::clearance`: nothing to pick up
+on a door's grid or arrival hexes, nor on or within one hex of a stair's grid;
+an item there moves to the nearest free walkable hex and the map report says
+"moved off link hexes: N"; `verify_clearance` checks the written maps), and
+`shots --auto` no longer picks an exit grid as a viewpoint
+(`WalkMap::route_to_clear`; an explicit `--at` on a grid is honoured with a
+warning). Not yet re-run against the real Mart in the engine.
+
+**Roofs.** The owner's "player on roofs" item (section 11, "What looks wrong",
+1) is not a walker standing on a roof: the far side of a building is drawn
+under its roof, so a walker behind a tall building is seen through the
+engine's see-through circle. Upper exterior levels still draw over
+black.
+
+### Caching
+
+The map stage now keeps its renders, grounds and preview PNGs in a
+content-hash store (`crates/mojave-convert/src/cache.rs`, `docs/contracts.md`
+section 2; flags in `docs/running.md`). Measured on the real Springvale and
+Super-Duper Mart layers, release build, `--jobs 2`. Each cell is the whole
+`all` run in seconds, with the map stage alone in brackets.
+
+| | Springvale before | Springvale after | Mart before | Mart after |
+|---|---|---|---|---|
+| cold | 192.7 (77.9) | 166.8 (54.8) | 264.1 (179.5) | 167.0 (82.0) |
+| unchanged | 5.5 (0.19) | 5.6 (0.18) | 4.8 (0.19) | 4.8 (0.19) |
+| one declutter key | 84.3 (78.9) | 34.1 (21.1) | 181.6 (177.1) | 49.3 (33.5) |
+| one builder key | 86.3 (78.5) | 28.8 (16.1) | 181.5 (176.7) | 40.1 (29.3) |
+| one map of the layer | 82.8 (77.3) | 22.7 (16.7) | 186.9 (182.3) | 35.2 (30.3) |
+
+Notes:
+
+- 95 % of the slicer's time was rendering, which is what the store keeps.
+- Warm output is byte-identical to cold output in every case above.
+  `--jobs 1` and `--jobs 4` give identical output too.
+- Damaged entries are detected (header and payload checks) and rebuilt.
+- Left for later: the builder's 12 to 18 s (a quadratic path-clash check in
+  the mod-layer insert), the slicer's non-render work (2.4 to 9 s), the
+  gallery stage (3 to 4 s on every run), the critters when cold (66 to 93 s),
+  and cache eviction (nothing is ever evicted; deleting the store is safe).
+
+### Simulation layer (Pass 2)
+
+`mojave-convert sim` on the real Mart layer reads
+`map-placements.json` (origin `stage`) in about a quarter of a second warm.
+It reports 221 placed entries (12 critters, 23 doors, 78 containers, 99
+items, 2 terminals, 7 scenery), 332 references left off with their reasons, 3
+scripts, 2 packages and 2 terminals.
+
+The owner locked all 15 decisions of `docs/simulation-layer-spec.md` section
+13 on 2026-11-23 (the table is in `docs/contracts.md` section 11). The engine
+pin bump and the final Megaton autoplay gate wait for the owner's engine
+fixes (the elevation-change audit and the camera follow toggle).

@@ -479,6 +479,12 @@ pub struct DeclutterProfile {
     /// Form keys (`plugin:xxxxxx`, as `mir::FormKey` prints them) never
     /// pruned: quest and script references, supplied by the caller.
     pub protected_refs: BTreeSet<String>,
+    /// Form keys of references the caller judged decorative (tabletop
+    /// junk: in the converter, unreferenced miscellaneous items of little
+    /// value and weight). Each is pruned whatever its kind's protection
+    /// ([`crate::SkipReason::DecorativeItem`]), unless it is also in
+    /// `protected_refs`. Default empty: nothing changes.
+    pub decorative_items: BTreeSet<String>,
     pub protect: Protection,
     pub clutter: Option<ClutterRules>,
     pub density: Option<DensityRule>,
@@ -517,6 +523,7 @@ impl Default for DeclutterProfile {
                 "CHIP", "CMNY", "IMOD", "KEYM", "MISC", "NOTE", "WEAP",
             ]),
             protected_refs: BTreeSet::new(),
+            decorative_items: BTreeSet::new(),
             protect: Protection::default(),
             clutter: None,
             density: None,
@@ -844,6 +851,13 @@ pub(crate) fn decide(
             continue;
         }
         let f = placed[i].as_ref();
+        if !profile.decorative_items.is_empty() {
+            let key = r.form.to_string();
+            if profile.decorative_items.contains(&key) && !profile.protected_refs.contains(&key) {
+                prune(&mut d, classes, i, SkipReason::DecorativeItem);
+                continue;
+            }
+        }
         let reason = protection(r, &classes[i], f.map(|f| f.hexes), profile);
         if let Some(reason) = reason {
             d.protected[i] = true;

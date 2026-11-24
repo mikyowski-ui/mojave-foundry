@@ -89,6 +89,11 @@ pub(crate) struct ElevationPlan<'a> {
     pub skipped: Vec<SkippedTeleport>,
     pub passages: Vec<PassageReport>,
     pub islands_left: Vec<IslandReport>,
+    /// Components closed as unreached ([`crate::LayerOptions::close_unreached`]):
+    /// first hex, size, what they held.
+    pub closed: Vec<(i32, usize, Vec<String>)>,
+    /// Items and containers moved off link hexes ([`crate::clearance`]).
+    pub moved_off_links: usize,
     pub opened: BTreeSet<i32>,
     pub border: Vec<i32>,
     pub entrance: Option<EntranceReport>,
@@ -596,8 +601,31 @@ pub(crate) fn plan_map<'a>(
         if !footprints.hexes.is_empty() {
             options.protected_hexes.extend(footprints.hexes.iter());
         }
-        let (verdicts, stats) =
+        let (mut verdicts, mut stats) =
             walk::verdicts(&frame, elevation.sampler, input.cells, &blocked, &options);
+        if options.coverage_bridges {
+            let added = walk::bridge_coverage(
+                &frame,
+                elevation.sampler,
+                input.cells,
+                &blocked,
+                &options,
+                &mut verdicts,
+                walk::BRIDGE_MAX_LENGTH,
+            );
+            stats.walkable += added.len();
+            if !added.is_empty() {
+                notes.push(format!(
+                    "{}{} hexes bridge what the coverage rule cut apart: {added:?}",
+                    if multi_elevation && e > 0 {
+                        format!("elevation {e}: ")
+                    } else {
+                        String::new()
+                    },
+                    added.len()
+                ));
+            }
+        }
         let walkable: Vec<bool> = verdicts
             .iter()
             .map(|v| *v == walk::Verdict::Walkable)
@@ -709,6 +737,8 @@ pub(crate) fn plan_map<'a>(
             skipped,
             passages: Vec::new(),
             islands_left: Vec::new(),
+            closed: Vec::new(),
+            moved_off_links: 0,
             opened: BTreeSet::new(),
             border: Vec::new(),
             entrance: None,
@@ -1006,6 +1036,7 @@ pub(crate) fn reconnect(plan: &mut MapPlan) -> Result<(), BuildError> {
             let mut reserved = elevation.grid_hexes();
             reserved.extend(elevation.arrival_hexes());
             reserved.extend(&elevation.door_hexes);
+            reserved.extend(crate::clearance::elevation_keep_clear(elevation));
             place_on(plan, e, &elevation.walkable, &reserved)
                 .0
                 .into_iter()
@@ -1115,6 +1146,7 @@ pub(crate) fn place_critters(plan: &mut MapPlan) {
         reserved.extend(elevation.arrival_hexes());
         reserved.extend(&elevation.door_hexes);
         reserved.extend(&elevation.opened);
+        reserved.extend(crate::clearance::elevation_keep_clear(elevation));
         let (spots, skipped) = place_on(plan, e, &elevation.walkable, &reserved);
         plan.elevations[e].spots = spots;
         plan.elevations[e].skipped_critters = skipped;

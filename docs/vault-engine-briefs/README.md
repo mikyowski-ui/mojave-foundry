@@ -23,4 +23,4 @@ requirement `[Must-match]`, `[May-improve]` or `[Safe rule]`.
 Until a writer lands upstream, this repository's own adapter in
 `crates/emit` (behind the `FormatWriters` trait) produces the same bytes;
 the synthetic FRM, LST, MSG and GAM vectors in the briefs are checked
-against it (`crates/emit/tests/brief_vectors.rs`).
+against it by a brief-vector test in that crate.

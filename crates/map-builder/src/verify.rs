@@ -10,7 +10,7 @@ use vault_formats::fallout2::maps::MapsTable;
 use vault_formats::fid::ART_DIRECTORIES;
 use vault_formats::map::{MapFile, ObjectDetail, ObjectState};
 use vault_formats::mod_manifest::{MANIFEST, MAP_NUMBERS, ModManifest, ModRegistry, README};
-use vault_formats::pro::{Category, PrototypeData, PrototypeKind, PrototypeLookup};
+use vault_formats::pro::{BasicFlags, Category, PrototypeData, PrototypeKind, PrototypeLookup};
 use vault_formats::{
     ArtCatalog, ByteSource, Fid, FrmArchive, GameProfile, LayeredVfs, LocalPrototypeCatalog,
     LstKind, LstTable, MAX_ASSET_BYTES, MemoryDir, MsgCatalog, Prototype, Vfs, VfsPath,
@@ -525,31 +525,13 @@ pub struct LinkCheck {
     pub one_way: Vec<String>,
 }
 
-/// One elevation's exit grids: hex -> (map, hex, elevation).
-type GridsByHex = BTreeMap<i32, (i32, i32, i32)>;
-
-/// The label of a link between two map elevations.
-pub(crate) fn pair_label(from: &str, from_elevation: u8, to: &str, to_elevation: u8) -> String {
-    format!("{from} elevation {from_elevation} -> {to} elevation {to_elevation}")
-}
-
-/// Every exit grid of every map of `layer` (mounted over `base_files`,
-/// parsed through `vault-formats`) followed to its destination:
-///
-/// - the destination map is a map of the layer (a real map or a stub);
-/// - the destination elevation exists there (it has tiles or objects);
-/// - the destination hex is 1 to 39999 (0 would keep the map's entrance),
-///   holds no exit grid of that elevation (arriving never leaves again)
-///   and no object that stops movement (the engine's rule, critters
-///   included): the hex is walkable there;
-/// - every link (map and elevation to map and elevation) is counted, and
-///   one with no grid leading back is listed in [`LinkCheck::one_way`].
-///
-/// A failed check is [`BuildError::Verify`] naming the map and grid.
-pub fn verify_links(
+/// Every map of `layer` parsed back through `vault-formats` over
+/// `base_files`: the registered file names by number, and the maps by file.
+#[allow(clippy::type_complexity)]
+fn parse_maps(
     layer: &emit::ModLayer,
     base_files: &BTreeMap<String, Vec<u8>>,
-) -> Result<LinkCheck, BuildError> {
+) -> Result<(BTreeMap<u32, String>, BTreeMap<String, MapFile>), BuildError> {
     let text = layer
         .manifest_text()
         .map_err(|e| BuildError::verify(MANIFEST, e))?;
@@ -581,6 +563,127 @@ pub fn verify_links(
             .map_err(|e| BuildError::verify(&path, e))?;
         maps.insert(file.clone(), map);
     }
+    Ok((by_number, maps))
+}
+
+/// What [`verify_clearance`] checked.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClearanceCheck {
+    /// Keep-clear hexes over every map and elevation.
+    pub hexes: usize,
+    /// Items, containers and critters checked against them (those on an
+    /// elevation with links).
+    pub objects: usize,
+}
+
+/// The keep-clear rule on the written maps ([`crate::clearance`]): on every
+/// elevation, no ground item, container or critter stands on an exit grid
+/// or arrival hex of `maps`' links, nor (items and containers that do not
+/// block their hex, and critters) within
+/// [`crate::clearance::STAIRS_KEEP_CLEAR_RADIUS`] steps of a stair's grid.
+/// A failed check is [`BuildError::Verify`] naming the map, elevation, hex
+/// and object.
+pub fn verify_clearance(
+    layer: &emit::ModLayer,
+    base_files: &BTreeMap<String, Vec<u8>>,
+    maps: &[crate::BuiltMap],
+) -> Result<ClearanceCheck, BuildError> {
+    // Per (file, elevation): the exact keep-clear set, and the set that
+    // blocking containers are exempt from (the stairs' surroundings).
+    let mut exact: BTreeMap<(String, u8), BTreeSet<i32>> = BTreeMap::new();
+    let mut around: BTreeMap<(String, u8), BTreeSet<i32>> = BTreeMap::new();
+    for map in maps {
+        for link in &map.links {
+            let key = (map.file.clone(), link.elevation);
+            exact
+                .entry(key.clone())
+                .or_default()
+                .extend(link.grid_hexes.iter().copied());
+            exact
+                .entry((link.to_file.clone(), link.to_elevation))
+                .or_default()
+                .insert(link.to_hex);
+            let ring = crate::clearance::keep_clear([(link.kind, link.grid_hexes.as_slice())], []);
+            around.entry(key).or_default().extend(ring);
+        }
+    }
+    if exact.is_empty() {
+        return Ok(ClearanceCheck::default());
+    }
+    let (_, parsed) = parse_maps(layer, base_files)?;
+    let mut check = ClearanceCheck {
+        hexes: around.values().map(BTreeSet::len).sum(),
+        ..ClearanceCheck::default()
+    };
+    for (key, hexes) in &exact {
+        if !around.contains_key(key) {
+            check.hexes += hexes.len();
+        }
+    }
+    for (file, map) in &parsed {
+        let path = format!("maps/{file}");
+        for (e, objects) in map.objects.elevations.iter().enumerate() {
+            let key = (path.clone(), e as u8);
+            let Some(exact) = exact.get(&key) else {
+                continue;
+            };
+            let around = around.get(&key);
+            for object in objects {
+                let category = Fid(object.art_id).category();
+                if !matches!(category, 0 | 1) {
+                    continue;
+                }
+                let Some(hex) = object.hex else { continue };
+                check.objects += 1;
+                let blocks = category == 0 && object.flags.0 & BasicFlags::NONBLOCKING.0 == 0;
+                let bad = exact.contains(&hex)
+                    || (!blocks && around.is_some_and(|set| set.contains(&hex)));
+                if bad {
+                    return Err(BuildError::verify(
+                        &path,
+                        format!(
+                            "{} {} stands on hex {hex} of elevation {e}, on or beside an exit grid or arrival of a link",
+                            if category == 0 {
+                                "item or container"
+                            } else {
+                                "critter"
+                            },
+                            object.id
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(check)
+}
+
+/// One elevation's exit grids: hex -> (map, hex, elevation).
+type GridsByHex = BTreeMap<i32, (i32, i32, i32)>;
+
+/// The label of a link between two map elevations.
+pub(crate) fn pair_label(from: &str, from_elevation: u8, to: &str, to_elevation: u8) -> String {
+    format!("{from} elevation {from_elevation} -> {to} elevation {to_elevation}")
+}
+
+/// Every exit grid of every map of `layer` (mounted over `base_files`,
+/// parsed through `vault-formats`) followed to its destination:
+///
+/// - the destination map is a map of the layer (a real map or a stub);
+/// - the destination elevation exists there (it has tiles or objects);
+/// - the destination hex is 1 to 39999 (0 would keep the map's entrance),
+///   holds no exit grid of that elevation (arriving never leaves again)
+///   and no object that stops movement (the engine's rule, critters
+///   included): the hex is walkable there;
+/// - every link (map and elevation to map and elevation) is counted, and
+///   one with no grid leading back is listed in [`LinkCheck::one_way`].
+///
+/// A failed check is [`BuildError::Verify`] naming the map and grid.
+pub fn verify_links(
+    layer: &emit::ModLayer,
+    base_files: &BTreeMap<String, Vec<u8>>,
+) -> Result<LinkCheck, BuildError> {
+    let (by_number, maps) = parse_maps(layer, base_files)?;
     let number_of: BTreeMap<&str, u32> = by_number
         .iter()
         .map(|(number, file)| (file.as_str(), *number))

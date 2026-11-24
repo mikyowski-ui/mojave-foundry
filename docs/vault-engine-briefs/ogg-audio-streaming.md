@@ -318,7 +318,7 @@ Vector F (refused): the four bytes `4F 67 67 54` and nothing more; a valid
 stream with byte 22 (the CRC) changed; a stream whose identification header
 declares 0 channels; a three-channel stream (`Unsupported`).
 
-Fuzzing: a new `fuzz/fuzz_targets/ogg.rs` target that runs
+Fuzzing: a new fuzz target for the OGG decoder that runs
 `decode_to_mixer` on arbitrary bytes, with seeds from vectors A-D, in the
 `fuzz/` workspace beside `acm`. `[Safe rule]`
 

@@ -84,6 +84,114 @@ pub struct DeclutterSpec {
     /// Also measure the window without the pass (one more render).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub measure_baseline: Option<bool>,
+    /// Prune decorative tabletop items ([`MiscPrune`]): unreferenced
+    /// miscellaneous items (`MISC`) worth at most `prune_misc_max_value`
+    /// caps and weighing at most `prune_misc_max_weight`. Default on in
+    /// the readable profile, at 1 and 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prune_misc: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prune_misc_max_value: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prune_misc_max_weight: Option<f32>,
+}
+
+/// The decorative-item rule of the readable profile (owner decision,
+/// 2026-11-23): a placed miscellaneous item (`MISC`) is pruned with the
+/// micro-clutter when its base is worth at most `max_value` caps and
+/// weighs at most `max_weight`, and nothing marks it as part of the game:
+/// it is not in the referenced set (`mir::Records::referenced_refs`:
+/// quests, scripts, conditions, links, enable parents, packages), it is
+/// not persistent, has no editor id and no linked reference, and its base
+/// has no script (quest items carry one). A placed reference is never
+/// inside a container, so container contents are never touched. Weapons,
+/// ammunition, aid, keys, armour, notes, books and every `MISC` above the
+/// thresholds stay protected by kind.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MiscPrune {
+    pub max_value: i64,
+    pub max_weight: f32,
+}
+
+impl Default for MiscPrune {
+    fn default() -> Self {
+        MiscPrune {
+            max_value: 1,
+            max_weight: 1.0,
+        }
+    }
+}
+
+/// The decorative-item rule of a run: `None` with the pass off or
+/// `prune_misc = false`; the readable default with the slice's thresholds
+/// over it.
+pub fn misc_prune(profile: &str, spec: Option<&DeclutterSpec>) -> Option<MiscPrune> {
+    if profile != "readable" {
+        return None;
+    }
+    let default = DeclutterSpec::default();
+    let spec = spec.unwrap_or(&default);
+    if spec.prune_misc == Some(false) {
+        return None;
+    }
+    let mut rule = MiscPrune::default();
+    if let Some(v) = spec.prune_misc_max_value {
+        rule.max_value = v;
+    }
+    if let Some(w) = spec.prune_misc_max_weight {
+        rule.max_weight = w;
+    }
+    Some(rule)
+}
+
+/// What a base record says about an item, for [`MiscPrune::judge`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ItemFacts {
+    pub value: Option<i64>,
+    pub weight: Option<f32>,
+    pub scripted: bool,
+}
+
+impl MiscPrune {
+    /// Whether `reference` is a decorative item under this rule; `facts`
+    /// is its base's record (`None`: not in the plugin list, kept).
+    pub fn judge(
+        &self,
+        reference: &mir::Reference,
+        facts: Option<ItemFacts>,
+        referenced: &BTreeSet<String>,
+    ) -> bool {
+        if reference.base_kind.as_deref() != Some("MISC")
+            || referenced.contains(&reference.form.to_string())
+            || reference.flags.persistent
+            || reference.editor_id.is_some()
+            || reference.linked_ref.is_some()
+        {
+            return false;
+        }
+        let Some(facts) = facts else {
+            return false;
+        };
+        !facts.scripted
+            && facts.value.is_some_and(|v| v <= self.max_value)
+            && facts.weight.is_some_and(|w| w <= self.max_weight)
+    }
+}
+
+/// The decorative items among `references` (form keys), judged by `rule`
+/// with each base's record from `facts`.
+pub fn decorative_items(
+    rule: &MiscPrune,
+    references: &[mir::Reference],
+    referenced: &BTreeSet<String>,
+    mut facts: impl FnMut(&mir::FormKey) -> Option<ItemFacts>,
+) -> BTreeSet<String> {
+    references
+        .iter()
+        .filter(|r| r.base_kind.as_deref() == Some("MISC"))
+        .filter(|r| rule.judge(r, facts(&r.base), referenced))
+        .map(|r| r.form.to_string())
+        .collect()
 }
 
 /// One class's tone curve in `[tone]`; unset fields keep the profile's.
@@ -438,6 +546,98 @@ mod tests {
             foundry_render::ClassTones::readable().floor.saturation
         );
         assert_eq!(fo3.tones.figures.contrast, 1.2);
+    }
+
+    fn misc(id: u32, kind: &str) -> mir::Reference {
+        serde_json::from_value(serde_json::json!({
+            "form": format!("fallout3.esm:{id:06x}"),
+            "kind": "object",
+            "group": "temporary",
+            "base": "fallout3.esm:000100",
+            "base_kind": kind,
+            "transform": {"position": [0.0, 0.0, 0.0], "rotation": [0.0, 0.0, 0.0], "scale": 1.0},
+            "flags": {"persistent": false, "initially_disabled": false, "deleted": false}
+        }))
+        .expect("a reference")
+    }
+
+    fn facts(value: i64, weight: f32) -> Option<ItemFacts> {
+        Some(ItemFacts {
+            value: Some(value),
+            weight: Some(weight),
+            scripted: false,
+        })
+    }
+
+    #[test]
+    fn decorative_items_by_value_weight_and_reference() {
+        let rule = MiscPrune::default();
+        assert_eq!((rule.max_value, rule.max_weight), (1, 1.0));
+        let none = BTreeSet::new();
+        let cup = misc(0x10, "MISC");
+        // Both sides of each threshold.
+        assert!(rule.judge(&cup, facts(1, 1.0), &none));
+        assert!(rule.judge(&cup, facts(0, 0.5), &none));
+        assert!(!rule.judge(&cup, facts(2, 1.0), &none), "worth more");
+        assert!(!rule.judge(&cup, facts(1, 1.5), &none), "heavier");
+        // Unknown figures, a script, or no record keep it.
+        assert!(!rule.judge(&cup, None, &none));
+        let scripted = ItemFacts {
+            scripted: true,
+            ..facts(0, 0.0).expect("facts")
+        };
+        assert!(!rule.judge(&cup, Some(scripted), &none));
+        let unvalued = ItemFacts {
+            value: None,
+            ..facts(0, 0.0).expect("facts")
+        };
+        assert!(!rule.judge(&cup, Some(unvalued), &none));
+        // A referenced item survives; so do persistent, named or linked ones.
+        let referenced: BTreeSet<String> = [cup.form.to_string()].into();
+        assert!(!rule.judge(&cup, facts(0, 0.0), &referenced));
+        let mut persistent = cup.clone();
+        persistent.flags.persistent = true;
+        assert!(!rule.judge(&persistent, facts(0, 0.0), &none));
+        let mut named = cup.clone();
+        named.editor_id = Some("QuestCup".to_owned());
+        assert!(!rule.judge(&named, facts(0, 0.0), &none));
+        // Only MISC: a cheap, light weapon, aid item or key stays.
+        for kind in ["WEAP", "ALCH", "KEYM", "AMMO", "ARMO", "BOOK"] {
+            assert!(
+                !rule.judge(&misc(0x11, kind), facts(0, 0.1), &none),
+                "{kind}"
+            );
+        }
+        // The set over a window.
+        let refs = vec![cup.clone(), misc(0x12, "MISC"), misc(0x13, "WEAP")];
+        let set = decorative_items(&rule, &refs, &referenced, |_| facts(0, 0.1));
+        assert_eq!(set, ["fallout3.esm:000012".to_owned()].into());
+    }
+
+    #[test]
+    fn the_misc_rule_is_on_in_readable_only_and_takes_the_keys() {
+        assert_eq!(misc_prune("off", None), None);
+        assert_eq!(misc_prune("readable", None), Some(MiscPrune::default()));
+        let spec = DeclutterSpec {
+            prune_misc_max_value: Some(5),
+            prune_misc_max_weight: Some(0.5),
+            ..DeclutterSpec::default()
+        };
+        assert_eq!(
+            misc_prune("readable", Some(&spec)),
+            Some(MiscPrune {
+                max_value: 5,
+                max_weight: 0.5
+            })
+        );
+        let off = DeclutterSpec {
+            prune_misc: Some(false),
+            ..DeclutterSpec::default()
+        };
+        assert_eq!(misc_prune("readable", Some(&off)), None);
+        // With the pass off the keys are refused.
+        let none = BTreeSet::new();
+        assert!(profile(GameVariant::Fallout3, "off", Some(&spec), None, &none).is_err());
     }
 
     #[test]

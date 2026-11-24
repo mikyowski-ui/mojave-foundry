@@ -199,10 +199,38 @@ fn the_mini_mart_reads_back_object_by_object() {
         ObjectState::Other { detail: ObjectDetail::Weapon { rounds: 5, ammo_pid }, .. }
             if ammo_pid == ammo308 as i32
     ));
+    // The ammunition box was placed on the front door's exit grid, so the
+    // builder moved it to the nearest free hex off the link (crate notes,
+    // "Link clearance"); the rifle, beside a grid, stays: doors keep only
+    // their grid hexes and arrival hexes clear.
+    let ammo_input = hex_of(&mart.mart, AMMO_REF);
+    let mut link_hexes = std::collections::BTreeSet::new();
+    for built_map in &built.maps {
+        for link in &built_map.links {
+            link_hexes.extend(link.grid_hexes.iter().copied());
+            if link.to_file == "maps/mart.map" {
+                link_hexes.insert(link.to_hex);
+            }
+        }
+    }
+    assert!(link_hexes.contains(&ammo_input));
+    assert!(!link_hexes.contains(&rifle_hex));
+    let moved: usize = built
+        .maps
+        .iter()
+        .flat_map(|m| &m.elevations)
+        .map(|e| e.moved_off_links)
+        .sum();
+    assert_eq!(moved, 1);
     let packs: Vec<_> = all.iter().filter(|o| o.pid == ammo10).collect();
     assert_eq!(packs.len(), 2);
     for pack in &packs {
-        assert_eq!(pack.hex, Some(hex_of(&mart.mart, AMMO_REF)));
+        let at = pack.hex.unwrap();
+        assert!(!link_hexes.contains(&at));
+        assert_eq!(
+            vault_formats::HexGrid::lattice_distance(ammo_input, at),
+            Ok(1)
+        );
         assert!(matches!(
             pack.state,
             ObjectState::Other {

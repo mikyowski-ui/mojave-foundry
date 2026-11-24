@@ -164,6 +164,47 @@ pub fn safe_waypoints(path: &[i32], hop: usize, avoid: &[i32]) -> Vec<i32> {
     points
 }
 
+/// The least hex steps an automatic viewpoint keeps from every exit grid
+/// when it can: a walker standing beside one is a step from being carried
+/// to another map or elevation.
+pub const GRID_CLEARANCE: i32 = 2;
+
+/// The hex an automatic viewpoint for `wanted` stands on, among the hexes
+/// `reachable` accepts: `wanted` itself when it is reachable and at least
+/// [`GRID_CLEARANCE`] steps from every hex of `grids`; else the nearest
+/// reachable hex (fewest steps from `wanted`, then lowest hex number) that
+/// is; when none is that far from the grids, the nearest that is not itself
+/// a grid. `None` when nothing reachable is off the grids. Without grids
+/// this is the nearest reachable hex.
+pub fn clear_hex(wanted: i32, reachable: impl Fn(i32) -> bool, grids: &[i32]) -> Option<i32> {
+    let nearest_grid = |hex: i32| {
+        grids
+            .iter()
+            .map(|g| HexGrid::lattice_distance(*g, hex).unwrap_or(i32::MAX))
+            .min()
+            .unwrap_or(i32::MAX)
+    };
+    if in_grid(wanted) && reachable(wanted) && nearest_grid(wanted) >= GRID_CLEARANCE {
+        return Some(wanted);
+    }
+    (0..HEXES as i32)
+        .filter(|h| reachable(*h))
+        .filter_map(|h| {
+            let steps = nearest_grid(h);
+            (steps >= 1).then(|| {
+                let tier = u8::from(steps < GRID_CLEARANCE);
+                let away = if in_grid(wanted) {
+                    HexGrid::lattice_distance(h, wanted).unwrap_or(i32::MAX)
+                } else {
+                    0
+                };
+                ((tier, away, h), h)
+            })
+        })
+        .min()
+        .map(|(_, hex)| hex)
+}
+
 /// A walk from the entry to (or toward) a requested hex.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Route {
@@ -344,6 +385,40 @@ impl WalkMap {
         self.route_between(self.entry, requested)
     }
 
+    /// [`WalkMap::route_to`] for an automatic viewpoint: the destination is
+    /// chosen by [`clear_hex`], so it is never an exit grid (stepping on
+    /// one ends the walk on another map or elevation) and keeps
+    /// [`GRID_CLEARANCE`] steps from the grids where it can, even when
+    /// `requested` is itself a grid. `None` when the entry is blocked or
+    /// nothing reachable is off the grids.
+    pub fn route_to_clear(&self, requested: i32) -> Option<Route> {
+        let grids: Vec<i32> = self.exits.iter().map(|e| e.hex).collect();
+        let mut avoid = self.exit_mask();
+        if in_grid(self.entry) {
+            avoid[self.entry as usize] = false;
+        }
+        let parent = flood(&self.blocked, &avoid, self.entry);
+        if !reached(&parent, self.entry) {
+            return None;
+        }
+        // A requested hex off the grid is measured from the entry.
+        let wanted = if in_grid(requested) {
+            requested
+        } else {
+            self.entry
+        };
+        let destination = clear_hex(
+            wanted,
+            |h| reached(&parent, h) && !avoid[h as usize],
+            &grids,
+        )?;
+        Some(Route {
+            requested,
+            destination,
+            path: path_to(&parent, destination),
+        })
+    }
+
     /// [`WalkMap::route_to`] from `from` instead of the entry: a walk
     /// that continues from where an earlier one ended. `None` when `from`
     /// is blocked or off the grid.
@@ -507,6 +582,95 @@ mod tests {
         let route = map.route_to(hex(105, 100)).expect("a route");
         assert_eq!(route.destination, hex(105, 100));
         assert_eq!(route.steps(), 5);
+    }
+
+    #[test]
+    fn a_viewpoint_hex_keeps_two_steps_from_every_grid() {
+        let grids = [hex(105, 100), hex(105, 101)];
+        let everywhere = |_: i32| true;
+        // Far from the grids: the wanted hex itself.
+        assert_eq!(
+            clear_hex(hex(120, 100), everywhere, &grids),
+            Some(hex(120, 100))
+        );
+        // On a grid, or one step from it: the nearest hex two steps out,
+        // the lowest number among the nearest.
+        for wanted in [hex(105, 100), hex(106, 100)] {
+            let at = clear_hex(wanted, everywhere, &grids).expect("a hex");
+            for g in &grids {
+                assert!(HexGrid::lattice_distance(at, *g).unwrap() >= GRID_CLEARANCE);
+            }
+            assert!(HexGrid::lattice_distance(at, wanted).unwrap() <= 3, "{at}");
+        }
+        // Deterministic: the same candidates give the same hex.
+        assert_eq!(
+            clear_hex(hex(105, 100), everywhere, &grids),
+            clear_hex(hex(105, 100), everywhere, &grids)
+        );
+        // Only the reachable hexes count: a corridor of hexes on row 100,
+        // columns 100 to 106, with the grid at 106. The nearest two-step
+        // hex to the grid is column 104.
+        let corridor = |h: i32| h / 200 == 100 && (100..=106).contains(&(h % 200));
+        assert_eq!(
+            clear_hex(hex(106, 100), corridor, &[hex(106, 100)]),
+            Some(hex(104, 100))
+        );
+        // Every reachable hex within a step of a grid: the nearest one that
+        // is not a grid.
+        let short = |h: i32| h / 200 == 100 && (105..=106).contains(&(h % 200));
+        assert_eq!(
+            clear_hex(hex(106, 100), short, &[hex(106, 100)]),
+            Some(hex(105, 100))
+        );
+        // Nothing but grids: no viewpoint.
+        let only = |h: i32| h == hex(106, 100);
+        assert_eq!(clear_hex(hex(106, 100), only, &[hex(106, 100)]), None);
+        // Without grids: the wanted hex, or the nearest reachable one.
+        let row = |h: i32| h / 200 == 100;
+        assert_eq!(clear_hex(hex(50, 100), row, &[]), Some(hex(50, 100)));
+        let nearest = clear_hex(hex(50, 103), row, &[]).expect("a hex");
+        let best = (0..200)
+            .map(|c| HexGrid::lattice_distance(hex(c, 100), hex(50, 103)).unwrap())
+            .min();
+        assert_eq!(nearest / 200, 100);
+        assert_eq!(HexGrid::lattice_distance(nearest, hex(50, 103)).ok(), best);
+    }
+
+    #[test]
+    fn an_automatic_route_never_ends_on_a_grid_even_when_asked_for_one() {
+        let mut map = open_map(hex(100, 100));
+        map.exits.push(Exit {
+            hex: hex(110, 100),
+            to_map: 152,
+            to_hex: 1,
+            to_elevation: 1,
+        });
+        // The plain route goes to the grid itself; the automatic one stops
+        // two or more steps short.
+        assert_eq!(
+            map.route_to(hex(110, 100)).unwrap().destination,
+            hex(110, 100)
+        );
+        let route = map.route_to_clear(hex(110, 100)).expect("a route");
+        assert_eq!(route.requested, hex(110, 100));
+        assert_eq!(
+            HexGrid::lattice_distance(route.destination, hex(110, 100)),
+            Ok(GRID_CLEARANCE)
+        );
+        let exits = map.exit_mask();
+        assert!(route.path.iter().all(|h| !exits[*h as usize]));
+        assert_eq!(route.path[0], map.entry);
+        assert_eq!(route.path.last(), Some(&route.destination));
+        // A hex clear of the grid is reached as asked, as before.
+        assert_eq!(
+            map.route_to_clear(hex(130, 100)),
+            map.route_to(hex(130, 100))
+        );
+        // A map without grids: no change at all.
+        let open = open_map(hex(100, 100));
+        for wanted in [hex(120, 100), hex(100, 100), 39_999, 0] {
+            assert_eq!(open.route_to_clear(wanted), open.route_to(wanted));
+        }
     }
 
     #[test]

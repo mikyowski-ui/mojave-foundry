@@ -195,6 +195,22 @@
 //! linked and the layer is checked to hold exactly its maps and no exit
 //! grid.
 //!
+//! # Link clearance
+//!
+//! Exit grids are walk-over, so nothing to pick up may lie on or by one: a
+//! bot that collects items first steps on the grid and leaves the map.
+//! After the walkable grids are final, every ground item and every
+//! container that does not block its hex, standing on an exit grid or
+//! arrival hex of a link, or within [`clearance::STAIRS_KEEP_CLEAR_RADIUS`]
+//! steps of a stair's grid, moves to the nearest free walkable hex outside
+//! that set (the same component when it has room, ties to the lowest hex),
+//! and critters are placed clear of it ([`clearance`]). Doors keep only
+//! their grid hexes and arrival hexes clear
+//! ([`clearance::DOOR_KEEP_CLEAR_RADIUS`]). The count is
+//! [`ElevationReport::moved_off_links`] and the note "moved off link
+//! hexes: N"; [`verify_clearance`] asserts the rule on the written maps.
+//! Stub exits are not links: a layer without links is written as before.
+//!
 //! # Exterior levels
 //!
 //! An exterior whose walkable surfaces lie over one another (a town of
@@ -235,6 +251,7 @@
 
 mod assemble;
 mod budget;
+pub mod clearance;
 pub mod cover;
 pub mod critters;
 mod error;
@@ -249,6 +266,7 @@ mod loot_build;
 mod names;
 mod passages;
 mod plan;
+pub mod reach;
 mod readability;
 pub mod storeys;
 mod verify;
@@ -264,7 +282,8 @@ pub use loot::{
     MapLoot, PlacedLoot,
 };
 pub use verify::{
-    LinkCheck, LootCheck, VerifyReport, read_layer, verify_layer, verify_links, verify_loot,
+    ClearanceCheck, LinkCheck, LootCheck, VerifyReport, read_layer, verify_clearance, verify_layer,
+    verify_links, verify_loot,
 };
 pub use walk::{dominant_floor_z, navmesh_centre};
 
@@ -533,6 +552,19 @@ pub struct BuildOptions {
     /// elevation); in [`build_layer`] each [`ElevationInput::level`]
     /// carries its own and a map's must be `None`. Default `None`.
     pub level: Option<ExteriorLevel>,
+    /// Exterior: a hex in a cell without a navmesh is not walkable when
+    /// some cell of the window has one ([`walk::Verdict::NoGround`]),
+    /// instead of being judged by slope alone: land the source never lets
+    /// an actor walk, such as the ground outside a walled town. Default
+    /// `false`: the slope rule, as every earlier build.
+    pub navmesh_only: bool,
+    /// Under a [`BuildOptions::navmesh_coverage`] stricter than the
+    /// tolerance rule, join the islands that rule cuts out of one floor
+    /// (a narrow flight of steps, a doorway) to the larger part they meet
+    /// under the tolerance rule, through at most
+    /// [`walk::BRIDGE_MAX_LENGTH`] hexes per join ([`walk::bridge_coverage`]).
+    /// Default `false`: nothing changes.
+    pub coverage_bridges: bool,
 }
 
 /// One level of a multi-level exterior map ([`levels::LevelSplit::exterior_level`]):
@@ -581,6 +613,13 @@ pub struct InteriorBuild {
     pub clamp_levels: bool,
     /// Default [`INTERIOR_CLAMP_RADIUS`].
     pub clamp_radius: i32,
+    /// The storey's own navmesh triangles (navmesh form key, index), such
+    /// as [`storeys::Floor::members`] of the floors grouped into it: when
+    /// given, walkability takes exactly these triangles at any height
+    /// instead of every triangle inside the band, so a floor that dips at
+    /// a stair head stays one floor. The band still assigns critters.
+    /// Default `None`: the band, as every earlier build.
+    pub triangles: Option<std::sync::Arc<BTreeSet<(String, u32)>>>,
 }
 
 impl InteriorBuild {
@@ -593,6 +632,7 @@ impl InteriorBuild {
             entrance_near: None,
             clamp_levels: false,
             clamp_radius: INTERIOR_CLAMP_RADIUS,
+            triangles: None,
         }
     }
 
@@ -653,6 +693,8 @@ impl Default for BuildOptions {
             readability_sight: cover::SightRule::AnyPixel,
             navmesh_coverage: walk::NavmeshCoverage::Tolerance,
             level: None,
+            navmesh_only: false,
+            coverage_bridges: false,
         }
     }
 }
@@ -1421,6 +1463,14 @@ pub struct LayerOptions {
     /// definitions are layer-wide; references are keyed by form key, which
     /// no two maps share). Default `None`: nothing changes.
     pub catalogue: Option<std::sync::Arc<loot::Catalogue>>,
+    /// Close what the layer's start cannot reach (crate notes, "Reach"):
+    /// after passages, every walkable component that no walk from the
+    /// first map's entrance reaches, through the exit grids of the
+    /// layer's links, is made not walkable (no critter, entrance or
+    /// arrival stands on it) and reported on its elevation
+    /// ([`ElevationReport::closed`]). Default `false`: nothing changes;
+    /// the reach is reported either way ([`ElevationReport::reached`]).
+    pub close_unreached: bool,
 }
 
 impl Default for LayerOptions {
@@ -1433,6 +1483,7 @@ impl Default for LayerOptions {
             isolated: false,
             link_doors: true,
             catalogue: None,
+            close_unreached: false,
         }
     }
 }
@@ -1529,6 +1580,21 @@ pub struct ElevationReport {
     pub arrivals: Vec<(String, i32, Option<usize>)>,
     /// References of the critters placed here.
     pub critters: Vec<String>,
+    /// Every component of the planned walkable grid apart from the main
+    /// one, with whether the ground joins it to the main one and what is
+    /// in the way ([`reach::IslandDiagnosis`]), largest first.
+    pub islands: Vec<reach::IslandDiagnosis>,
+    /// Walkable hexes reached from the first map's entrance through the
+    /// layer's links ([`reach::layer_reach`]), and the elevation's planned
+    /// walkable hexes (passages in, closed components out); `None` when it
+    /// could not be computed.
+    pub reached: Option<(usize, usize)>,
+    /// Components closed as unreached ([`LayerOptions::close_unreached`]):
+    /// first hex, size, what they held.
+    pub closed: Vec<(i32, usize, Vec<String>)>,
+    /// Ground items and containers moved off the exit grids, arrival hexes
+    /// and stair surroundings of links ([`clearance`]).
+    pub moved_off_links: usize,
 }
 
 /// One map of a built layer.

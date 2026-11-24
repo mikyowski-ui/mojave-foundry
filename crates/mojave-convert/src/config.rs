@@ -182,6 +182,26 @@ pub struct SliceSpec {
     /// How the entrance rule judges a figure: `"any"` or `"visible"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entrance_sight: Option<String>,
+    /// Exterior only: `navmesh_only = true` makes the hexes of cells
+    /// without a navmesh not walkable when some cell of the window has one
+    /// (`map_builder::BuildOptions::navmesh_only`): land the source never
+    /// lets an actor walk, such as Megaton's ground outside its wall.
+    /// Default off (the slope rule there, as before).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub navmesh_only: Option<bool>,
+    /// Exterior only: the darkest a land vertex colour may make the
+    /// ground, 0 to 1 (`map_terrain::TerrainOptions::vertex_color_floor`;
+    /// 0.4 on Megaton, whose crater's vertex shade quantizes to black).
+    /// Default 0: the colours as stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vertex_color_floor: Option<f32>,
+    /// `coverage_bridges = true`: with a `navmesh_coverage` stricter than
+    /// the tolerance rule, the islands it cuts out of one floor (a narrow
+    /// flight of steps) are joined again through the hexes the tolerance
+    /// rule covers (`map_builder::BuildOptions::coverage_bridges`).
+    /// Default off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_bridges: Option<bool>,
 }
 
 /// `game = "fo3" | "fnv"` (the longer ids `fallout3` and `falloutnv` are
@@ -252,6 +272,9 @@ impl Default for SliceSpec {
             navmesh_coverage: None,
             sight: None,
             entrance_sight: None,
+            navmesh_only: None,
+            vertex_color_floor: None,
+            coverage_bridges: None,
         }
     }
 }
@@ -431,6 +454,18 @@ impl SliceSpec {
         }
         for text in [&self.sight, &self.entrance_sight].into_iter().flatten() {
             parse_sight(text)?;
+        }
+        if self.interior.is_some()
+            && (self.navmesh_only.is_some() || self.vertex_color_floor.is_some())
+        {
+            return Err(
+                "navmesh_only and vertex_color_floor apply to an exterior slice".to_owned(),
+            );
+        }
+        if let Some(v) = self.vertex_color_floor
+            && !(v.is_finite() && (0.0..=1.0).contains(&v))
+        {
+            return Err(format!("vertex_color_floor = {v}: expected 0 to 1"));
         }
         if self.interior.is_some() && self.levels.is_some() {
             return Err("levels applies to an exterior slice (storeys to an interior)".to_owned());
@@ -794,6 +829,9 @@ pub struct Inputs {
     /// `--with-interiors`: build the exterior slice with every interior its
     /// doors lead to (depth 1) into one layer.
     pub with_interiors: bool,
+    /// `--cache-dir`: where the map stage keeps its renders and grounds
+    /// (`crate::cache`). `None`: `<out>/cache`.
+    pub cache_dir: Option<PathBuf>,
 }
 
 impl Inputs {
@@ -845,6 +883,7 @@ impl Inputs {
             critter: CritterSettings::default(),
             layer: None,
             with_interiors: false,
+            cache_dir: None,
         })
     }
 
@@ -890,7 +929,38 @@ impl Inputs {
                 name: self.slice.name.clone(),
                 reason,
             })?;
-        Ok(self.critter.or(&slice))
+        let mut settings = self.critter.or(&slice);
+        // Owner decision (2026-11-23): the readable profile draws figures
+        // with the readable look (the figures tone and a dark rim) unless
+        // the flag or the slice names a look (`figure_look = "default"`
+        // turns it off). Only above the minimal level, which draws figures
+        // as the first wave did; with the pass off nothing changes.
+        let above_minimal = settings
+            .level
+            .is_some_and(|l| l != crate::critters::AnimationLevel::Minimal);
+        if settings.look.is_none() && above_minimal && self.readable_anywhere() {
+            settings.look = Some(true);
+        }
+        Ok(settings)
+    }
+
+    /// Whether the declutter pass is `readable` for this run: the command
+    /// line's profile, else on a layer any map's slice, else the slice's.
+    pub fn readable_anywhere(&self) -> bool {
+        if let Some(profile) = &self.declutter {
+            return profile == "readable";
+        }
+        match &self.layer {
+            Some(layer) => layer.maps.iter().any(|m| {
+                m.slice
+                    .declutter
+                    .as_ref()
+                    .and_then(|d| d.profile_name())
+                    .unwrap_or_else(|| crate::declutter::default_profile(self.game))
+                    == "readable"
+            }),
+            None => self.declutter_profile() == "readable",
+        }
     }
 
     /// The rebalance tables of this run (`crate::rebalance`): `--rebalance`,
@@ -1046,6 +1116,14 @@ impl Inputs {
     }
     pub fn mod_dir(&self) -> PathBuf {
         self.out.join("mods").join("mojave")
+    }
+
+    /// The directory of the map stage's renders and grounds
+    /// (`crate::cache::Store`): `--cache-dir`, else `<out>/cache`.
+    pub fn store_dir(&self) -> PathBuf {
+        self.cache_dir
+            .clone()
+            .unwrap_or_else(|| self.out.join("cache"))
     }
 
     /// Reads and parses the Fallout 2 palette.
@@ -1299,6 +1377,7 @@ interior = "TestRoomInterior"
             critter: CritterSettings::default(),
             layer: None,
             with_interiors: false,
+            cache_dir: None,
         };
         let error = inputs.check_mode().expect_err("refused").to_string();
         assert!(error.contains("--standalone"), "{error}");
@@ -1307,5 +1386,56 @@ interior = "TestRoomInterior"
         inputs.slice = SliceSpec::preset("goodsprings").expect("a preset");
         inputs.standalone = false;
         assert!(inputs.check_mode().is_ok());
+    }
+
+    #[test]
+    fn the_readable_profile_turns_the_figure_look_on_above_minimal() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut inputs = Inputs {
+            data_dir: dir.path().to_owned(),
+            game: mir::GameVariant::Fallout3,
+            f2: dir.path().to_owned(),
+            f2_master: None,
+            out: dir.path().to_owned(),
+            slice: SliceSpec::from_toml(ROOM).expect("parses"),
+            jobs: 1,
+            calibration: foundry_render::Calibration::default(),
+            backend: foundry_render::Backend::Cpu,
+            outline: false,
+            standalone: true,
+            declutter: None,
+            loot: None,
+            rebalance: None,
+            slice_file: None,
+            critter: CritterSettings::default(),
+            layer: None,
+            with_interiors: false,
+            cache_dir: None,
+        };
+        let look = |i: &Inputs| i.critter_settings().expect("settings").look;
+        // Declutter off: nothing set, at any level.
+        inputs.slice.animations = Some("combat".to_owned());
+        assert_eq!(look(&inputs), None);
+        // Readable from the command line, above minimal: on.
+        inputs.declutter = Some("readable".to_owned());
+        assert_eq!(look(&inputs), Some(true));
+        // The slice says default: off, as the flag would.
+        inputs.slice.figure_look = Some("default".to_owned());
+        assert_eq!(look(&inputs), Some(false));
+        inputs.slice.figure_look = None;
+        inputs.critter.look = Some(false);
+        assert_eq!(look(&inputs), Some(false));
+        inputs.critter.look = None;
+        // The minimal level draws figures as the first wave did.
+        inputs.slice.animations = None;
+        assert_eq!(look(&inputs), None);
+        // Readable from the slice's own table.
+        inputs.declutter = None;
+        inputs.slice.animations = Some("combat".to_owned());
+        inputs.slice.declutter = Some(crate::declutter::DeclutterSpec {
+            profile: Some("readable".to_owned()),
+            ..Default::default()
+        });
+        assert_eq!(look(&inputs), Some(true));
     }
 }

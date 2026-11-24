@@ -7,7 +7,7 @@ use clap::{Args, Parser, Subcommand};
 use foundry_render::Backend;
 use mojave_convert::{
     ConvertError, GameVariant, Inputs, Install, critters, gallery, map, pipeline, probe, sequence,
-    shots, sprites,
+    shots, sim, sprites,
 };
 
 #[derive(Parser)]
@@ -71,6 +71,14 @@ struct Common {
     /// built-in tables.
     #[arg(long, value_name = "FILE")]
     rebalance: Option<PathBuf>,
+    /// Print what each stage and step took (always written to
+    /// <out>/timings.txt).
+    #[arg(long)]
+    timings: bool,
+    /// Where the map stage keeps its cached renders and grounds; several
+    /// --out directories may share one. Default: <out>/cache.
+    #[arg(long, value_name = "DIR")]
+    cache_dir: Option<PathBuf>,
 }
 
 /// The critter stage's options; each wins over the slice's key.
@@ -231,6 +239,7 @@ impl Common {
         };
         inputs.outline = self.outline;
         inputs.rebalance = self.rebalance.clone();
+        inputs.cache_dir = self.cache_dir.clone();
         Ok(inputs)
     }
 }
@@ -320,6 +329,18 @@ enum Command {
         /// Keep only sprites whose model path contains this text.
         #[arg(long, default_value = "")]
         filter: String,
+    },
+    /// Scaffold of the simulation stage (Pass 2): reads a finished --out
+    /// directory, counts the source logic for the placed references, prints
+    /// the stage cache key and writes sim-report.md. Needs no game install
+    /// and changes nothing in the layer.
+    Sim {
+        /// The --out directory of a finished run (holding mir/ and mods/mojave).
+        #[arg(long)]
+        out: PathBuf,
+        /// Print what the stage took (always written to <out>/timings.txt).
+        #[arg(long)]
+        timings: bool,
     },
     /// Read-only checks of the parsers against real files. Prints tallies only.
     #[command(subcommand)]
@@ -606,6 +627,10 @@ fn run(cli: Cli) -> Result<(), String> {
             println!("output: {}", inputs.gallery_dir().display());
             Ok(())
         }
+        Command::Sim { out, .. } => {
+            let _t = mojave_convert::timings::span("sim");
+            sim::cli(&out)
+        }
         Command::Probe(Probe::Bsa { archive, step, dds }) => probe::bsa(&archive, step, dds),
         Command::Probe(Probe::Nif {
             archive,
@@ -628,8 +653,39 @@ fn run(cli: Cli) -> Result<(), String> {
     }
 }
 
+impl Command {
+    /// Where a stage's timings go, and whether to print them.
+    fn timings(&self) -> Option<(PathBuf, bool)> {
+        let common = match self {
+            Command::Extract(c) | Command::Sprites(c) => c,
+            Command::Critters { common, .. }
+            | Command::Map { common, .. }
+            | Command::All { common, .. }
+            | Command::Estimate { common, .. }
+            | Command::Gallery { common, .. } => common,
+            Command::Sim { out, timings } => return Some((out.clone(), *timings)),
+            _ => return None,
+        };
+        Some((common.out.clone(), common.timings))
+    }
+}
+
 fn main() -> ExitCode {
-    match run(Cli::parse()) {
+    let cli = Cli::parse();
+    let timings = cli.command.timings();
+    let result = {
+        let _total = mojave_convert::timings::span("total");
+        run(cli)
+    };
+    if let Some((out, print)) = timings {
+        if out.is_dir() {
+            mojave_convert::timings::write(&out);
+        }
+        if print {
+            println!("timings:\n{}", mojave_convert::timings::table());
+        }
+    }
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("error: {message}");

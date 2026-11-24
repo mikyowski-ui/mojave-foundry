@@ -103,6 +103,12 @@ pub const MAX_COMPOSE_PIXELS: u64 = 1 << 26;
 /// The colour of ground without land, by default.
 pub const DEFAULT_FALLBACK_RGB: [u8; 3] = [92, 84, 70];
 
+/// The revision of what [`build_ground`] makes. Bump it whenever its
+/// tiles, squares or statistics for the same inputs change: caches of
+/// grounds key on it (mojave-convert's terrain cache), and an older
+/// revision's entries are then never read.
+pub const OUTPUT_REVISION: u32 = 1;
+
 /// Everything that can go wrong.
 #[derive(Debug, thiserror::Error)]
 pub enum TerrainError {
@@ -222,6 +228,13 @@ pub struct TerrainOptions {
     /// [`TerrainOptions::blank_without_land`] (black) is not toned. `None`
     /// (the default) or [`foundry_render::Tone::IDENTITY`] changes no byte.
     pub tone: Option<Tone>,
+    /// The darkest a land vertex colour may make the ground, 0 to 1: each
+    /// vertex colour multiplier `c` becomes `floor + (1 - floor) c`. The
+    /// source paints shade into vertex colours (Fallout 3's Megaton crater
+    /// down to 0.1) that its own sunlight lifts; multiplied as they are,
+    /// with dark textures and the relief term, such ground quantizes to
+    /// black. Default 0: the colours as stored, every earlier byte.
+    pub vertex_color_floor: f32,
 }
 
 impl Default for TerrainOptions {
@@ -243,6 +256,7 @@ impl Default for TerrainOptions {
             cluster_iterations: 8,
             seam_weight: 1.0,
             tone: None,
+            vertex_color_floor: 0.0,
         }
     }
 }
@@ -295,6 +309,13 @@ impl TerrainOptions {
             return bad(
                 "seam_weight",
                 format!("{} is outside [0, 100]", self.seam_weight),
+            );
+        }
+        if !(self.vertex_color_floor.is_finite() && (0.0..=1.0).contains(&self.vertex_color_floor))
+        {
+            return bad(
+                "vertex_color_floor",
+                format!("{} is outside [0, 1]", self.vertex_color_floor),
             );
         }
         if self.cluster_iterations > 100 {

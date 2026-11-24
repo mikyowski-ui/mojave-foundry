@@ -878,3 +878,298 @@ fn the_link_check_refuses_grids_onto_blocked_hexes_grids_and_hex_zero() {
     assert_eq!(check.one_way.len(), 1);
     assert!(check.one_way[0].starts_with("synth.map elevation 0 -> saloon.map"));
 }
+
+#[test]
+fn reach_is_reported_and_what_the_start_cannot_reach_is_closed() {
+    let t = tower(3, "tower");
+    let maps = tower_maps(&t);
+    let mut input = layer(maps, &t.base, &t.critter_art);
+    // Only the stairs between floors 0 and 1: floor 2 has no way in.
+    input.stairs = t.layout.stair_links(0);
+    input
+        .stairs
+        .retain(|s| s.ends.iter().all(|e| e.elevation < 2));
+    assert_eq!(input.stairs.len(), 1);
+    let open = build_layer(&input).unwrap();
+    let e = &open.maps[0].elevations;
+    let (reached0, planned0) = e[0].reached.expect("reach");
+    assert_eq!(reached0, planned0);
+    assert_eq!(e[1].reached.map(|r| r.0 == r.1), Some(true));
+    assert_eq!(e[2].reached.map(|r| r.0), Some(0));
+    assert!(e[2].closed.is_empty(), "off by default");
+    // Closed: elevation 2 holds nothing walkable, and says what it closed.
+    input.options.close_unreached = true;
+    let closed = build_layer(&input).unwrap();
+    let e = &closed.maps[0].elevations;
+    assert!(!e[2].closed.is_empty());
+    assert_eq!(e[2].reached, Some((0, 0)));
+    assert!(closed.maps[0].walkable[2].iter().all(|w| !w));
+    assert_eq!(e[0].reached, open.maps[0].elevations[0].reached);
+    // Its critter now has nowhere to stand.
+    assert!(closed.maps[0].critter_elevations.iter().all(|e| *e < 2));
+    // Deterministic.
+    assert_eq!(
+        build_layer(&input).unwrap().layer.files(),
+        closed.layer.files()
+    );
+}
+
+#[test]
+fn a_storey_can_walk_its_own_floor_triangles() {
+    let t = tower(3, "tower");
+    let mut maps = tower_maps(&t);
+    // The floors' own triangles instead of the band: the same walkable
+    // ground on this tower, whose floors are flat.
+    let band: Vec<Vec<bool>> = {
+        let mut input = layer(tower_maps(&t), &t.base, &t.critter_art);
+        input.stairs = t.layout.stair_links(0);
+        build_layer(&input).unwrap().maps[0].walkable.clone()
+    };
+    for (e, elevation) in maps[0].elevations.iter_mut().enumerate() {
+        let floor = &t.split.floors[t.layout.maps[0].floors[e]];
+        assert!(!floor.members.is_empty());
+        let mut interior = elevation.interior.clone().unwrap();
+        interior.triangles = Some(std::sync::Arc::new(floor.members.iter().cloned().collect()));
+        elevation.interior = Some(interior);
+    }
+    let mut input = layer(maps, &t.base, &t.critter_art);
+    input.stairs = t.layout.stair_links(0);
+    let built = build_layer(&input).unwrap();
+    assert_eq!(built.maps[0].walkable, band);
+}
+
+// --- Link clearance (crate notes, "Link clearance") ---------------------------
+
+/// The hexes of the ground items and containers (art category 0) on one
+/// elevation of a written map.
+fn item_hexes(map: &MapFile, elevation: usize) -> Vec<i32> {
+    let mut hexes: Vec<i32> = map.objects.elevations[elevation]
+        .iter()
+        .filter(|o| vault_formats::Fid(o.art_id).category() == 0)
+        .filter_map(|o| o.hex)
+        .collect();
+    hexes.sort_unstable();
+    hexes
+}
+
+/// The keep-clear set of one elevation of a built layer, read from the
+/// links the report lists.
+fn keep_clear_of(built: &BuiltLayer, map: usize, elevation: u8) -> BTreeSet<i32> {
+    let file = &built.maps[map].file;
+    let mut clear = BTreeSet::new();
+    for m in &built.maps {
+        for link in &m.links {
+            if m.file == *file && link.elevation == elevation {
+                clear.extend(map_builder::clearance::keep_clear(
+                    [(link.kind, link.grid_hexes.as_slice())],
+                    [],
+                ));
+            }
+            if link.to_file == *file && link.to_elevation == elevation {
+                clear.insert(link.to_hex);
+            }
+        }
+    }
+    clear
+}
+
+fn distance_to(set: &[i32], hex: i32) -> i32 {
+    set.iter()
+        .map(|g| HexGrid::lattice_distance(*g, hex).unwrap())
+        .min()
+        .unwrap()
+}
+
+#[test]
+fn loot_on_or_beside_a_stair_is_moved_clear_and_the_rest_stays() {
+    let mut t = tower(3, "tower");
+    let item_art = t.art.len();
+    t.art
+        .push(image(ArtCategory::Items, 16, 16, 50, "crate on the floor"));
+    // Without items: where the stair's grids and arrivals are.
+    let (grid, arrivals, walkable, taken) = {
+        let mut input = layer(tower_maps(&t), &t.base, &t.critter_art);
+        input.stairs = t.layout.stair_links(0);
+        let plain = build_layer(&input).unwrap();
+        let map = &plain.maps[0];
+        let grid: Vec<i32> = map
+            .links
+            .iter()
+            .filter(|l| l.elevation == 0 && l.kind == LinkKind::Stairs)
+            .flat_map(|l| l.grid_hexes.iter().copied())
+            .collect();
+        let arrivals: Vec<i32> = map
+            .links
+            .iter()
+            .filter(|l| l.to_elevation == 0)
+            .map(|l| l.to_hex)
+            .collect();
+        let taken: Vec<i32> = t.placements[0].iter().map(|p| p.hex).collect();
+        (grid, arrivals, map.walkable[0].clone(), taken)
+    };
+    assert!(!grid.is_empty() && !arrivals.is_empty());
+    let free =
+        |hex: i32| walkable[hex as usize] && !arrivals.contains(&hex) && !taken.contains(&hex);
+    let on_grid = grid[0];
+    let beside = (0..40_000)
+        .find(|h| free(*h) && !grid.contains(h) && distance_to(&grid, *h) == 1)
+        .expect("a walkable hex beside the grid");
+    let two_away = (0..40_000)
+        .find(|h| free(*h) && distance_to(&grid, *h) == 2)
+        .expect("a walkable hex 2 steps from the grid");
+    for (n, hex) in [on_grid, beside, two_away].into_iter().enumerate() {
+        t.placements[0].push(placement(
+            item_art,
+            hex,
+            Role::Item,
+            false,
+            &format!("synthetic.esm:0090{n:02x}"),
+        ));
+    }
+    let mut input = layer(tower_maps(&t), &t.base, &t.critter_art);
+    input.stairs = t.layout.stair_links(0);
+    let built = build_layer(&input).unwrap();
+    let map = &built.maps[0];
+    let written = parsed(&built, &t.base);
+    let hexes = item_hexes(&written[&map.number], 0);
+    assert_eq!(hexes.len(), 3);
+    // The item two steps out stays; the other two moved off the set.
+    assert!(hexes.contains(&two_away));
+    assert!(!hexes.contains(&on_grid) && !hexes.contains(&beside));
+    assert_eq!(map.elevations[0].moved_off_links, 2);
+    assert_eq!(map.elevations[1].moved_off_links, 0);
+    assert!(
+        map.report
+            .notes
+            .iter()
+            .any(|n| n == "moved off link hexes: 2"),
+        "{:?}",
+        map.report.notes
+    );
+    let clear = keep_clear_of(&built, 0, 0);
+    let comps = map_builder::islands::components(|h| map.walkable[0][h as usize]);
+    for hex in &hexes {
+        assert!(!clear.contains(hex), "item on keep-clear hex {hex}");
+        assert!(map.walkable[0][*hex as usize]);
+        assert_eq!(comps.of(*hex), comps.of(on_grid), "same component");
+    }
+    // The check on the written maps agrees, and counts what it looked at.
+    let check = map_builder::verify_clearance(&built.layer, &t.base, &built.maps).unwrap();
+    assert!(check.hexes > 0 && check.objects >= 3, "{check:?}");
+    // Deterministic: two builds are identical.
+    let again = build_layer(&input).unwrap();
+    assert_eq!(again.layer.files(), built.layer.files());
+    assert_eq!(again.maps[0].report, built.maps[0].report);
+    // Without the stairs nothing is moved and every item stays where it
+    // was placed.
+    let mut open = layer(tower_maps(&t), &t.base, &t.critter_art);
+    open.stairs = Vec::new();
+    let unlinked = build_layer(&open).unwrap();
+    assert_eq!(unlinked.maps[0].elevations[0].moved_off_links, 0);
+    let mut placed = vec![on_grid, beside, two_away];
+    placed.sort_unstable();
+    assert_eq!(
+        item_hexes(&parsed(&unlinked, &t.base)[&unlinked.maps[0].number], 0),
+        placed
+    );
+}
+
+#[test]
+fn the_check_refuses_an_item_left_on_a_grid_hex() {
+    let t = tower(2, "tower");
+    let mut input = layer(tower_maps(&t), &t.base, &t.critter_art);
+    input.stairs = t.layout.stair_links(0);
+    let plain = build_layer(&input).unwrap();
+    // The untouched layer passes.
+    map_builder::verify_clearance(&plain.layer, &t.base, &plain.maps).unwrap();
+    let grid = plain.maps[0]
+        .links
+        .iter()
+        .find(|l| l.elevation == 0)
+        .unwrap()
+        .grid_hexes[0];
+    // Put an item object on the grid by hand, on the written map: a copy
+    // of a scenery object given an item's art, which is all the check
+    // reads.
+    let mut tampered = plain.layer.clone();
+    let path = plain.maps[0].file.clone();
+    let vfs = mounted(&plain.layer, &t.base);
+    let catalog = LocalPrototypeCatalog::for_game(&vfs, GameProfile::Fallout2);
+    let bytes = plain.layer.files()[&path].clone();
+    let mut file = MapFile::parse_for(&bytes, &catalog, GameProfile::Fallout2).unwrap();
+    let mut object = file.objects.elevations[0]
+        .iter()
+        .find(|o| vault_formats::Fid(o.art_id).category() == 2)
+        .unwrap()
+        .clone();
+    object.art_id = vault_formats::Fid::new(0, 1, 0, 0, 0).0;
+    object.hex = Some(grid);
+    object.id = 99_999;
+    file.objects.elevations[0].push(object);
+    file.objects.total += 1;
+    tampered.insert(&path, file.write().unwrap()).unwrap();
+    let error = map_builder::verify_clearance(&tampered, &t.base, &plain.maps).unwrap_err();
+    assert!(
+        error.to_string().contains("on or beside an exit grid"),
+        "{error}"
+    );
+}
+
+#[test]
+fn loot_on_a_door_arrival_is_moved_and_loot_beside_the_door_grid_stays() {
+    let (mut town, saloon) = town_and_saloon();
+    let base = full_base();
+    let plain = build_layer(&layer(
+        vec![map_of(&town), map_of(&saloon)],
+        &base,
+        &saloon.critter_art,
+    ))
+    .unwrap();
+    // The saloon door's link arrives on the town.
+    let arrival = plain.maps[1].links[0].to_hex;
+    let grid = plain.maps[0].links[0].grid_hexes.clone();
+    let taken: Vec<i32> = town.placements.iter().map(|p| p.hex).collect();
+    let beside = (0..40_000)
+        .find(|h| {
+            distance_to(&grid, *h) == 1
+                && !grid.contains(h)
+                && *h != arrival
+                && !taken.contains(h)
+                && plain.maps[0].walkable[0][*h as usize]
+        })
+        .expect("a hex beside the door's grid");
+    // Items are the town's art 2 (a crate).
+    for (n, hex) in [arrival, beside].into_iter().enumerate() {
+        town.placements.push(placement(
+            2,
+            hex,
+            Role::Item,
+            false,
+            &format!("synthetic.esm:0091{n:02x}"),
+        ));
+    }
+    let input = layer(
+        vec![map_of(&town), map_of(&saloon)],
+        &base,
+        &saloon.critter_art,
+    );
+    let built = build_layer(&input).unwrap();
+    let written = parsed(&built, &base);
+    let town_items = item_hexes(&written[&built.maps[0].number], 0);
+    let before = item_hexes(&parsed(&plain, &base)[&plain.maps[0].number], 0);
+    let at = |items: &[i32], hex: i32| items.iter().filter(|h| **h == hex).count();
+    assert_eq!(town_items.len(), before.len() + 2);
+    assert!(
+        at(&town_items, beside) > at(&before, beside),
+        "radius 0 beside a door grid"
+    );
+    assert_eq!(
+        at(&town_items, arrival),
+        at(&before, arrival),
+        "the item on the arrival hex moved off it"
+    );
+    assert_eq!(built.maps[0].elevations[0].moved_off_links, 1);
+    assert!(keep_clear_of(&built, 0, 0).contains(&arrival));
+    let again = build_layer(&input).unwrap();
+    assert_eq!(again.layer.files(), built.layer.files());
+}

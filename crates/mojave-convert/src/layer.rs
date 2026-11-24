@@ -63,7 +63,7 @@ use crate::map::{
 pub const LAYER_SUFFIX: &str = ".layer.toml";
 
 /// Bumped whenever a layer's output for the same inputs would change.
-const LAYER_VERSION: &str = "layer-1";
+const LAYER_VERSION: &str = "layer-2";
 
 /// Whether `name` (a `--slice` argument) names a layer file.
 pub fn is_layer_file(name: &str) -> bool {
@@ -86,6 +86,10 @@ pub struct LayerSpec {
     pub start: Option<String>,
     /// Add every interior the first exterior's doors lead to.
     pub with_interiors: bool,
+    /// `close_unreached = true`: what no walk from the start map's entrance
+    /// reaches through the layer's links is closed and reported
+    /// (`map_builder::LayerOptions::close_unreached`). Default off.
+    pub close_unreached: bool,
     pub maps: Vec<LayerMap>,
     /// The first exterior's slice as a table, and the `[all_maps]` keys:
     /// what an automatic interior is made from.
@@ -105,6 +109,8 @@ struct LayerFile {
     #[serde(default)]
     with_interiors: bool,
     #[serde(default)]
+    close_unreached: bool,
+    #[serde(default)]
     all_maps: toml::Table,
     #[serde(default)]
     maps: Vec<toml::Table>,
@@ -114,6 +120,8 @@ struct LayerFile {
 const EXTERIOR_ONLY: &[&str] = &[
     "map_center",
     "levels",
+    "navmesh_only",
+    "vertex_color_floor",
     "entrance",
     "map",
     "name",
@@ -257,6 +265,7 @@ impl LayerSpec {
             name: file.name,
             start: file.start,
             with_interiors: file.with_interiors,
+            close_unreached: file.close_unreached,
             maps,
             base,
             all_maps: file.all_maps,
@@ -272,6 +281,7 @@ impl LayerSpec {
             name: slice.name.clone(),
             start: None,
             with_interiors: true,
+            close_unreached: false,
             maps: vec![LayerMap {
                 slice: slice.clone(),
                 automatic: false,
@@ -288,6 +298,7 @@ impl LayerSpec {
             name: slice.name.clone(),
             start: None,
             with_interiors: false,
+            close_unreached: false,
             maps: vec![LayerMap {
                 slice: slice.clone(),
                 automatic: false,
@@ -1249,6 +1260,16 @@ fn plan_interior(
         if e == entrance_elevation {
             build.entrance_near = base_build.entrance_near;
         }
+        // The storey walks its own floors' triangles, at any height: a
+        // floor that dips at a stair head (the Super-Duper Mart's upper
+        // level) is not cut by the band into islands.
+        build.triangles = Some(std::sync::Arc::new(
+            storey
+                .floors
+                .iter()
+                .flat_map(|f| split.floors[*f].members.iter().cloned())
+                .collect(),
+        ));
         let mut cut = slice.interior_slice(z);
         // Never into the storey above.
         if let Some(above) = storeys
@@ -1508,17 +1529,22 @@ pub fn estimate_layer(inputs: &Inputs, layer: &LayerSpec) -> Result<String, Conv
     let budgets = map::budgets(&base, inputs.standalone)?;
     let maps = layer.resolve(inputs, &mir)?;
     let mut plan = plan(inputs, &mir, &maps)?;
-    estimate_runs(&mir, &mut plan, &budgets)?;
+    let assets = map_slicer::MirAssets::new(&mir, 0);
+    estimate_runs(&assets, &mut plan, &budgets)?;
     Ok(budget_text(&plan, &budgets))
 }
 
 /// Estimates every run and gives each its share of the slicer budget.
-fn estimate_runs(mir: &Mir, plan: &mut Plan, budgets: &Budgets) -> Result<(), ConvertError> {
+fn estimate_runs(
+    assets: &dyn map_slicer::Assets,
+    plan: &mut Plan,
+    budgets: &Budgets,
+) -> Result<(), ConvertError> {
     let mut demand: Vec<[usize; 3]> = Vec::new();
     for map in &mut plan.maps {
         for run in &mut map.runs {
-            let report = map_slicer::estimate(
-                mir,
+            let report = map_slicer::estimate_with(
+                assets,
                 &run.references,
                 &map.window,
                 run.slicer_sampler.as_ref().unwrap_or(&map.sampler),
@@ -1711,6 +1737,7 @@ pub fn map_layer(inputs: &Inputs, layer: &LayerSpec) -> Result<MapSummary, Conve
     let features_path = inputs.out.join(map::FEATURES_FILE);
     if mod_dir.join("vault-mod.toml").is_file()
         && features_path.is_file()
+        && crate::placements::is_current(&inputs.out)
         && std::fs::read_to_string(&key_path).is_ok_and(|stored| stored == key)
         && let Ok(text) = std::fs::read_to_string(&summary_path)
         && let Some(summary) = MapSummary::from_cache(&text)
@@ -1722,13 +1749,29 @@ pub fn map_layer(inputs: &Inputs, layer: &LayerSpec) -> Result<MapSummary, Conve
     }
 
     let budgets = map::budgets(&base, inputs.standalone)?;
+    // Every mesh is read and every texture decoded once for the estimate
+    // and all the slicer runs (`crate::cache::SharedAssets`).
+    let assets = crate::cache::SharedAssets::new(
+        &mir,
+        map_slicer::SlicerConfig::default().texture_cache_bytes,
+    );
+    let plan_time = crate::timings::span("plan the layer");
     let mut plan = plan(inputs, &mir, &maps)?;
     let redirected = normalise_teleports(&mut plan);
-    estimate_runs(&mir, &mut plan, &budgets)?;
+    drop(plan_time);
+    let estimate_time = crate::timings::span("estimate");
+    estimate_runs(&assets, &mut plan, &budgets)?;
+    drop(estimate_time);
 
     // Slice every run in order, passing on what each leaves unused.
     let mut renderer =
         foundry_render::renderer(inputs.backend, &inputs.calibration).map_err(stage)?;
+    // Renders and grounds come from the content-hash store when their
+    // inputs are unchanged (`crate::cache`).
+    let store = crate::cache::Store::open(&inputs.store_dir());
+    let calibration_toml = inputs.calibration.to_toml().map_err(stage)?;
+    let texture_id = |path: &str| mir.texture_hash(path).map(str::to_owned);
+    let manifest_digest = map::manifest_digest(inputs)?;
     // Interiors first, then the levels above an exterior's ground, its
     // ground level last: estimates of a room overcount what its cut
     // leaves, so what the rooms leave over goes to the ground level, whose
@@ -1753,18 +1796,26 @@ pub fn map_layer(inputs: &Inputs, layer: &LayerSpec) -> Result<MapSummary, Conve
             run.budget.walls += carry[0];
             run.budget.scenery += carry[1];
             run.budget.items += carry[2];
-            let sliced = map_slicer::slice_statics(
-                &mir,
+            let _t = crate::timings::span(format!("slice {}", run.label));
+            let mut cached = crate::cache::CachedRenderer::new(
+                renderer.as_mut(),
+                &calibration_toml,
+                &store,
+                &texture_id,
+            );
+            let sliced = map_slicer::slice_with(
+                &assets,
                 &run.references,
                 &map.window,
                 run.slicer_sampler.as_ref().unwrap_or(&map.sampler),
                 &map.projection,
-                renderer.as_mut(),
+                &mut cached,
                 &palette_map,
                 &run.budget,
                 &run.slicer_config,
             )
             .map_err(|e| stage(format!("{}: {e}", run.label)))?;
+            cached.note("renderer");
             let used = [
                 category_use(&sliced.report, map_slicer::ArtCategory::Walls),
                 category_use(&sliced.report, map_slicer::ArtCategory::Scenery),
@@ -1829,6 +1880,7 @@ pub fn map_layer(inputs: &Inputs, layer: &LayerSpec) -> Result<MapSummary, Conve
             })
             .collect();
         let blank = matches!(run.terrain, Terrain::Blank(_));
+        let _t = crate::timings::span(format!("terrain {}", run.label));
         let options = map_terrain::TerrainOptions {
             library_cap: run.tile_cap.max(1),
             library_method: if inputs.standalone {
@@ -1840,13 +1892,33 @@ pub fn map_layer(inputs: &Inputs, layer: &LayerSpec) -> Result<MapSummary, Conve
             texture_lod_bias: map::GROUND_LOD_BIAS,
             blank_without_land: blank,
             tone: map::terrain_tone(&map.inputs.slice, &run.slicer_config),
+            vertex_color_floor: map.inputs.slice.vertex_color_floor.unwrap_or(0.0),
             ..map_terrain::TerrainOptions::default()
         };
-        let ground = match run.terrain {
-            Terrain::Blank(z) => map_terrain::build_ground_from(
+        let flat;
+        let sampler = match run.terrain {
+            Terrain::Blank(z) => {
+                flat = GroundSampler::flat(z);
+                &flat
+            }
+            Terrain::Land => &map.sampler,
+        };
+        let key = crate::cache::GroundKey {
+            land: matches!(run.terrain, Terrain::Land)
+                .then_some((manifest_digest.as_str(), map.worldspace.as_str())),
+            window: &map.window,
+            sampler,
+            projection: &map.projection,
+            calibration: &calibration_toml,
+            palette: &palette_bytes,
+            overlays: &overlays,
+            options: &options,
+        };
+        let (ground, reused) = crate::cache::cached_ground(&store, &key, || match run.terrain {
+            Terrain::Blank(_) => map_terrain::build_ground_from(
                 &map_terrain::MemoryLand::default(),
                 &map.window,
-                &GroundSampler::flat(z),
+                sampler,
                 &map.projection,
                 &inputs.calibration,
                 &palette_map,
@@ -1857,15 +1929,18 @@ pub fn map_layer(inputs: &Inputs, layer: &LayerSpec) -> Result<MapSummary, Conve
                 &mir,
                 &map.worldspace,
                 &map.window,
-                &map.sampler,
+                sampler,
                 &map.projection,
                 &inputs.calibration,
                 &palette_map,
                 &overlays,
                 &options,
             ),
-        }
+        })
         .map_err(|e| stage(format!("{}: {e}", run.label)))?;
+        if reused {
+            crate::timings::note("ground reused");
+        }
         tile_carry = run.tile_cap.saturating_sub(ground.tiles.len());
         run.squares = ground
             .squares
@@ -1883,6 +1958,7 @@ pub fn map_layer(inputs: &Inputs, layer: &LayerSpec) -> Result<MapSummary, Conve
     }
 
     // People: one set of sprite sets for the layer.
+    let people_time = crate::timings::span("people and catalogue");
     let mut sets: BTreeMap<String, usize> = BTreeMap::new();
     let mut critter_art: Vec<map_builder::CritterArt> = Vec::new();
     for map in &mut plan.maps {
@@ -1947,6 +2023,7 @@ pub fn map_layer(inputs: &Inputs, layer: &LayerSpec) -> Result<MapSummary, Conve
         None
     };
 
+    drop(people_time);
     // Protected hexes and footprints, per map over its elevations.
     for map in &mut plan.maps {
         let mut protected: BTreeSet<i32> = BTreeSet::new();
@@ -1970,8 +2047,10 @@ pub fn map_layer(inputs: &Inputs, layer: &LayerSpec) -> Result<MapSummary, Conve
         catalogue: catalogue
             .as_ref()
             .map(|c| std::sync::Arc::new(c.catalogue.clone())),
+        close_unreached: layer.close_unreached,
         ..map_builder::LayerOptions::default()
     };
+    let build_time = crate::timings::span("build the layer");
     let built = {
         let mut map_inputs = Vec::new();
         for map in &plan.maps {
@@ -2016,16 +2095,36 @@ pub fn map_layer(inputs: &Inputs, layer: &LayerSpec) -> Result<MapSummary, Conve
         })
         .map_err(stage)?
     };
+    drop(build_time);
 
+    let write_time = crate::timings::span("write and verify the layer");
     if let Some(parent) = mod_dir.parent() {
         std::fs::create_dir_all(parent).map_err(io(parent))?;
     }
-    built.layer.write(&mod_dir).map_err(stage)?;
-    let written = map_builder::read_layer(&mod_dir).map_err(stage)?;
-    let verified = map_builder::verify_layer(&written, &base).map_err(stage)?;
-    let links = map_builder::verify_links(&written, &base).map_err(stage)?;
+    {
+        let _t = crate::timings::span("write");
+        built.layer.write(&mod_dir).map_err(stage)?;
+    }
+    let written = {
+        // What is on disk is what a player loads: check that it is the
+        // layer in memory, byte for byte, then verify that.
+        let _t = crate::timings::span("check the written files");
+        map::check_written(&mod_dir, &built.layer)?;
+        &built.layer
+    };
+    let verified = {
+        let _t = crate::timings::span("verify the layer");
+        map_builder::verify_layer(written, &base).map_err(stage)?
+    };
+    let links = {
+        let _t = crate::timings::span("verify the links");
+        map_builder::verify_links(written, &base).map_err(stage)?
+    };
+    drop(write_time);
+    let _report_time = crate::timings::span("previews, report, features");
 
     // Previews, features, the items page.
+    let preview_time = crate::timings::span("previews");
     let gallery_dir = inputs.gallery_dir();
     std::fs::create_dir_all(&gallery_dir).map_err(io(&gallery_dir))?;
     for map in &plan.maps {
@@ -2034,18 +2133,23 @@ pub fn map_layer(inputs: &Inputs, layer: &LayerSpec) -> Result<MapSummary, Conve
                 run.ground.as_ref().expect("built above"),
                 run.sliced.as_ref().expect("sliced above"),
             );
-            let rgba = quantize::to_rgba(&indexed, &palette);
             let name = if run.elevation == 0 {
                 format!("map-{}.png", map.stem)
             } else {
                 format!("map-{}-e{}.png", map.stem, run.elevation)
             };
             let path = gallery_dir.join(name);
-            let png = foundry_gallery::encode_png(&rgba, width, height).map_err(stage)?;
+            let png =
+                crate::cache::cached_png(&store, &indexed, width, height, &palette_bytes, || {
+                    let rgba = quantize::to_rgba(&indexed, &palette);
+                    foundry_gallery::encode_png(&rgba, width, height).map_err(stage)
+                })?;
             std::fs::write(&path, png).map_err(io(&path))?;
         }
     }
+    drop(preview_time);
     if let Some(catalogue) = &catalogue {
+        let _t = crate::timings::span("items page");
         crate::gallery::items_page(inputs, &catalogue.report.items, &palette)?;
     }
     let features_dir = inputs.out.join(map::FEATURES_DIR);
@@ -2093,6 +2197,47 @@ pub fn map_layer(inputs: &Inputs, layer: &LayerSpec) -> Result<MapSummary, Conve
         if m == 0 {
             std::fs::write(&features_path, json + "\n").map_err(io(&features_path))?;
         }
+    }
+
+    // The placement index beside the report, never inside the layer.
+    {
+        let _t = crate::timings::span("placement index");
+        let (referenced, why) = crate::placements::referenced_of(&mir);
+        if let Some(why) = why {
+            crate::timings::note(format!("no referenced set: {why}"));
+        }
+        let stage_maps: Vec<crate::placements::StageMap<'_>> = plan
+            .maps
+            .iter()
+            .zip(&built.maps)
+            .map(|(map, built_map)| {
+                crate::placements::StageMap::of_layer(
+                    &map.stem,
+                    &map.references,
+                    map.runs
+                        .iter()
+                        .map(|run| (run.elevation, run.placements.as_slice()))
+                        .collect(),
+                    built_map,
+                    catalogue.as_ref().map(|c| &c.catalogue),
+                    map.people_skipped
+                        .iter()
+                        .map(|p| (p.reference.clone(), p.reason.clone()))
+                        .chain(map.runs.iter().flat_map(|run| {
+                            run.sliced.iter().flat_map(crate::placements::slicer_skips)
+                        }))
+                        .collect(),
+                )
+            })
+            .collect();
+        crate::placements::write_for_stage(
+            &inputs.out,
+            &mod_dir,
+            inputs.game,
+            &stage_maps,
+            &referenced,
+        )
+        .map_err(stage)?;
     }
 
     let report = report_text(
@@ -2161,6 +2306,8 @@ pub fn map_layer(inputs: &Inputs, layer: &LayerSpec) -> Result<MapSummary, Conve
             + verified.maps.len(),
         critters: built.maps.iter().map(|m| m.report.critters.len()).sum(),
     };
+    crate::timings::note(format!("cache store: {}", store.summary()));
+    assets.note();
     let maps_dir = cache_dir.join("maps");
     std::fs::create_dir_all(&maps_dir).map_err(io(&maps_dir))?;
     for (stem, key) in &per_map_keys {
@@ -2232,6 +2379,69 @@ fn elevation_reach(text: &mut String, e: &map_builder::ElevationReport) {
             island.island_hex,
             island.holds.join(", "),
             island.reason
+        );
+    }
+    if let Some((reached, planned)) = e.reached {
+        let _ = writeln!(
+            text,
+            "- reached from the layer's start through links: {reached} of {planned} walkable hexes ({:.1} %)",
+            if planned == 0 {
+                0.0
+            } else {
+                100.0 * reached as f64 / planned as f64
+            }
+        );
+    }
+    for island in &e.islands {
+        let way = if island.way.is_empty() {
+            String::new()
+        } else {
+            let shown: Vec<String> = island
+                .way
+                .iter()
+                .take(6)
+                .map(|(hex, what)| format!("{hex} ({what})"))
+                .collect();
+            format!(
+                "; in the way: {}{}",
+                shown.join(", "),
+                if island.way.len() > 6 { ", ..." } else { "" }
+            )
+        };
+        let _ = writeln!(
+            text,
+            "- island {} hexes at {}: {}; {}{}{}",
+            island.size,
+            island.first_hex,
+            if island.ground_joins {
+                "the ground joins it to the main component"
+            } else if island.joins_with_tolerance {
+                "the ground keeps it apart under this coverage rule, the tolerance rule would join it"
+            } else {
+                "the ground keeps it apart"
+            },
+            match island.reached {
+                Some(true) => "reached through links",
+                Some(false) => "NOT reached through links",
+                None => "reach unknown",
+            },
+            if island.holds.is_empty() {
+                String::new()
+            } else {
+                format!("; holds {}", island.holds.join(", "))
+            },
+            way
+        );
+    }
+    for (hex, size, holds) in &e.closed {
+        let _ = writeln!(
+            text,
+            "- closed as unreached: {size} hexes at {hex}{}",
+            if holds.is_empty() {
+                String::new()
+            } else {
+                format!(", holding {}", holds.join(", "))
+            }
         );
     }
     for passage in &e.passages {

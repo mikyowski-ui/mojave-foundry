@@ -248,6 +248,74 @@ pub struct SlicerConfig {
     /// level runs). Items, doors and containers stay sprites. Empty (the
     /// default), nothing changes.
     pub flat_references: BTreeSet<String>,
+    /// Leave out every shape whose alpha property blends it onto the scene
+    /// instead of over it ([`blends_onto_scene`]): an untextured multiply
+    /// (the vertex coloured shade planes under Fallout 3's Megaton houses)
+    /// or any additive glow (window lights, lamp halos). Drawn with
+    /// ordinary blending such a shape is a blank white plane. Default
+    /// `false`: every shape drawn, as before.
+    pub skip_blend_shapes: bool,
+    /// Leave out every shape whose texture coordinates all fall within one
+    /// texel's worth of the texture ([`fills_flat`]): the whole surface
+    /// samples a single colour, a fill box (Moriarty's Saloon in Megaton
+    /// holds one of 69 triangles), which the key light draws as a blank
+    /// white plane. Default `false`: every shape drawn, as before.
+    pub skip_flat_fills: bool,
+}
+
+/// Whether a material blends by multiplying what is behind it: blending
+/// on (bit 0 of the alpha property's flags), with the source and
+/// destination factors (bits 1 to 4 and 5 to 8: 0 one, 1 zero, 2 source
+/// colour, 4 destination colour) of a multiply.
+pub fn multiplies(material: &nif::Material) -> bool {
+    let Some(flags) = material.alpha_flags else {
+        return false;
+    };
+    let src = (flags >> 1) & 0xf;
+    let dst = (flags >> 5) & 0xf;
+    flags & 1 != 0 && matches!((src, dst), (1, 2) | (4, 1))
+}
+
+/// Whether a material adds itself to what is behind it: blending on and
+/// the destination factor one (a glow).
+pub fn adds(material: &nif::Material) -> bool {
+    material
+        .alpha_flags
+        .is_some_and(|flags| flags & 1 != 0 && (flags >> 5) & 0xf == 0)
+}
+
+/// The widest texture-coordinate span (either axis) of a flat fill
+/// ([`fills_flat`]): under a texel of a 1,024-texel texture.
+pub const FLAT_FILL_SPAN: f32 = 1.0 / 1024.0;
+
+/// [`SlicerConfig::skip_flat_fills`]: a textured shape of at least 8
+/// triangles whose texture coordinates span less than [`FLAT_FILL_SPAN`]
+/// on both axes.
+pub fn fills_flat(primitive: &nif::Primitive) -> bool {
+    if primitive.material.textures.iter().all(String::is_empty) || primitive.indices.len() < 24 {
+        return false;
+    }
+    let Some(uvs) = &primitive.uvs else {
+        return false;
+    };
+    if uvs.is_empty() {
+        return false;
+    }
+    let mut lo = [f32::INFINITY; 2];
+    let mut hi = [f32::NEG_INFINITY; 2];
+    for uv in uvs {
+        for k in 0..2 {
+            lo[k] = lo[k].min(uv[k]);
+            hi[k] = hi[k].max(uv[k]);
+        }
+    }
+    (0..2).all(|k| hi[k] - lo[k] < FLAT_FILL_SPAN)
+}
+
+/// [`SlicerConfig::skip_blend_shapes`]: an untextured multiply, or any
+/// additive shape.
+pub fn blends_onto_scene(material: &nif::Material) -> bool {
+    adds(material) || (material.textures.iter().all(String::is_empty) && multiplies(material))
 }
 
 /// Thin wire and lattice props (shopping carts, wire baskets, grates). A
@@ -397,6 +465,8 @@ impl Default for SlicerConfig {
             wire: None,
             landmark_crop_unreachable: true,
             flat_references: BTreeSet::new(),
+            skip_blend_shapes: false,
+            skip_flat_fills: false,
         }
     }
 }

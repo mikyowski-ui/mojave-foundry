@@ -47,6 +47,12 @@ pub use projection::Projection;
 pub use texture::{MAX_TEXTURE_SIDE, NoTextures, Texture, TextureSource};
 pub use tone::{ClassTones, Tone};
 
+/// The revision of what the renderers draw. Bump it whenever the pixels,
+/// depths or counts a renderer returns for the same scene, window and
+/// calibration change: caches of renders key on it (mojave-convert's render
+/// cache), and an older revision's entries are then never read.
+pub const OUTPUT_REVISION: u32 = 1;
+
 /// How an instance's colours are shaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Shading {

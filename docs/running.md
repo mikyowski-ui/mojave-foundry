@@ -65,7 +65,24 @@ more subcommands read a run's output: `estimate` and `shots` (below), and
 | `mods/mojave/` | the mod layer: maps, art, prototypes, lists, `vault-mod.toml` |
 | `map-report.md` | the interior (on an interior slice), art budget and lists, budget ladder, landmark pieces, ground, open hexes, walkability, entrance, components, passages, islands, exits |
 | `map-features.json` | the map's largest landmarks and buildings (on an interior demo also the room and its people), for `shots --auto` |
+| `map-placements.json` | the placement index the map stage writes beside `map-report.md` (not inside the layer): every placed critter, door, container, item and terminal with its map, elevation, hex, object id and PID as written, and the references of the maps' cells that were left off, each with the stage's reason; the map stage reuses its output only when this file is present; `sim` reads it |
+| `cache/` | the map stage's keys (`map.key`, `maps/<stem>.key`) and, unless `--cache-dir` says otherwise, its render, ground and preview store |
+| `timings.txt` | what each stage and step took, with cache counts; written by `extract`, `sprites`, `critters`, `map`, `all`, `estimate`, `gallery` and `sim`, each replacing the last (no times reach any converted file) |
+| `sim-report.md` | the `sim` stage's counts and cache key (below) |
 | `shots/` | engine screenshots, `index.json`, `contact.png` (from `shots`) |
+
+`--timings` prints what each step took, with the cache counts (hits, misses,
+damaged entries rebuilt, entries written); the same table is always written
+to `<out>/timings.txt` (by the stage commands: `extract`, `sprites`,
+`critters`, `map`, `all`, `estimate`, `gallery` and `sim`). `--cache-dir <dir>` moves the map stage's render,
+ground and preview store (default `<out>/cache`), so that several `--out`
+directories can share one; the stage keys stay in each `<out>/cache`.
+Deleting the store is always safe, and nothing is ever evicted. A changed
+slice key, declutter threshold, builder option or rebalance value redoes
+only the renders and grounds it touches, plus the cheap steps after them
+(pruning, cutting, the builder, the write); a run whose inputs have not
+changed skips the stage as before. The design is in `docs/contracts.md`
+section 2.
 
 `--slice` takes a built-in name (`goodsprings`, `springvale`) or a TOML file; `--config`
 takes a calibration TOML (`docs/contracts.md`, section 4); `--backend gpu`
@@ -253,6 +270,15 @@ with the pass off is an error.
 | `cutaway`, `kerb_height`, `cutaway_exteriors` | on, 35, `false` | the foreground cutaway; outdoors only when asked |
 | `outline`, `outline_factor` | on, 0.45 | the dark outline of interactive sprites |
 | `measure_baseline` | `true` | also measure the window without the pass |
+| `prune_misc`, `prune_misc_max_value`, `prune_misc_max_weight` | on, 1, 1 | prune decorative miscellaneous items (`MISC`) worth at most that many caps and weighing at most that much; only in the readable profile |
+
+A miscellaneous item is pruned as decorative (skip reason "decorative
+item", counted in `## Declutter`) only when nothing marks it as part of the
+game: it is unreferenced (`referenced_refs`), not persistent, has no editor
+id and no linked reference, and its base has no script, and its base is
+within both thresholds. Weapons, ammunition, aid, keys, armour, notes, books
+and every `MISC` above the thresholds stay protected by kind;
+`prune_misc = false` turns the rule off.
 
 `[tone.floor]`, `[tone.props]` and `[tone.figures]` take `gain`, `gamma`,
 `saturation` and `contrast` over the preset's curves. The slicer tones the
@@ -324,6 +350,7 @@ the build keeping their stub maps, one art budget for the whole layer.
 name = "super-duper-mart"     # the layer; the report's title
 start = "sdmart"              # the start map's stem (default: the first map)
 with_interiors = false        # also every interior the exterior's doors lead to
+close_unreached = false       # true: close every walkable component no walk from the start map's entrance reaches
 
 [all_maps]                    # slice keys laid over every map's slice
 loot = true
@@ -343,6 +370,13 @@ storeys = "auto"
 [[maps]]
 interior = "MegatonClinic"    # no slice file: the first exterior's keys, as an interior
 ```
+
+`close_unreached = true` closes every walkable component that no walk from
+the start map's entrance reaches through the layer's links (stepping on an
+exit grid goes on from its arrival hex): the hexes become not walkable, no
+person, entrance or arrival stands on them, and each is listed as "closed
+as unreached". Off by default, so a layer keeps its bytes; the reach is
+reported either way.
 
 Every map must be of one game, one plugin list and one worldspace: extract,
 sprites and critters run once over their union (the union of the cell
@@ -369,6 +403,9 @@ window) lead to, each with the exterior's keys, `place_disabled = true`,
 | `navmesh_coverage` | `tolerance` | `centre` or `share:F`; `share:0.5` is recommended indoors with footprints |
 | `sight` | `any` | `visible`: `## Readability` counts a figure covered only when more than a quarter of its box is under art drawn after it |
 | `entrance_sight` | `any` | the entrance rule's sight |
+| `navmesh_only` | off | exterior: cells without a navmesh are not walkable when the window has one elsewhere (`BuildOptions::navmesh_only`); used for the ground outside Megaton's wall |
+| `vertex_color_floor` | 0 | exterior: the darkest a land vertex colour may make the ground, 0 to 1 (`TerrainOptions::vertex_color_floor`) |
+| `coverage_bridges` | off | with a strict `navmesh_coverage`, joins the islands it cuts out of one floor through hexes the tolerance rule covers, at most 8 per join (`BuildOptions::coverage_bridges`) |
 
 These keys are read on a one-map run as well, each only when present; a
 slice with `storeys = "auto"` or `levels = "auto"` is built as a layer of
@@ -430,6 +467,49 @@ scripts/layer-check.sh <vault-platform> <Fallout 2> <dir> 4000 <mojave-convert>
 `--chaos-doors-c4` autoplay from the start map; the summary is
 `<dir>/engine-check/summary.txt`.
 
+Each elevation's section of the report carries, besides its components,
+passages and islands left:
+
+- `reached from the layer's start through links: R of N`: the walkable hexes
+  a walk from the start map's entrance reaches (stepping on an exit grid
+  continues from its arrival hex), of the elevation's planned walkable
+  hexes, with the share;
+- `island <size> hexes at <hex>: ...`: each walkable component other than
+  the main one, saying whether the ground joins it to the main component
+  ("the ground joins it to the main component", with `in the way:` the hexes
+  that are not walkable on the shortest way and what keeps them so: a wall
+  strip, scenery, a footprint, relief), or keeps it apart ("the ground keeps
+  it apart", or "... under this coverage rule, the tolerance rule would join
+  it"), whether it is "reached through links" or "NOT reached through
+  links", and what it holds (grids, arrivals, critters);
+- `closed as unreached: <size> hexes at <hex>, holding ...`, with
+  `close_unreached`;
+- `moved off link hexes: N`, a line of the map's `## Notes` (prefixed
+  `elevation <e>: ` above elevation 0): the ground items and containers the
+  builder moved off the exit grids of links (below).
+
+**Ground loot and exit grids.** Links between elevations and maps are
+walk-over exit grids, so a bot that collects items first steps onto a grid
+lying under an item and is carried away. In a layer with links, no ground
+item, no container that does not block its hex and no critter's standing hex
+is on an exit grid hex of a link (a door's grids or a stair's), on a link's
+arrival hex, or within one hex of a stair's grid hex
+(`map_builder::clearance::STAIRS_KEEP_CLEAR_RADIUS`; a door keeps only its
+grid hexes and arrival hexes, `DOOR_KEEP_CLEAR_RADIUS` 0, since door mats
+legitimately have clutter nearby). An item placed there moves to the nearest
+free walkable hex outside that set, in the same walkable component when it
+has room, ties to the lowest hex; critters are placed clear of it. A
+container that blocks its hex stays (it cannot stand on a grid, which is
+walkable). A map without links is written as before. `verify_clearance`
+checks the written maps and fails the build otherwise.
+
+**Known limits.** Stairs are walk-over exit grids, not stair objects: a
+walker steps onto the grid and the map reloads on the other elevation. A
+building's far side is drawn under its roof, so a walker behind a tall
+building is seen through the engine's see-through circle (not standing on
+the roof). Upper exterior levels draw over black: an elevation above 0 has
+floor only under its decks.
+
 ### Critter stage options
 
 | Flag (on `critters`, `all`) | Slice key | Default | What |
@@ -437,10 +517,11 @@ scripts/layer-check.sh <vault-platform> <Fallout 2> <dir> 4000 <mojave-convert>
 | `--animations minimal\|combat\|full` | `animations` | `minimal` | a stand, a walk and stills (the first wave's bytes); combat adds every unarmed animation the source has and the armed set of the weapon carried; full adds pistol and rifle sets for everyone |
 | `--deaths ragdoll\|game` | `deaths` | `ragdoll` | falls and corpses from the physics sampler, or the game's knock-downs |
 | `--stride exact\|matched\|whole_hexes` | `stride` | `exact` | walk travel against the grid |
-| `--figure-look default\|readable` | `figure_look` | `default` | the readable look: the figures tone and a dark rim; `[tone.figures]` is laid over it |
+| `--figure-look default\|readable` | `figure_look` | `readable` with the readable declutter profile and an animation level above `minimal`, else `default` | the readable look: a dark 1-pixel rim and the figures tone; `[tone.figures]` is laid over it; `default` (or `--figure-look default`) turns it off |
 | `--only <editor id>` | | all | render only these actors |
 
-A figure look needs `combat` or `full`. The Fallout 3 slices say
+A figure look needs `combat` or `full`; the readable declutter profile turns
+it on there unless the slice or the flag says `default`. The Fallout 3 slices say
 `animations = "combat"`; the New Vegas ones keep `minimal`, so their
 layers stay byte-identical. A combat set is about 3.5 to 4.6 MB and 21 to
 24 animation files of six directions. `--rebalance` is on every
@@ -466,6 +547,34 @@ To play a converted map in a `vault-engine` build:
 ```
 scripts/play.sh <vault-platform binary> <Fallout 2 install> <the --out directory>
 ```
+
+### Sim
+
+```
+mojave-convert sim --out <dir>
+```
+
+`sim` reads an already-built `--out` directory: the MIR (`mir/`), the layer
+(`mods/mojave`) and the placement index `map-placements.json`, which the map
+stage writes beside `map-report.md` (not inside the layer). It needs no game
+install, renders nothing, slices and builds no map, and changes no file of
+the layer. It checks that the three belong together (the same game, every
+indexed map registered in the layer's manifest), counts what the source has
+for the placed references (scripts, packages, dialogue infos, topics and
+quests, terminals and notes, and how many placed critters and objects have a
+script, packages or dialogue), prints those counts and the stage cache key
+(`sim-1:` and a hash of the game, slice, plugins, MIR rows, base files, the
+map stage's key from `<out>/cache/map.key`, every map's bytes and the index), and writes `sim-report.md` beside
+`map-report.md` (no time, host or path: a second run on the same output is
+byte-identical). `--timings` prints what the stage took (the table is always written to
+`<out>/timings.txt`). On the real Super-Duper Mart layer the stage reads the
+index in about a quarter of a second warm. A directory without
+`map-placements.json` is read from its built maps instead, with a warning
+(no references, bases or enable parents). No scripts are compiled yet; this
+is the scaffold of Pass 2 (`docs/simulation-layer-spec.md`). Two parts of the
+cache key are placeholders today: the transpiler version and the `[sim]` table
+of `foundry.toml`, which the scaffold does not read. The interfaces are in
+`docs/contracts.md` section 11.
 
 ## Building
 
@@ -496,3 +605,17 @@ local `vault-engine` checkout instead of the network, copy
 
 Shared interfaces are in `docs/contracts.md`. Requests to `vault-engine` are
 in `docs/vault-engine-briefs/`.
+
+## Gate
+
+`scripts/gate.sh` runs the local gate in order and stops at the first failure:
+`cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, the clean-room
+brief linter, and then byte-identity checks of the Goodsprings and Prospector
+Saloon conversions against local baselines (`out/baseline-goodsprings-2.sha`,
+`out/baseline-saloon.sha`; the file counts must match too). Give the installs
+with `FNV_DIR` and `F2_DIR` (or `--fnv` and `--f2`); `GATE_BASELINES`,
+`GATE_SCRATCH`, `GATE_BIN` and `GATE_JOBS` override the defaults. Without the
+installs or baselines the last step prints a SKIP line and the gate still
+passes, unless `GATE_REQUIRE_REAL=1`; `--fast` skips it on purpose.
+`scripts/gate.sh briefs` runs only the brief linter, and
+`scripts/gate.sh briefs --self-test` checks the linter itself.

@@ -212,7 +212,10 @@ mod strips;
 mod tests;
 
 pub use classify::{Class, ClassKind, Footprint, MeshFacts, SkipReason, classify, masked_share};
-pub use config::{Budget, BudgetLadder, SlicerConfig, WireRule};
+pub use config::{
+    Budget, BudgetLadder, FLAT_FILL_SPAN, SlicerConfig, WireRule, adds, blends_onto_scene,
+    fills_flat, multiplies,
+};
 pub use declutter::{
     ClutterRules, Cutaway, DecalMode, DeclutterProfile, DensityRule, DoorStub, OverhangRule,
     Protection, RoofCut, ShellCut, WalkerCover, floor_stats, walker_cover,

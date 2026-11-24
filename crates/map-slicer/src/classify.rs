@@ -219,6 +219,10 @@ pub enum SkipReason {
     /// The model is a tree in a format the converter does not read
     /// (SpeedTree `.spt`): it has no mesh.
     TreeFormat,
+    /// Declutter: a decorative item the caller named
+    /// ([`crate::DeclutterProfile::decorative_items`]: in the converter, an
+    /// unreferenced miscellaneous item of little value and weight).
+    DecorativeItem,
 }
 
 /// The share of a mesh's triangle area whose material is alpha-tested or
@@ -277,6 +281,7 @@ impl SkipReason {
             SkipReason::Overhang => "overhang",
             SkipReason::Wire => "wire prop",
             SkipReason::TreeFormat => "tree format not converted",
+            SkipReason::DecorativeItem => "decorative item",
         }
     }
 
@@ -289,6 +294,7 @@ impl SkipReason {
                 | SkipReason::ClutterDensity
                 | SkipReason::Decal
                 | SkipReason::Overhang
+                | SkipReason::DecorativeItem
         )
     }
 }

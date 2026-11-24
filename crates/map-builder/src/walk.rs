@@ -626,7 +626,7 @@ pub fn verdicts(
             } else if has_navmesh {
                 stats.rejected_navmesh += 1;
                 Some(Verdict::OffNavmesh)
-            } else if level.level > 0 {
+            } else if level.level > 0 || (options.navmesh_only && !nav_cells.is_empty()) {
                 stats.rejected_no_ground += 1;
                 Some(Verdict::NoGround)
             } else {
@@ -654,6 +654,11 @@ pub fn verdicts(
             }
             verdicts[hex] = Verdict::Walkable;
             stats.walkable += 1;
+            continue;
+        }
+        if !has_navmesh && options.navmesh_only && !nav_cells.is_empty() {
+            stats.rejected_no_ground += 1;
+            verdicts[hex] = Verdict::NoGround;
             continue;
         }
         if !has_navmesh {
@@ -717,15 +722,22 @@ fn interior_triangles<'a>(
         .filter(|cell| cell.is_interior())
         .flat_map(|cell| cell.navmeshes.iter())
         .flat_map(move |navmesh| {
+            let form = interior
+                .triangles
+                .as_ref()
+                .map(|_| navmesh.form.to_string());
             (0..navmesh.triangles.len()).map(move |index| match navmesh.corners(index) {
                 None => Level::Unreadable,
                 Some(corners) if corners.iter().flatten().any(|v| !v.is_finite()) => {
                     Level::Unreadable
                 }
-                Some(corners) if corners.iter().all(|v| interior.in_band(v[2])) => {
-                    Level::On(corners)
+                Some(corners) => {
+                    let on = match (&interior.triangles, &form) {
+                        (Some(set), Some(form)) => set.contains(&(form.clone(), index as u32)),
+                        _ => corners.iter().all(|v| interior.in_band(v[2])),
+                    };
+                    if on { Level::On(corners) } else { Level::Off }
                 }
-                Some(_) => Level::Off,
             })
         })
 }
@@ -797,6 +809,7 @@ pub fn dominant_floor_z(cells: &[CellDoc]) -> Option<f32> {
     let everything = InteriorBuild {
         below: f32::INFINITY,
         above: f32::INFINITY,
+        triangles: None,
         ..InteriorBuild::default()
     };
     for level in interior_triangles(cells, &everything) {
@@ -893,6 +906,114 @@ pub fn standable_hexes(
                 })
         })
         .collect()
+}
+
+/// The longest join [`bridge_coverage`] makes, in hexes it adds.
+pub const BRIDGE_MAX_LENGTH: usize = 8;
+
+/// [`crate::BuildOptions::coverage_bridges`]: under a coverage rule
+/// stricter than [`NavmeshCoverage::Tolerance`], a narrow flight of steps
+/// or a doorway the rule leaves uncovered cuts one navmesh floor into
+/// islands. Every walkable component is joined to the largest one it
+/// shares a component with under the tolerance rule (the same `blocked`
+/// hexes), through the fewest tolerance-covered hexes, at most
+/// `max_length` hexes per join; those hexes become
+/// [`Verdict::Walkable`]. Returns the hexes added (sorted). Nothing
+/// changes under the tolerance rule itself.
+pub fn bridge_coverage(
+    frame: &Frame,
+    sampler: &GroundSampler,
+    cells: &[CellDoc],
+    blocked: &[bool],
+    options: &BuildOptions,
+    grid: &mut [Verdict],
+    max_length: usize,
+) -> Vec<i32> {
+    if options.navmesh_coverage == NavmeshCoverage::Tolerance {
+        return Vec::new();
+    }
+    let loose = BuildOptions {
+        navmesh_coverage: NavmeshCoverage::Tolerance,
+        ..options.clone()
+    };
+    let (tolerant, _) = verdicts(frame, sampler, cells, blocked, &loose);
+    let mut added: BTreeSet<i32> = BTreeSet::new();
+    loop {
+        let walkable = |h: i32| grid[h as usize] == Verdict::Walkable;
+        let comps = crate::islands::components(walkable);
+        if comps.len() < 2 {
+            break;
+        }
+        let union = crate::islands::components(|h| {
+            walkable(h) || tolerant[h as usize] == Verdict::Walkable
+        });
+        let mut joined = false;
+        // Each component, smallest first, towards a larger one in its
+        // tolerance component.
+        for id in (1..comps.len()).rev() {
+            let Some(first) = comps.first_hex(id) else {
+                continue;
+            };
+            let Some(region) = union.of(first) else {
+                continue;
+            };
+            let larger: Vec<bool> = (0..HEXES as i32)
+                .map(|h| comps.of(h).is_some_and(|c| c < id) && union.of(h) == Some(region))
+                .collect();
+            if !larger.iter().any(|v| *v) {
+                continue;
+            }
+            let mut parent = vec![-2i32; HEXES];
+            let mut depth = vec![0usize; HEXES];
+            let mut queue = std::collections::VecDeque::new();
+            for h in comps.members(id) {
+                parent[h as usize] = -1;
+                queue.push_back(h);
+            }
+            let mut end = None;
+            while let Some(h) = queue.pop_front() {
+                if larger[h as usize] {
+                    end = Some(h);
+                    break;
+                }
+                if depth[h as usize] > max_length {
+                    continue;
+                }
+                for n in neighbours(h) {
+                    let u = n as usize;
+                    if parent[u] == -2 && union.of(n) == Some(region) {
+                        parent[u] = h;
+                        depth[u] = depth[h as usize] + usize::from(!walkable(n));
+                        queue.push_back(n);
+                    }
+                }
+            }
+            let Some(end) = end else {
+                continue;
+            };
+            let mut at = parent[end as usize];
+            let mut path = Vec::new();
+            while at >= 0 {
+                if grid[at as usize] != Verdict::Walkable {
+                    path.push(at);
+                }
+                at = parent[at as usize];
+            }
+            if path.is_empty() || path.len() > max_length {
+                continue;
+            }
+            for h in path {
+                grid[h as usize] = Verdict::Walkable;
+                added.insert(h);
+            }
+            joined = true;
+            break;
+        }
+        if !joined {
+            break;
+        }
+    }
+    added.into_iter().collect()
 }
 
 /// The six neighbours of `hex` that are on the grid.

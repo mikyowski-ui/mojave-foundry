@@ -1490,9 +1490,17 @@ On the real layer, in the engine, by the owner (headless checks first):
 6. NPCs with schedules are where their package puts them at a chosen hour
    (advance time with rest) and walk between places.
 
-## 13. Open questions for the owner
+## 13. Owner decisions (locked 2026-11-23)
 
-Each has a default that the build uses unless the owner says otherwise.
+The owner accepted all 15 defaults below as written, on 2026-11-23. They
+are decisions for Pass 2, no longer open: forever (1), 1:1 (2), automatic
+lock and hack (3), holodisks with voice notes as text (4), presence copies
+for named actors (5), sfall off (6), a whole `scripts.lst` with brief S
+filed (7), objectives only (8), `sim-ids.toml` off for Pass 2 (9),
+`vault-vm` as a pinned dev-dependency for tests (10), Megaton and raider
+teams (11), essential ignored and reported (12), a shadow karma global
+(13), hello barks off (14), New Vegas failed checks shown as "25/50" and
+selectable (15). The questions are kept as they were asked.
 
 1. **Speech challenge memory.** Remember a challenge's outcome forever
    (re-asking repeats the branch), or roll on every selection? Default:

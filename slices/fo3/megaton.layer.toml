@@ -8,7 +8,13 @@
 name = "megaton"
 start = "megaton"
 
+# What the start cannot reach through the links is closed and reported.
+close_unreached = true
+
 [all_maps]
+# Islands a strict navmesh coverage rule cuts out of one floor are joined
+# again through the hexes the tolerance rule covers.
+coverage_bridges = true
 loot = true
 animations = "combat"
 wire = true

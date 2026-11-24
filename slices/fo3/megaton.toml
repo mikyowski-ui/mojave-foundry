@@ -15,3 +15,9 @@ map_center = [-2048.0, -26624.0]
 # fights' animations and the weapon in hand). See docs/running.md.
 loot = true
 animations = "combat"
+# The fix pass: the ground outside the wall has no navmesh and no way in
+# (closed instead of judged by slope), and the crater's land is painted
+# dark in its vertex colours, which its own sunlight lifts: lifted here so
+# that the floor does not quantize to black.
+navmesh_only = true
+vertex_color_floor = 0.4

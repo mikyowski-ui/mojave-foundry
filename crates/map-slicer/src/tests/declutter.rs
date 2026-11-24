@@ -679,3 +679,97 @@ fn the_ladder_never_demotes_a_protected_terminal() {
     assert_eq!(of(&protected, 1).len(), 1);
     assert!(of(&protected, 2).is_empty());
 }
+
+#[test]
+fn decorative_items_are_pruned_unless_referenced() {
+    // Three "MISC" items on a table: two named decorative, one of those
+    // also a quest reference; and a third left alone. The kind protects all
+    // of them otherwise.
+    let mut refs = room();
+    let table = [280.0, 0.0];
+    for (n, id) in [300u32, 301, 302].into_iter().enumerate() {
+        refs.push(put(
+            id,
+            "MISC",
+            "small",
+            [table[0] - 20.0 + 20.0 * n as f32, table[1] - 15.0],
+            55.0,
+            0.0,
+        ));
+    }
+    let mut profile = readable();
+    profile.decorative_items = [key(300), key(301)].into_iter().collect();
+    profile.protected_refs.insert(key(301));
+    let config = indoors(Some(profile));
+    let sliced = run(&assets(), &refs, &on_floor(), &big_budget(), &config).expect("slices");
+    assert_eq!(skip_of(&sliced, 300), Some(&SkipReason::DecorativeItem));
+    assert!(of(&sliced, 300).is_empty());
+    assert_eq!(skip_of(&sliced, 301), None, "referenced: kept");
+    assert!(!of(&sliced, 301).is_empty());
+    assert_eq!(skip_of(&sliced, 302), None, "not named: kept by kind");
+    assert!(!of(&sliced, 302).is_empty());
+    let stats = sliced.report.declutter.as_ref().expect("stats");
+    assert_eq!(stats.pruned.get("decorative item"), Some(&1));
+    assert!(SkipReason::DecorativeItem.is_declutter());
+    // An empty set changes nothing.
+    let plain = run(
+        &assets(),
+        &refs,
+        &on_floor(),
+        &big_budget(),
+        &indoors(Some(readable())),
+    )
+    .expect("slices");
+    assert_eq!(skip_of(&plain, 300), None);
+}
+
+#[test]
+fn multiply_blended_shapes_are_recognised() {
+    let mut m = nif::Material::default();
+    assert!(!crate::multiplies(&m), "no alpha property");
+    // Blending on, source zero, destination source colour: a multiply.
+    m.alpha_flags = Some(1 | (1 << 1) | (2 << 5) | 0x1000);
+    assert!(crate::multiplies(&m));
+    // Source destination colour, destination zero: a multiply too.
+    m.alpha_flags = Some(1 | (4 << 1) | (1 << 5));
+    assert!(crate::multiplies(&m));
+    // Ordinary alpha blending (source alpha, inverse source alpha).
+    m.alpha_flags = Some(1 | (6 << 1) | (7 << 5));
+    assert!(!crate::multiplies(&m));
+    // The multiply factors with blending off.
+    m.alpha_flags = Some((1 << 1) | (2 << 5));
+    assert!(!crate::multiplies(&m));
+    // Additive glows (source alpha, destination one), textured or not.
+    m.alpha_flags = Some(0x100d);
+    assert!(crate::adds(&m) && crate::blends_onto_scene(&m));
+    m.textures = vec!["textures\\effects\\fxwhite.dds".to_owned()];
+    assert!(crate::blends_onto_scene(&m));
+    // A textured multiply decal is drawn; an untextured one is not.
+    m.alpha_flags = Some(1 | (1 << 1) | (2 << 5));
+    assert!(!crate::blends_onto_scene(&m));
+    m.textures.clear();
+    assert!(crate::blends_onto_scene(&m));
+    // Ordinary alpha blending is drawn.
+    m.alpha_flags = Some(1 | (6 << 1) | (7 << 5));
+    assert!(!crate::blends_onto_scene(&m));
+}
+
+#[test]
+fn a_shape_sampling_one_texel_is_a_flat_fill() {
+    let mut mesh = mesh(&nif::fixture::box_mesh([100.0, 100.0, 300.0], WALL));
+    let mut p = mesh.primitives.remove(0);
+    p.material.textures = vec!["textures\\test\\wall.dds".to_owned()];
+    let n = p.positions.len();
+    p.uvs = Some((0..n).map(|i| [i as f32 / n as f32, 0.5]).collect());
+    assert!(!crate::fills_flat(&p), "a spread of texture coordinates");
+    p.uvs = Some(vec![[0.8146, 0.0050]; n]);
+    assert!(p.indices.len() >= 24);
+    assert!(crate::fills_flat(&p));
+    // Untextured, or too small to matter: not a fill.
+    let mut bare = p.clone();
+    bare.material.textures.clear();
+    assert!(!crate::fills_flat(&bare));
+    let mut tiny = p.clone();
+    tiny.indices.truncate(6);
+    assert!(!crate::fills_flat(&tiny));
+}

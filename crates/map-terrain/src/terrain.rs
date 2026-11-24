@@ -348,6 +348,8 @@ pub(crate) struct Terrain {
     /// true unless the caller set the tone.
     substitute: bool,
     fallback_rgb: [f32; 3],
+    /// [`crate::TerrainOptions::vertex_color_floor`].
+    vertex_floor: f32,
     /// Sub-sample offsets in source units, relative to the pixel centre.
     offsets: Vec<[f64; 2]>,
     pub cells_with_land: usize,
@@ -470,6 +472,7 @@ impl Terrain {
             missing_rgb,
             substitute: options.missing_texture_rgb.is_none(),
             fallback_rgb: options.fallback_rgb.map(f32::from),
+            vertex_floor: options.vertex_color_floor,
             offsets: Vec::new(),
             cells_with_land: 0,
             cells_without_land: 0,
@@ -760,7 +763,12 @@ impl Terrain {
         if let Some(colors) = &cell.colors {
             for (k, channel) in rgb.iter_mut().enumerate() {
                 let grid = ColorChannel { colors, channel: k };
-                *channel *= grid.at(u, v);
+                let c = grid.at(u, v);
+                *channel *= if self.vertex_floor > 0.0 {
+                    self.vertex_floor + (1.0 - self.vertex_floor) * c
+                } else {
+                    c
+                };
             }
         }
         if let Some(n) = sampler.normal(x as f32, y as f32) {

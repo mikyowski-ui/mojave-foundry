@@ -146,6 +146,46 @@ impl GroundSampler {
         );
     }
 
+    /// A content hash of everything the sampler answers from (every cell's
+    /// heights and normals, and the flat floor), lowercase hex SHA-256: two
+    /// samplers with one digest give every query the same answer. For cache
+    /// keys.
+    pub fn digest(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"ground-sampler-1");
+        match self.flat {
+            Some(z) => {
+                hasher.update([1]);
+                hasher.update(z.to_bits().to_le_bytes());
+            }
+            None => hasher.update([0]),
+        }
+        hasher.update((self.cells.len() as u64).to_le_bytes());
+        for ((x, y), grid) in &self.cells {
+            hasher.update(x.to_le_bytes());
+            hasher.update(y.to_le_bytes());
+            hasher.update((grid.heights.len() as u64).to_le_bytes());
+            for h in &grid.heights {
+                hasher.update(h.to_bits().to_le_bytes());
+            }
+            match &grid.normals {
+                Some(normals) => {
+                    hasher.update([1]);
+                    for n in normals {
+                        hasher.update(n.map(|c| c as u8));
+                    }
+                }
+                None => hasher.update([0]),
+            }
+        }
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
     /// Whether there is no ground at all: no terrain was loaded and there
     /// is no flat floor.
     pub fn is_empty(&self) -> bool {
@@ -277,6 +317,40 @@ mod tests {
             colors: None,
             layers: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_digest_follows_every_height_and_the_floor() {
+        let mut a = GroundSampler::default();
+        a.insert(0, 0, &land(|r, c| (r + c) as f32));
+        let mut b = GroundSampler::default();
+        b.insert(0, 0, &land(|r, c| (r + c) as f32));
+        assert_eq!(a.digest(), b.digest());
+        assert_eq!(a.digest().len(), 64);
+        let mut c = GroundSampler::default();
+        c.insert(
+            0,
+            0,
+            &land(|r, c| {
+                if r == 3 && c == 4 {
+                    7.5
+                } else {
+                    (r + c) as f32
+                }
+            }),
+        );
+        let mut moved = GroundSampler::default();
+        moved.insert(1, 0, &land(|r, c| (r + c) as f32));
+        let digests = [
+            a.digest(),
+            c.digest(),
+            moved.digest(),
+            GroundSampler::flat(10.0).digest(),
+            GroundSampler::flat(12.0).digest(),
+            GroundSampler::default().digest(),
+        ];
+        let distinct: std::collections::BTreeSet<&String> = digests.iter().collect();
+        assert_eq!(distinct.len(), digests.len());
     }
 
     #[test]

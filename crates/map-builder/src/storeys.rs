@@ -101,6 +101,8 @@ pub struct Floor {
     pub min: [f32; 2],
     pub max: [f32; 2],
     pub centre: [f32; 2],
+    /// Its triangles: navmesh form key and index there, sorted.
+    pub members: Vec<(String, u32)>,
 }
 
 impl Floor {
@@ -329,6 +331,11 @@ fn describe(tris: &[Tri], members: &[usize]) -> Floor {
     } else {
         [(min[0] + max[0]) / 2.0, (min[1] + max[1]) / 2.0]
     };
+    let mut keys: Vec<(String, u32)> = members
+        .iter()
+        .map(|i| (tris[*i].navmesh.clone(), tris[*i].index))
+        .collect();
+    keys.sort();
     Floor {
         floor_z: median_z(tris, members),
         z_range,
@@ -337,6 +344,7 @@ fn describe(tris: &[Tri], members: &[usize]) -> Floor {
         min,
         max,
         centre,
+        members: keys,
     }
 }
 

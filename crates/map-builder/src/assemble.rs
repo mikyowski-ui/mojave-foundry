@@ -257,6 +257,7 @@ pub(crate) fn build(input: &BuildInput) -> Result<Built, BuildError> {
         isolated: interior.is_some(),
         link_doors: false,
         catalogue: options.catalogue.clone(),
+        close_unreached: false,
     };
     let layer = LayerInput {
         layer_id: input.layer_id,
@@ -426,6 +427,30 @@ pub(crate) fn build_layer(input: &LayerInput) -> Result<BuiltLayer, BuildError> 
             )),
             other => other,
         })?;
+    }
+    // Islands, diagnosed before anything is closed (crate notes, "Reach").
+    let diagnoses: Vec<Vec<Vec<crate::reach::IslandDiagnosis>>> = plans
+        .iter()
+        .map(|plan| {
+            (0..plan.elevations.len())
+                .map(|e| {
+                    let main_hex = if e == plan.entrance_elevation {
+                        plan.entrance_hex()
+                    } else {
+                        plan.elevations[e].arrivals.first().map(|(hex, _)| *hex)
+                    };
+                    crate::reach::diagnose(plan, e, main_hex)
+                })
+                .collect()
+        })
+        .collect();
+    // What the start cannot reach.
+    if options.close_unreached {
+        crate::reach::close_unreached(&mut plans);
+    }
+    // Nothing to pick up on a link's hexes (crate notes, "Link clearance").
+    for plan in &mut plans {
+        crate::clearance::move_off_links(plan);
     }
     // The catalogue, checked against every plan before anything is
     // written.
@@ -988,6 +1013,7 @@ pub(crate) fn build_layer(input: &LayerInput) -> Result<BuiltLayer, BuildError> 
     };
 
     // The maps' objects and files.
+    let reach = crate::reach::planned_reach(&plans);
     let mut built_maps: Vec<BuiltMap> = Vec::new();
     for (m, plan) in plans.iter().enumerate() {
         let mut report = BuildReport {
@@ -1233,6 +1259,17 @@ pub(crate) fn build_layer(input: &LayerInput) -> Result<BuiltLayer, BuildError> 
                     components.leaked
                 ));
             }
+            if elevation.moved_off_links > 0 {
+                report.notes.push(format!(
+                    "{}moved off link hexes: {}",
+                    if plan.elevations.len() > 1 && e > 0 {
+                        format!("elevation {e}: ")
+                    } else {
+                        String::new()
+                    },
+                    elevation.moved_off_links
+                ));
+            }
             let readability = crate::readability::measure(
                 &elevation.verdicts,
                 &elevation.walkable,
@@ -1265,6 +1302,25 @@ pub(crate) fn build_layer(input: &LayerInput) -> Result<BuiltLayer, BuildError> 
                     .iter()
                     .map(|c| c.reference.clone())
                     .collect(),
+                islands: {
+                    let mut islands = diagnoses[m][e].clone();
+                    if let Some(r) = &reach {
+                        for island in &mut islands {
+                            island.reached = Some(r[m][e][island.first_hex as usize]);
+                        }
+                    }
+                    islands
+                },
+                reached: reach.as_ref().map(|r| {
+                    (
+                        (0..HEXES)
+                            .filter(|h| elevation.walkable[*h] && r[m][e][*h])
+                            .count(),
+                        elevation.walkable.iter().filter(|w| **w).count(),
+                    )
+                }),
+                closed: elevation.closed.clone(),
+                moved_off_links: elevation.moved_off_links,
             });
         }
         // Furniture: the footprints used, and upright art walkers can stand
@@ -1499,6 +1555,7 @@ pub(crate) fn build_layer(input: &LayerInput) -> Result<BuiltLayer, BuildError> 
         }
     }
     let links = crate::verify_links(&builder.layer, input.base_files)?;
+    crate::verify_clearance(&builder.layer, input.base_files, &built_maps)?;
     if let Some(loot) = loot.as_mut() {
         let check = crate::verify_loot(&builder.layer, input.base_files)?;
         if let Some(item) = loot

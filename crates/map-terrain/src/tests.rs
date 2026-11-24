@@ -992,6 +992,14 @@ fn options_are_validated() {
             cluster_iterations: 1000,
             ..options()
         },
+        TerrainOptions {
+            vertex_color_floor: 1.5,
+            ..options()
+        },
+        TerrainOptions {
+            vertex_color_floor: f32::NAN,
+            ..options()
+        },
     ];
     for o in bad {
         assert!(

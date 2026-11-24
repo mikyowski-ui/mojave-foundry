@@ -111,6 +111,20 @@ the record is skipped.
 **Bad records.** One undecodable record never stops an extract. It is
 counted, listed in `report.md` with its form and offset, and skipped.
 
+**Caches below the stage keys (2026-11-24).** A stage key (`cache/map.key`)
+says whether a whole stage can be skipped. When it cannot, the map stage
+takes units from a content-hash store under `--cache-dir` (default
+`<out>/cache`): every renderer call the slicer makes, keyed by the scene's
+content, the texture content hashes, the window, the calibration, the backend
+and `foundry_render::OUTPUT_REVISION`; every terrain ground, keyed by its land
+inputs, the sampler digest (`GroundSampler::digest`), the overlay pixels, the
+options (except `jobs`) and `map_terrain::OUTPUT_REVISION`; and every
+preview PNG, keyed by its pixels and palette. No key holds a path or a time.
+An entry is a header (magic, kind, key, length, SHA-256 of the payload)
+followed by the payload; an entry failing any check is deleted and its work
+redone; entries are written under a temporary name and renamed; nothing is
+evicted. Source: `crates/mojave-convert/src/cache.rs`.
+
 ## 3. Mesh interchange (`.glb`)
 
 `.glb` is the interface between extraction and rendering. Files are valid
@@ -211,6 +225,10 @@ applied at extraction.
   absolute paths in outputs.
 - `--jobs` changes speed only. Parallel work is collected and written in a
   sorted order.
+- A cached unit is byte-identical to the work it replaces. Bump the crate's
+  `OUTPUT_REVISION` (`foundry_render`, `map_terrain`) when its output
+  changes, and the `cache` module's revision constants (`RENDER_REVISION`,
+  `GROUND_REVISION`, `PREVIEW_REVISION`) when a key or an encoding changes.
 - The GPU and CPU render paths agree within the tolerance stated in
   `foundry-render`. Byte-identical output across machines is guaranteed
   only for the CPU path; a cache entry records which path produced it.
@@ -368,7 +386,10 @@ registered in the manifest's `[[maps]]`.
 is the `SlicerConfig` every map run starts from: New Vegas gets
 `SlicerConfig::default()` unchanged; Fallout 3 replaces the pattern lists
 (`relief_patterns`, `flat_patterns`, `sprite_patterns`, `name_prefixes`)
-with the Capital Wasteland's. Nothing else differs.
+with the Capital Wasteland's, and also sets `skip_blend_shapes` (leave out
+shapes that blend onto the scene: untextured multiply planes and additive
+glows, which draw as blank white planes) and `skip_flat_fills` (leave out
+shapes whose texture coordinates sample one texel). Nothing else differs.
 
 **Declutter wiring** (2026-11-23). `SlicerConfig::declutter` is `None`
 unless the run's profile (`Inputs::declutter_profile`: `--declutter`,
@@ -801,6 +822,65 @@ one-map path of 9.4 to 9.6, byte for byte. The code is
   map's. Cache: `cache/map.key` is the layer's key (the layer file, the
   stems, and `map::cache_key` of every map's inputs); `cache/maps/<stem>.key`
   each map's.
+- **Placement index.** On both paths (`layer`, and `map::map` for one map)
+  the stage writes `map-placements.json` beside `map-report.md`: every placed
+  critter, door, container, item and terminal with its map, elevation, hex,
+  object id and PID as written, plus the references of the maps' cells that
+  were left off, each with the stage's reason, and the stub maps listed with
+  no references. Schema in section 11.2. The stage reuses its output only
+  when this file is present (`placements::is_current`: it reads, is of this
+  schema version and has origin `stage`). Items the builder moved off link
+  hexes are matched to their object by the nearest free item object within
+  12 steps (`placements::MOVED_RADIUS`), a heuristic; the file's notes count
+  them.
+- **Reach** (`map_builder::reach`). Every walkable component of an
+  elevation other than the main one is diagnosed against the elevation's own
+  ground rule with nothing blocked (`reach::IslandDiagnosis`, in
+  `ElevationReport::islands`): whether the ground joins it to the main
+  component (and on the shortest way, each hex that is not walkable and
+  what keeps it so), whether the tolerance coverage rule would, what it
+  holds, and whether it is reached from the layer's start through the
+  links (`reach::layer_reach`). `ElevationReport::reached` is (hexes
+  reached, planned walkable hexes); `ElevationReport::closed` lists the
+  components closed as unreached. `LayerOptions::close_unreached` (layer
+  file `close_unreached`, default off) closes every walkable component no
+  walk from the first map's entrance reaches (the start map comes first),
+  stepping on an exit grid continuing from its arrival hex; the report
+  counts them. Both are computed from the planned grids before anything is
+  written.
+- **Exterior ground options.** `BuildOptions::navmesh_only` (slice key
+  `navmesh_only`, exterior only, default off): a hex in a cell without a
+  navmesh is not walkable when some other cell of the window has one
+  (`Verdict::NoGround`), instead of the slope rule; Megaton's ground
+  outside its wall. `BuildOptions::coverage_bridges` (slice key
+  `coverage_bridges`, default off): under a `navmesh_coverage` stricter than
+  the tolerance rule, the islands it cuts out of one floor are joined to the
+  larger part through the hexes the tolerance rule covers, at most
+  `walk::BRIDGE_MAX_LENGTH` (8) hexes per join (`walk::bridge_coverage`).
+  `TerrainOptions::vertex_color_floor` (slice key `vertex_color_floor`, 0 to
+  1, default 0): the darkest a land vertex colour may make the ground.
+- **Storeys walk their own triangles.** The converter gives each storey's
+  `InteriorBuild::triangles` the member triangles of the floors grouped into
+  it (`Floor::members`), so walkability takes exactly those at any height
+  instead of every triangle inside the band; a floor that dips at a stair
+  head stays one floor. `None` keeps the band, as every earlier build.
+- **Link clearance** (`map_builder::clearance`). After the walkable grids
+  are final (passages opened, unreached components closed) and before
+  critters and loot are placed, nothing is left on or by a link's exit
+  grids: the keep-clear set of an elevation is every exit grid hex of its
+  door and stair links and every arrival hex another link leads to here
+  (`DOOR_KEEP_CLEAR_RADIUS` 0), plus every hex within
+  `STAIRS_KEEP_CLEAR_RADIUS` (1) of a stair's grid hexes. A ground item, and
+  a container that does not block its hex, in the set moves to the nearest
+  free walkable hex outside it (same walkable component when it has room,
+  ties to the lowest hex; `ElevationPlan::moved_off_links`, reported as
+  `ElevationReport::moved_off_links` and the note "moved off link hexes:
+  N"); critters are placed clear of the whole set. A container that blocks
+  its hex stays. Stub exits are not links, so a layer without links is
+  byte-identical. `verify_clearance` (run by `build_layer` after
+  `verify_links`) checks the written maps: no category 0 or 1 object (item,
+  container, critter) on a grid or arrival hex, and none but a blocking
+  container within the stairs radius.
 - **Slicer addition.** `SlicerConfig::flat_references` (form keys always
   flattened onto the ground, items, doors and containers excepted; empty
   by default, nothing changes).
@@ -1067,3 +1147,501 @@ returns them all and the map stage ships them all), `missing_textures`,
 `placeholders` (stills), `weapons` (weapon letter to the model drawn in
 hand) and `bytes`. A minimal set has no `schema` (it reads as 0) and the
 first wave's fields only.
+
+## 11. Simulation layer interfaces (Pass 2, settled 2026-11-24)
+
+Task T0 of `docs/simulation-layer-spec.md` section 12. This section copies
+the interfaces that spec settles; the design discussion stays there. **The
+spec stays the design reference; where it differs from this section on an
+interface, this section wins.** Nothing of the transpiler is built:
+`crates/transpile` is a placeholder, and of the stage only the scaffold in
+`crates/mojave-convert/src/sim.rs` exists (11.3). Spec section numbers are
+written "spec 4.7" and so on; engine facts are the spec's E1 to E31.
+
+### 11.1 The IR (`transpile::ir`, spec 3)
+
+Plain data (`serde`, `BTreeMap`, sorted `Vec`), built from the MIR, checked,
+then lowered. It never holds engine numbers; `emit` allocates those (11.4).
+Order everywhere is `SimId` order. Texts are kept as decoded (Windows-1252)
+and converted once in `emit` (spec 4.10); the converter's own labels
+("[Continue]", the skill-check brackets) are `TextRole::Label` and are the
+only text this repository writes.
+
+Identifiers and text:
+
+```rust
+pub struct FormKey(pub String);           // "fallout3.esm:01a2b3", the MIR's form identity (section 2)
+
+#[derive(Ord, PartialOrd, Eq, PartialEq, Clone)]
+pub struct SimId { pub kind: SimKind, pub form: FormKey, pub sub: u32 }
+pub enum SimKind { Topic, Info, Quest, Stage, Objective, QuestVar, Global,
+                   Script, ScriptVar, Package, Group, Terminal, MenuItem,
+                   Note, Actor, Ref, Text }
+
+pub struct TextId(pub u32);               // index into Module::texts
+pub struct Text { pub owner: SimId, pub source: String, pub role: TextRole }
+pub enum TextRole { Response, Prompt, TopicName, QuestName, Objective,
+                    LogEntry, TerminalHeader, MenuItem, MenuResult,
+                    NoteTitle, NoteBody, MessageBox, Label }
+```
+
+`sub` is a sub-index where one form makes several objects (a quest's stage
+10, a terminal's menu item 2). Every lowered artifact (procedure name,
+message id, global index) is derived from a `SimId`, so the report and the
+debug overlay can name the source form of any number.
+
+Expressions and conditions:
+
+```rust
+pub enum Expr {
+    Int(i32), Float(f32), Str(TextId),
+    Var(VarRef),
+    Form(FormKey),                        // a base form: becomes a PID, a msg id, ...
+    Ref(RefExpr),
+    Call(Box<Call>),
+    Unary(UnOp, Box<Expr>),
+    Binary(BinOp, Box<Expr>, Box<Expr>),
+}
+pub enum RefExpr { Player, SelfRef, Action, Placed(FormKey), Var(VarRef), Linked(Box<RefExpr>) }
+pub struct Call { pub func: Func, pub on: Option<RefExpr>, pub args: Vec<Expr> }
+pub enum Func { Known(FuncId), Unsupported { name: String } }
+
+pub enum VarRef {
+    Local  { script: SimId, index: u32, ty: VarTy },   // object-script variable
+    Quest  { quest: SimId, index: u32, ty: VarTy },    // quest-script variable
+    Global(SimId),                                     // GLOB
+    Hoisted { owner: FormKey, script: SimId, index: u32, ty: VarTy },
+    Temp(u32),                                         // procedure-local
+}
+pub enum VarTy { Int, Float, Ref }
+
+pub enum Cond {
+    True, False,
+    Not(Box<Cond>), All(Vec<Cond>), Any(Vec<Cond>),
+    Cmp { lhs: Expr, op: CmpOp, rhs: Expr },
+    Fallback { function: u16, name: String, value: f32, report: bool },
+}
+```
+
+A `CTDA` list becomes one `Cond` by the editor's rule: a condition with the
+OR flag is OR-ed with the next one, and the OR runs are AND-ed, so
+`[A or, B, C or, D]` is `(A ∨ B) ∧ (C ∨ D)`. The comparison value is a
+literal or a `GLOB`. `run_on` becomes the call's `on`: 0 subject, 1 target,
+2 the condition's reference, 3 combat target, 4 linked reference. An
+unsupported function is never silently true: it becomes `Cond::Fallback` with
+a value chosen per function (spec 4.8, 4.9), and the comparison is evaluated
+normally; every fallback writes one report line.
+
+Dialogue:
+
+```rust
+pub struct Topic {
+    pub id: SimId, pub editor_id: String, pub kind: TopicKind,
+    pub name: Option<TextId>, pub priority: f32, pub top_level: bool,
+    pub infos: Vec<SimId>,                // file order inside the topic group
+}
+pub enum TopicKind { Topic, Conversation, Combat, Persuasion, Detection,
+                     Service, Misc, Radio }
+
+pub struct Info {
+    pub id: SimId, pub topic: SimId, pub quest: SimId,
+    pub speakers: SpeakerSet,
+    pub condition: Cond,                  // speaker terms folded out
+    pub flags: InfoFlags,
+    pub responses: Vec<Response>,
+    pub prompt: Option<TextId>,           // RNAM; else the topic name
+    pub choices: Vec<SimId>,              // TCLT, in order
+    pub link_from: Vec<SimId>,            // TCLF
+    pub add_topics: Vec<SimId>,           // NAME
+    pub begin: Option<Block>, pub end: Option<Block>,   // before / after NEXT
+    pub check: Option<SkillCheck>,
+}
+pub struct InfoFlags { pub goodbye: bool, pub random: bool, pub random_end: bool,
+                       pub say_once: bool, pub say_once_a_day: bool,
+                       pub run_immediately: bool, pub info_refusal: bool }
+pub struct Response { pub number: u8, pub text: TextId, pub emotion: (u32, i32) }
+pub enum SpeakerSet { Bases(Vec<FormKey>), Any }
+
+pub enum SkillCheck {
+    /// Fallout 3: a chance shown on the option, one roll, two branches.
+    Percent { skill: Skill, difficulty: u8, label: Option<ActorValue>,
+              failure: FailureRoute, remember: Remember },
+    /// New Vegas, and Fallout 3 attribute/skill gates: a comparison, no roll.
+    Threshold { stat: Stat, op: CmpOp, value: i32, label: Option<ActorValue>,
+                shown_when_failed: bool, partner: Option<SimId> },
+}
+pub enum FailureRoute { SharedTopic(SimId), NextInfo }
+pub enum Remember { PerSelection, Forever }
+pub enum Stat { Skill(Skill), Special(u8) }
+pub enum Skill { SmallGuns, BigGuns, EnergyWeapons, Unarmed, Melee, Throwing,
+                 FirstAid, Doctor, Sneak, Lockpick, Steal, Traps, Science,
+                 Repair, Speech, Barter, Gambling, Outdoorsman }   // Fallout 2 order
+```
+
+`Skill` is in Fallout 2 order (SPEC-006 section 3.3) because it is a lowering
+target; the source actor value maps to it in `dialogue::checks` (spec 4.7).
+
+Scripts:
+
+```rust
+pub struct Script {
+    pub id: SimId, pub editor_id: String, pub kind: ScriptKind,
+    pub vars: Vec<VarDecl>, pub blocks: Vec<Block>, pub diagnostics: Vec<Diag>,
+}
+pub enum ScriptKind { Object, Quest, Effect, Result(ResultOwner) }
+pub enum ResultOwner { InfoBegin(SimId), InfoEnd(SimId), Stage(SimId),
+                       MenuItem(SimId), PackageEvent(SimId, PackageEvent) }
+pub struct VarDecl { pub index: u32, pub name: String, pub ty: VarTy }
+pub struct Block { pub event: Event, pub body: Vec<Stmt> }
+pub enum Event {
+    GameMode, MenuMode, OnActivate, OnLoad, OnDeath { killer: Option<RefExpr> },
+    OnHit { by: Option<RefExpr> }, OnTrigger { by: Option<RefExpr> },
+    OnTriggerEnter { by: Option<RefExpr> }, OnTriggerLeave { by: Option<RefExpr> },
+    OnStartCombat, OnCombatEnd, SayToDone, OnPackageStart(Option<FormKey>),
+    OnPackageEnd(Option<FormKey>), OnPackageChange(Option<FormKey>),
+    OnAdd, OnEquip, OnUnequip, ScriptEffectStart, ScriptEffectUpdate,
+    ScriptEffectFinish, Result, Other(String),
+}
+pub enum Stmt {
+    Set(VarRef, Expr),
+    If { arms: Vec<(Expr, Vec<Stmt>)>, otherwise: Vec<Stmt> },
+    Call(Call),
+    Return,
+}
+```
+
+Quests:
+
+```rust
+pub struct Quest {
+    pub id: SimId, pub editor_id: String, pub name: Option<TextId>,
+    pub start_enabled: bool, pub priority: u8,
+    pub delay_seconds: Option<f32>,       // DATA delay; None or 0 = default
+    pub script: Option<SimId>,
+    pub vars: Vec<VarDecl>,               // the quest script's variables
+    pub stages: Vec<Stage>, pub objectives: Vec<Objective>,
+}
+pub struct Stage { pub id: SimId, pub index: i16, pub entries: Vec<LogEntry> }
+pub struct LogEntry { pub complete: bool, pub fail: bool, pub condition: Cond,
+                      pub text: Option<TextId>, pub script: Option<SimId>,
+                      pub next_quest: Option<SimId> }
+pub struct Objective { pub id: SimId, pub index: i32, pub text: Option<TextId>,
+                       pub targets: Vec<(FormKey, Cond)> }   // kept, not lowered
+```
+
+Packages (type numbers as stored: 0 Find, 1 Follow, 2 Escort, 3 Eat, 4
+Sleep, 5 Wander, 6 Travel, 7 Accompany, 8 UseItemAt, 9 Ambush, 10
+FleeNotCombat, 12 Sandbox, 13 Patrol, 14 Guard, 15 Dialogue, 16 UseWeapon):
+
+```rust
+pub struct Package {
+    pub id: SimId, pub editor_id: String, pub kind: PackageKind,
+    pub flags: u32, pub behaviour_flags: u16, pub type_flags: u16,
+    pub location: Option<Location>, pub target: Option<Target>,
+    pub schedule: Schedule, pub condition: Cond,
+    pub events: Vec<(PackageEvent, Option<SimId>)>,   // begin, end, change scripts
+    pub runner: Runner,
+}
+pub enum PackageKind { Find, Follow, Escort, Eat, Sleep, Wander, Travel,
+                       Accompany, UseItemAt, Ambush, FleeNotCombat, Sandbox,
+                       Patrol, Guard, Dialogue, UseWeapon, Other(u8) }
+pub enum Location { NearRef { r: FormKey, radius: i32 }, InCell { cell: FormKey, radius: i32 },
+                    NearCurrent { radius: i32 }, NearEditor { radius: i32 },
+                    ObjectId(FormKey), ObjectType(u32), NearLinkedRef { radius: i32 },
+                    AtPackageLocation }
+pub enum Target { Ref(FormKey), Object(FormKey), ObjectType(u32), LinkedRef }
+pub struct Schedule { pub month: i8, pub day_of_week: i8, pub date: u8,
+                      pub hour: i8, pub duration_hours: i32 }   // -1 = any
+pub enum PackageEvent { Begin, End, Change }
+pub enum Runner { Travel, Sandbox, Follow, Guard, Wait, None }
+```
+
+World state, terminals, notes, references:
+
+```rust
+pub struct EnableGroup { pub id: SimId /* the parent */, pub initially_enabled: bool,
+                         pub children: Vec<(FormKey, bool /* opposite */)> }
+
+pub struct Terminal {
+    pub id: SimId, pub header: Option<TextId>,
+    pub difficulty: u8,                   // 0 very easy .. 4 very hard, 5 key only
+    pub flags: u8, pub server: u8,
+    pub password: Option<SimId>,          // a Note
+    pub items: Vec<MenuItem>,
+}
+pub struct MenuItem { pub id: SimId, pub text: TextId, pub result: Option<TextId>,
+                      pub add_note: bool, pub show_note: Option<SimId>,
+                      pub submenu: Option<SimId>, pub script: Option<SimId>,
+                      pub condition: Cond }
+
+pub struct Note { pub id: SimId, pub title: Option<TextId>, pub body: NoteBody }
+pub enum NoteBody { Text(TextId), Voice { topic: Option<SimId> }, Image(String), Sound(String) }
+
+/// Every placed reference something needs at run time (spec 5.8).
+pub struct RefEntry { pub form: FormKey, pub editor_id: Option<String>,
+                      pub base: FormKey, pub area: String, pub mobile: bool,
+                      pub why: RefUses }      // bit set: script, condition, package,
+                                              // quest target, enable parent, linked
+```
+
+The module and the two entry points:
+
+```rust
+pub struct Module {
+    pub texts: Vec<Text>,
+    pub topics: BTreeMap<SimId, Topic>, pub infos: BTreeMap<SimId, Info>,
+    pub scripts: BTreeMap<SimId, Script>, pub quests: BTreeMap<SimId, Quest>,
+    pub globals: BTreeMap<SimId, Global>, pub packages: BTreeMap<SimId, Package>,
+    pub groups: BTreeMap<SimId, EnableGroup>, pub terminals: BTreeMap<SimId, Terminal>,
+    pub notes: BTreeMap<SimId, Note>, pub refs: BTreeMap<FormKey, RefEntry>,
+    pub actors: BTreeMap<FormKey, Actor>,     // base: script, packages, factions, AI data
+    pub diagnostics: Vec<Diag>,               // the report's source
+}
+
+transpile::build(mir: &mir::Mir, slice: &SimSlice, config: &SimConfig)
+    -> Result<Module, TranspileError>
+transpile::lower(&Module, &Placement, &BaseFiles) -> Result<Lowered, TranspileError>
+```
+
+The spec names but does not define these types, which the first agent to
+build `transpile::ir` (task T2) settles and adds here: `Global`, `Actor`,
+`Diag`, `FuncId`, `UnOp`, `BinOp`, `CmpOp`, `ActorValue`, `RefUses`,
+`SimSlice`, `SimConfig`, `BaseFiles`, `Lowered`, `TranspileError`. The
+`Placement` that `lower` takes is a plain copy, made by the `sim` stage, of
+the fields of 11.2 that lowering uses (map, hex, elevation, PID, object id,
+kind, hidden); `transpile` does not depend on `mojave-convert`.
+
+### 11.2 The placement index (`map-placements.json`)
+
+**Who writes it and who reads it.** The map stage writes it, on both paths
+(`layer`, and `map::map` for one map), through
+`mojave_convert::placements::write_for_stage`, beside `map-report.md` and not
+inside the layer. The map stage also reads it, only to decide whether it can
+reuse its output (`placements::is_current`: origin `stage`). The `sim` stage
+reads it (`placements::read`); when the file is absent it makes what it can
+from the written maps (`placements::reconstruct`, origin `reconstructed`) and
+warns. The spec's `Placement` of `transpile::lower` is built from it
+(11.1). Two builds from the same inputs give the same bytes: no time, host
+or path is in the file.
+
+**Schema, version 1** (`placements::SCHEMA_VERSION`; a reader refuses another
+version and says to run the map stage again). The text is pretty-printed
+JSON with a final newline. A field marked "left out" is absent from the JSON
+when it has its default; a reader treats an absent field as that default.
+
+Top level, all fields always present except `notes`:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema_version` | integer | 1 |
+| `origin` | `"stage"` or `"reconstructed"` | who made it |
+| `layer` | string | the layer's name, from its manifest |
+| `game` | string | `mir::GameVariant::id` (`fallout3`); `sim` refuses a MIR of another game |
+| `maps` | `[MapEntry]` | the layer's maps, sorted by stem; includes the stub maps standing in for interiors outside the build (they place no reference; a note counts them) |
+| `placed` | `[PlacedRef]` | references that became objects of a written map |
+| `unplaced` | `[UnplacedRef]` | references of the maps' cells that are not on them |
+| `notes` | `[string]` | how it was made (matches by distance, objects not found, stubs); left out when empty |
+
+`MapEntry`: `stem` (the file stem), `file` (`maps/<stem>.map`), `number` (the
+map's number in the layer's manifest). `sim` checks that every entry is
+registered in the manifest with that number.
+
+`PlacedRef`:
+
+| Field | Type | Optional | Meaning |
+|---|---|---|---|
+| `map` | string | no | the map's stem |
+| `map_number` | integer | no | the map's number |
+| `elevation` | integer 0 to 2 | no | |
+| `hex` | integer 0 to 39,999 | no | the written object's hex when one was found, else the placement's |
+| `kind` | `critter`, `door`, `container`, `item`, `terminal`, `scenery` | no | what it is (`PlacedKind`); `scenery` is listed only for an enable parent or child, or a reference the caller names (a script, quest or package points at it) |
+| `critter` | boolean | no | `kind == critter` |
+| `object_id` | integer | left out when no object was found | the object's id in the written map |
+| `pid` | integer | left out when no object was found | the object's PID |
+| `pieces` | integer | left out when 1 | how many objects the reference became (a landmark is several pieces, ammunition several packs); the entry describes the first |
+| `reference` | string | absent in a reconstruction (except a person named by `features/<stem>.json`) | the reference's form key |
+| `editor_id` | string | left out when unknown | |
+| `base` | string | left out when unknown | the base record's form key |
+| `base_kind` | string | left out when unknown | the base record's signature (`DOOR`, `NPC_`) |
+| `base_editor_id` | string | left out when unknown | |
+| `enable_parent` | `{ reference, opposite }` | left out when none | the parent's form key; `opposite`: the child is enabled when the parent is disabled |
+| `initially_disabled` | boolean | left out when false | the source starts it disabled |
+| `hidden` | boolean | left out when false | the written object carries the hidden flag |
+| `team` | integer | critters only, left out when unknown | the critter's team in the written map |
+| `ai_packet` | integer | critters only, left out when unknown | the critter's AI packet number |
+
+`UnplacedRef`: `map` (stem), `reference`, `kind`, `reason` (all always
+present); `editor_id`, `base`, `base_kind`, `base_editor_id`,
+`enable_parent`, `initially_disabled` and `detail` as above (left out when
+empty or false). `reason` is one of `disabled` (the source starts it
+disabled and the stage left it out), `deleted` (the winning plugin deleted
+it), `skipped` (the stage names a reason in `detail`: a critter without art,
+say) and `not_placed` (it is in the map's cells and nowhere on the map:
+pruned by declutter, off the level, outside the window's budget, or not
+something the stage places, such as items with loot off). Until task T7 of
+the spec, children that start disabled are left out, so they appear here
+with reason `disabled`, and `hidden` does not yet mark them.
+
+**What is listed.** Critters, doors, containers, items and terminals, and any
+other reference that is an enable parent or child or that the caller names.
+Plain scenery is not listed.
+
+**Order.** `maps` by (stem, file, number). `placed` by (map, elevation,
+object id with "none" last, hex, reference). `unplaced` by (map, reference).
+
+**How an object is matched.** The n-th placement at an elevation and hex
+takes the n-th written object there that fits its class; an item takes the
+packs written after it (same hex, same PID, next ids) into `pieces`. Items
+and containers the builder moved off a link are matched to the nearest free
+item object within 12 steps (`placements::MOVED_RADIUS`) at a hex no
+placement names, a heuristic; the notes count them, and the placements that
+find no object.
+
+**Differences from spec 10.4.** The spec lists "map, hex, elevation, PID,
+object id and whether it is a critter" per placed reference. The index adds
+`map_number`, `kind`, `pieces`, the source identity (`reference`,
+`editor_id`, `base`, `base_kind`, `base_editor_id`), the enable-parent
+fields, `hidden`, `team`, `ai_packet`, and the `maps`, `unplaced` and `notes`
+lists. Spec 12 names `map-builder` as the writer in T7; the writer is
+`mojave-convert` (`placements.rs`), which holds the join. Locked bits,
+presence copies and the hostile packet option of T7 are not in it yet.
+
+### 11.3 The `sim` stage (`mojave_convert::sim`, spec 10)
+
+Command: `mojave-convert sim --out <dir> [--timings]` (`docs/running.md`,
+"Sim"). It is a subcommand of its own and is not part of `all` yet (task T9).
+It needs no game install, renders and builds no map, and everything it reads
+is under `--out`.
+
+**Inputs** (`SimInputs::load(out) -> Result<SimInputs, SimError>`, read once):
+`game`, `layer`, `index` (the placement index, from the file or
+reconstructed; placed references that name a reference but no base get the
+base from the MIR), `from_file`, `warnings`, `logic` (what the MIR holds for
+the placed bases: scripts, packages, dialogue infos, topics, quests,
+terminals, notes, the references something points at, and the whole
+extract's record counts), and `key_parts`. It fails when the MIR or the
+layer is missing, the index is of another game, or an indexed map is not
+registered in the layer's manifest.
+
+**Run.** `run(&SimInputs) -> SimReport` is a pure function of its inputs;
+`write_report(out, &report)` writes `<out>/sim-report.md`; `cli` loads, runs,
+writes and prints. Today `run` only counts. Pass 2 replaces its body with the
+build (`transpile::build` then `lower`); the spec does not fix `run`'s final
+signature (today it cannot fail).
+
+**Cache key** (spec 10.3; `SimInputs::cache_key`): `sim-1:` followed by the
+content hash of the lines `<name>=<value>`, one per key part, in this order.
+The version is `sim::SIM_VERSION`.
+
+| Part | Value today |
+|---|---|
+| `sim` | `sim-1` |
+| `transpiler` | **placeholder**: `none (Pass 2 scaffold)`; becomes the transpiler's version |
+| `foundry.toml [sim]` | **placeholder**: `none (not read by the scaffold)`; the `[sim]` table is not read and not yet defined in `config.rs` |
+| `game` | `GameVariant::id` |
+| `slice` | hash of the manifest's slice |
+| `plugins` | hash of the manifest's plugin list |
+| `mir rows` | hash of the MIR rows the scaffold reads (scripts of placed bases with their source, packages, terminals, notes, dialogue infos and referrals); it must grow with whatever the build reads (spec: the canonical rows of every query) |
+| `base file <path>` | hash, or `absent`, for each of `scripts/scripts.lst`, `data/vault13.gam`, `data/quests.txt`, `data/holodisk.txt`, `text/english/game/quests.msg`, `pipboy.msg`, `map.msg` (spec 10.1's base copies; a layer from the map stage has none yet) |
+| `map stage key` | the text of `<out>/cache/map.key`, or `absent` (the stage keys stay in `<out>/cache` whatever `--cache-dir` says) |
+| `map <file> (<number>)` | hash of each registered map's bytes, in file-name order (an addition to the spec, which names only the map stage's key and the index) |
+| `placement index` | hash of the index's text as read (before the base fill-in) |
+
+The spec's program cache (hash of a program's lowered IR to its `.int`
+bytes) does not exist yet.
+
+**Outputs.** Today: `<out>/sim-report.md` and the console lines (game,
+layer, index source, placed and not placed per map and in all, the logic
+counts, coverage, the cache key, the time); the layer is untouched. The
+report has no time, host or path, so a second run on the same output is
+byte-identical. Its sections today are `## Summary`, `## Warnings` (only
+when there are any), `## Placed references`, `## Source logic for the placed
+set`, `## Coverage`, `## Whole extract (for scale)` and `## Cache key`.
+
+The spec's report (10.5) has these sections, each with compiled, folded,
+dropped and fallback counts and the first owners by editor id: `## Summary`
+(programs, rows, globals, messages, holodisks, quest rows), `## Dialogue`,
+`## Conditions`, `## Scripts`, `## Quests`, `## Packages`, `## World state`,
+`## Terminals and notes`, `## Locks`, `## Engine gaps hit`. Only `## Summary`
+is common to both; the scaffold's other sections are replaced as the build
+lands.
+
+Files of the finished stage (spec 10.1; a base copy means the layer's
+own file is read and ours appended):
+
+| Path | Content | Base copy |
+|---|---|---|
+| `scripts/*.int` | every program | no |
+| `scripts/scripts.lst` | base rows, then `<stem>.int ; <editor id> # local_vars=<n>` per program | yes |
+| `text/english/dialog/<stem>.msg` | one per speaker, terminal and message-box program | no |
+| `data/vault13.gam` | base globals, then ours (`MF_<KIND>_<NAME> := <value>;`) | yes |
+| `data/quests.txt`, `data/holodisk.txt` | base rows, then ours | yes |
+| `text/english/game/quests.msg`, `pipboy.msg`, `map.msg` | base entries, then ours | yes |
+| `maps/*.map` | the map stage's maps with script records attached (the stage reads each built map, adds script records and the header's map script, writes it back) | no |
+| `vault-mod.toml` | adds `id`, `api = 1`, the `[[global_scripts]]` and `[[hooks]]` rows | no |
+| `sim-report.md` | the report, under `--out`, not in the layer | no |
+
+**Determinism.** Every map, list and table is iterated in `SimId` or file
+order; random draws happen only at run time, in the engine; no timestamp,
+host name or path in any file; `--jobs` only parallelises per-program code
+generation, collected in order.
+
+### 11.4 Identifiers and numbering (spec 10.1, 10.2, 4.10, 9.2)
+
+| What | Rule |
+|---|---|
+| Program stems (8 bytes) | `mm` + 6 base-36 digits (map scripts), `md` speaker programs, `mo` object programs, `mt` terminals, `mfquest` the dispatcher; numbered by `SimId` order within each prefix |
+| Script rows | appended after the base list; row index = base count + i |
+| Globals | base count G, then ours in `SimId` order by kind: quest state, quest variables, `GLOB`s, groups, notes, once-flags, actor globals; `data/vault13.gam` is a whole copy with ours appended, which keeps every base index |
+| Dialogue message ids (per speaker program) | 1 to 99 converter labels; `10000 + 10 n + r` response r (0 to 8) of the speaker's INFO ordinal n; `10000 + 10 n + 9` its prompt; `900000 + t` topic t's name; 970 to 1099 left free (the engine's Ask About lookup) |
+| Pip-Boy message ids | `map.msg`, `quests.msg`, `pipboy.msg` from 100000; holodisk title `100000 + k`, text window `200000 + 500 k` for note k |
+| Teams | from 100, in faction `SimId` order |
+| Reference slots | from 1, in `SimId` order; exported variable `r<k>` on its map |
+| Text | written through `emit`'s MSG adapter: braces become parentheses, characters outside Windows-1252 become `?`, every change counted in the report |
+
+A layer that grows `vault13.gam` changes the global count, so saves made
+without it do not load with it and the other way round. Numbers are not kept
+across rebuilds in Pass 2 (decision 9).
+
+### 11.5 Owner decisions, locked 2026-11-23 (spec 13)
+
+The owner accepted all 15 defaults as written. They are decisions for Pass 2.
+
+| # | Decision |
+|---|---|
+| 1 | A speech challenge's outcome is remembered forever; re-asking repeats the branch |
+| 2 | Fallout 3 and New Vegas skill thresholds compare 1:1 to Fallout 2 skill percentages; the percent formula uses the plugin's own settings |
+| 3 | Hacking and lock picking: no minigame, automatic success at the required skill, XP from the plugin's settings |
+| 4 | Notes are Pip-Boy holodisks with a message-line notice; voice notes as text |
+| 5 | NPCs whose packages leave their map get presence copies; named actors only |
+| 6 | sfall mode stays off (no `message_box`, plain Fallout 2 words) |
+| 7 | Ship a whole `scripts.lst` now (needed for dialogue files), with a brief for gap S filed |
+| 8 | Quest journal: objectives only |
+| 9 | No `sim-ids.toml` allocation file in Pass 2 (on before long playtests) |
+| 10 | `vault-vm` is a dev-dependency at the pinned revision, for tests only |
+| 11 | Megaton townsfolk are one team, raiders one team |
+| 12 | Essential NPCs: the flag is ignored and reported |
+| 13 | Karma is a shadow global with no display until gap K |
+| 14 | Hello barks are off in Pass 2 |
+| 15 | New Vegas failed checks are shown with a "25/50" label and can be chosen (the source's failure line) |
+
+### 11.6 Engine gaps each interface depends on (spec 11)
+
+Each gap has a workaround, so none blocks the build except A, which `emit`
+provides locally until the engine brief lands.
+
+| Interface | Gap | Effect on the interface |
+|---|---|---|
+| `emit::int` and every `scripts/*.int` | A (INT assembler in `vault-vm`) | local adapter in `emit`; the assembler source text is the stable interface |
+| `Terminal`, `MenuItem`, `Note` | T (terminal and document reader) | lowered to no-head dialogue and holodisks; the IR is the modal's model, so only `terminals::lower` changes |
+| `scripts/scripts.lst`, `text/english/dialog/<stem>.msg` | S (dialogue files for `[[scripts]]` rows) | the layer ships a whole `scripts.lst` (decision 7) |
+| `MoveTo` into another map; the map number and hex of the placement index | M (load a map at a hex, elevation and facing) | global plus `override_map_start` on entry |
+| `Package`, `Location`, presence copies, `RefEntry::mobile` | P (a critter leaving a map) | copies sharing the actor's globals (decision 5) |
+| `PackageKind::{Eat, Sleep}`, sandbox furniture | F (furniture actions) | stand in place |
+| `Stmt` rewards of karma; karma conditions | K (a karma write word) | shadow global `G_KARMA` (decision 13) |
+| `EnableGroup`, the `hidden` and `enable_parent` fields of the index | U (request a `map_update_p_proc` now) | a reference table in the calling program; changes can show up to 60 s late elsewhere |
+| `Quest`, `Stage`, `LogEntry` | J (per-quest text page in the Pip-Boy) | objectives only; stage text is kept in the IR, not shown |
+| `Objective::targets` | O (map or compass markers) | kept, not lowered |
+| `SkillCheck::Threshold { shown_when_failed, partner }` | G (greyed options) | shown with a "25/50" label, selectable (decision 15) |
+| `Response`, `NoteBody::Voice` | V (speech audio and lip sync) | text only; the response's sound field stays empty |
+| `VarRef::Hoisted` | R (reading another instance's local) | hoisting to globals, allowed only for a persistent reference with one placement |

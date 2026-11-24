@@ -168,6 +168,66 @@ pub(crate) fn map_stem(slice: &str) -> String {
     }
 }
 
+/// Checks that `dir` holds exactly `layer` as written: every file byte for
+/// byte, nothing else but the README, and the manifest that parses back to
+/// the layer's. It is the check of `map_builder::read_layer` (the layer
+/// read back from disk), whose per-file insert costs seconds on a layer of
+/// thousands of files; the layer in memory then stands for the one on disk.
+pub(crate) fn check_written(dir: &Path, layer: &emit::ModLayer) -> Result<(), ConvertError> {
+    use vault_formats::mod_manifest::{MANIFEST, ModManifest};
+    let bad = |what: String| stage(format!("the written layer in {}: {what}", dir.display()));
+    let manifest_path = dir.join(MANIFEST);
+    let text = std::fs::read_to_string(&manifest_path).map_err(io(&manifest_path))?;
+    let parsed = ModManifest::parse(&text).map_err(|e| bad(format!("{MANIFEST}: {e}")))?;
+    if parsed != *layer.manifest() {
+        return Err(bad(format!("{MANIFEST} does not read back as written")));
+    }
+    let mut stack = vec![dir.to_path_buf()];
+    let mut seen = 0usize;
+    while let Some(folder) = stack.pop() {
+        for entry in std::fs::read_dir(&folder).map_err(io(&folder))? {
+            let path = entry.map_err(io(&folder))?.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let relative = path
+                .strip_prefix(dir)
+                .map_err(|_| bad("a file outside the folder".to_owned()))?
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/");
+            if relative == MANIFEST || relative == "README.txt" {
+                continue;
+            }
+            let Some(expected) = layer.files().get(&relative) else {
+                return Err(bad(format!("{relative} is not the layer's")));
+            };
+            let bytes = std::fs::read(&path).map_err(io(&path))?;
+            if bytes != *expected {
+                return Err(bad(format!("{relative} differs from what was written")));
+            }
+            seen += 1;
+        }
+    }
+    if seen != layer.files().len() {
+        return Err(bad(format!(
+            "{seen} files on disk, {} in the layer",
+            layer.files().len()
+        )));
+    }
+    Ok(())
+}
+
+/// The SHA-256 of the MIR manifest, which names every plugin, mesh and
+/// texture by content hash (lowercase hex).
+pub(crate) fn manifest_digest(inputs: &Inputs) -> Result<String, ConvertError> {
+    let manifest_path = inputs.mir_dir().join("manifest.json");
+    let manifest = std::fs::read(&manifest_path).map_err(io(&manifest_path))?;
+    Ok(mir::content_hash(&manifest))
+}
+
 /// Everything the stage's output depends on, hashed.
 pub(crate) fn cache_key(
     inputs: &Inputs,
@@ -193,6 +253,8 @@ pub(crate) fn cache_key(
     // manifest names it too).
     if inputs.game != mir::GameVariant::FalloutNewVegas {
         hasher.update(inputs.game.id().as_bytes());
+        // Fallout 3's slicer profile leaves out shapes blended onto the scene.
+        hasher.update(b"blend-shapes flat-fills");
     }
     // And the declutter profile, only when on: the slice's own tables are
     // in its TOML above; `--declutter` is not.
@@ -506,6 +568,12 @@ pub fn slicer_defaults(game: mir::GameVariant) -> map_slicer::SlicerConfig {
                     "trees\\", "plants\\", "*shrub", "*bush", "*stump", "treedead", "!ambush",
                 ]),
                 name_prefixes: strings(&["scol"]),
+                // Megaton's houses stand on untextured multiply-blended
+                // shade planes, and its lamps carry additive glows: both
+                // drawn white otherwise (handoff 11, the fix pass).
+                skip_blend_shapes: true,
+                // And fill boxes sampling one texel (Moriarty's Saloon).
+                skip_flat_fills: true,
                 ..base
             }
         }
@@ -784,6 +852,9 @@ pub(crate) struct DeclutterChoice {
     pub(crate) referenced_here: usize,
     /// Keys handed to the builder as interactive.
     pub(crate) interactive: usize,
+    /// The decorative-item rule and the references of the window it named
+    /// (`crate::declutter::MiscPrune`), with the pass on.
+    pub(crate) decorative: Option<(crate::declutter::MiscPrune, usize)>,
 }
 
 /// Sets the scene's declutter profile (`crate::declutter::profile`) and,
@@ -829,15 +900,14 @@ pub(crate) fn apply_declutter(
         })?;
         return Ok(choice);
     }
-    let referenced: BTreeSet<String> = mir
-        .records()
-        .map_err(stage)?
+    let records = mir.records().map_err(stage)?;
+    let referenced: BTreeSet<String> = records
         .referenced_refs()
         .map_err(stage)?
         .iter()
         .map(ToString::to_string)
         .collect();
-    let Some(declutter) = crate::declutter::profile(
+    let Some(mut declutter) = crate::declutter::profile(
         inputs.game,
         &profile,
         inputs.slice.declutter.as_ref(),
@@ -871,6 +941,19 @@ pub(crate) fn apply_declutter(
         if kind_protected || referred || r.teleport.is_some() {
             interactive.insert(key);
         }
+    }
+    if let Some(rule) = crate::declutter::misc_prune(&profile, inputs.slice.declutter.as_ref()) {
+        let items =
+            crate::declutter::decorative_items(&rule, &scene.references, &referenced, |base| {
+                let o = records.base_object(base).ok().flatten()?;
+                Some(crate::declutter::ItemFacts {
+                    value: o.value,
+                    weight: o.weight,
+                    scripted: o.script.is_some(),
+                })
+            });
+        choice.decorative = Some((rule, items.len()));
+        declutter.decorative_items = items;
     }
     choice.referenced = referenced.len();
     choice.interactive = interactive.len();
@@ -923,6 +1006,12 @@ pub(crate) fn apply_slice_keys(slice: &crate::SliceSpec, scene: &mut Scene) {
         && let Some(point) = slice.entrance
     {
         scene.build_options.entrance_near = Some(point);
+    }
+    if !slice.is_interior() && slice.navmesh_only == Some(true) {
+        scene.build_options.navmesh_only = true;
+    }
+    if slice.coverage_bridges == Some(true) {
+        scene.build_options.coverage_bridges = true;
     }
 }
 
@@ -1416,6 +1505,7 @@ pub fn rank_features(features: &mut [Feature]) {
 
 /// Builds the slice's map and writes the mod layer.
 pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
+    let _stage = crate::timings::span("map");
     inputs.check_mode()?;
     // Several maps, storeys or levels: the layer path (`crate::layer`).
     if let Some(layer) = inputs.layer_spec() {
@@ -1434,6 +1524,7 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
     let features_path = inputs.out.join(FEATURES_FILE);
     if mod_dir.join("vault-mod.toml").is_file()
         && features_path.is_file()
+        && crate::placements::is_current(&inputs.out)
         && std::fs::read_to_string(&key_path).is_ok_and(|stored| stored == key)
         && let Ok(text) = std::fs::read_to_string(&summary_path)
         && let Some(summary) = MapSummary::from_cache(&text)
@@ -1445,6 +1536,7 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
     }
 
     let budgets = budgets(&base, inputs.standalone)?;
+    let plan_time = crate::timings::span("plan the scene");
     let mut scene = scene(inputs, &mir)?;
     let declutter_choice = apply_declutter(inputs, &mir, &mut scene)?;
     // `footprints = true`: the slicer finds the furniture and its placed
@@ -1487,8 +1579,21 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
         }
     }
 
+    drop(plan_time);
     let mut renderer =
         foundry_render::renderer(inputs.backend, &inputs.calibration).map_err(stage)?;
+    // Renders and grounds come from the content-hash store when their
+    // inputs are unchanged (`crate::cache`).
+    let store = crate::cache::Store::open(&inputs.store_dir());
+    let calibration_toml = inputs.calibration.to_toml().map_err(stage)?;
+    let texture_id = |path: &str| mir.texture_hash(path).map(str::to_owned);
+    let mut cached = crate::cache::CachedRenderer::new(
+        renderer.as_mut(),
+        &calibration_toml,
+        &store,
+        &texture_id,
+    );
+    let slice_time = crate::timings::span("slice");
     // A budget overflow arrives here as an error whose message carries the
     // list, the cap, the demand and the largest contributors.
     let sliced = map_slicer::slice_statics(
@@ -1497,12 +1602,14 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
         &window,
         &sampler,
         &projection,
-        renderer.as_mut(),
+        &mut cached,
         &palette_map,
         &budgets.slicer,
         &slicer_config,
     )
     .map_err(stage)?;
+    cached.note("renderer");
+    drop(slice_time);
     // A passage must never open a hex that wall art stands on. The builder
     // finds most of them itself; the slicer's merged runs are named here.
     // (The slicer does not report a landmark's blocked core apart from
@@ -1539,34 +1646,55 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
         // Indoors only the baked floor is drawn; the rest stays black.
         blank_without_land: interior.is_some(),
         tone: ground_tone,
+        vertex_color_floor: inputs.slice.vertex_color_floor.unwrap_or(0.0),
         ..map_terrain::TerrainOptions::default()
     };
-    let ground = if interior.is_some() {
-        // A room has no land: its coordinates would read the worldspace's.
-        map_terrain::build_ground_from(
-            &map_terrain::MemoryLand::default(),
-            &window,
-            &sampler,
-            &projection,
-            &inputs.calibration,
-            &palette_map,
-            &overlays,
-            &terrain_options,
-        )
-    } else {
-        map_terrain::build_ground(
-            &mir,
-            &worldspace,
-            &window,
-            &sampler,
-            &projection,
-            &inputs.calibration,
-            &palette_map,
-            &overlays,
-            &terrain_options,
-        )
-    }
+    let terrain_time = crate::timings::span("terrain");
+    let manifest_digest = manifest_digest(inputs)?;
+    let ground_key = crate::cache::GroundKey {
+        land: interior
+            .is_none()
+            .then_some((manifest_digest.as_str(), worldspace.as_str())),
+        window: &window,
+        sampler: &sampler,
+        projection: &projection,
+        calibration: &calibration_toml,
+        palette: &palette_bytes,
+        overlays: &overlays,
+        options: &terrain_options,
+    };
+    let (ground, ground_reused) = crate::cache::cached_ground(&store, &ground_key, || {
+        if interior.is_some() {
+            // A room has no land: its coordinates would read the worldspace's.
+            map_terrain::build_ground_from(
+                &map_terrain::MemoryLand::default(),
+                &window,
+                &sampler,
+                &projection,
+                &inputs.calibration,
+                &palette_map,
+                &overlays,
+                &terrain_options,
+            )
+        } else {
+            map_terrain::build_ground(
+                &mir,
+                &worldspace,
+                &window,
+                &sampler,
+                &projection,
+                &inputs.calibration,
+                &palette_map,
+                &overlays,
+                &terrain_options,
+            )
+        }
+    })
     .map_err(stage)?;
+    if ground_reused {
+        crate::timings::note("ground reused");
+    }
+    drop(terrain_time);
     // Blank squares get the engine's blank tile, not a library tile.
     let squares: Vec<u16> = ground
         .squares
@@ -1605,6 +1733,7 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
             blocking: p.blocking,
         })
         .collect();
+    let people_time = crate::timings::span("people and catalogue");
     let (critter_art, critters, people_skipped) = critter_inputs(inputs, &cells, &references)?;
     // Items, loot, armed and sided people (`crate::catalogue`), when on.
     let catalogue = if inputs.loot_on() {
@@ -1626,6 +1755,10 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
     } else {
         None
     };
+    drop(people_time);
+    let build_time = crate::timings::span("build the map");
+    // Kept for the placement index (how many objects each item becomes).
+    let catalogue_used = build_options.catalogue.clone();
     let mut builder_cells = cells.clone();
     builder_cells.extend(interiors.into_values());
     let stem = inputs.slice.map_stem();
@@ -1652,23 +1785,29 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
         options: build_options,
     })
     .map_err(stage)?;
+    drop(build_time);
 
+    let write_time = crate::timings::span("write and verify the layer");
     if let Some(parent) = mod_dir.parent() {
         std::fs::create_dir_all(parent).map_err(io(parent))?;
     }
     built.layer.write(&mod_dir).map_err(stage)?;
-    // What is on disk is what a player loads: check that, not the copy in
-    // memory.
-    let written = map_builder::read_layer(&mod_dir).map_err(stage)?;
-    let verified = map_builder::verify_layer(&written, &base).map_err(stage)?;
+    // What is on disk is what a player loads: check that it is the layer
+    // in memory, byte for byte, then verify that.
+    check_written(&mod_dir, &built.layer)?;
+    let verified = map_builder::verify_layer(&built.layer, &base).map_err(stage)?;
+    drop(write_time);
+    let _report_time = crate::timings::span("previews, report, features");
 
     // The preview and the report sit beside the layer, never inside it.
     let (indexed, width, height) = compose_preview(&ground, &sliced);
-    let rgba = quantize::to_rgba(&indexed, &palette);
     let gallery_dir = inputs.gallery_dir();
     std::fs::create_dir_all(&gallery_dir).map_err(io(&gallery_dir))?;
     let preview_path = gallery_dir.join(format!("map-{stem}.png"));
-    let png = foundry_gallery::encode_png(&rgba, width, height).map_err(stage)?;
+    let png = crate::cache::cached_png(&store, &indexed, width, height, &palette_bytes, || {
+        let rgba = quantize::to_rgba(&indexed, &palette);
+        foundry_gallery::encode_png(&rgba, width, height).map_err(stage)
+    })?;
     std::fs::write(&preview_path, png).map_err(io(&preview_path))?;
     if let Some(catalogue) = &catalogue {
         crate::gallery::items_page(inputs, &catalogue.items, &palette)?;
@@ -1842,6 +1981,37 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
     let json = serde_json::to_string_pretty(&map_features).map_err(stage)?;
     std::fs::write(&features_path, json + "\n").map_err(io(&features_path))?;
 
+    // The placement index beside the report, never inside the layer.
+    {
+        let _t = crate::timings::span("placement index");
+        let (referenced, why) = crate::placements::referenced_of(&mir);
+        if let Some(why) = why {
+            crate::timings::note(format!("no referenced set: {why}"));
+        }
+        let stage_map = crate::placements::StageMap {
+            stem: &stem,
+            references: &references,
+            elevations: vec![(0, placements.as_slice())],
+            report,
+            critter_elevations: &[],
+            catalogue: catalogue_used.as_deref(),
+            skipped: people_skipped
+                .iter()
+                .map(|p| (p.reference.clone(), p.reason.clone()))
+                .chain(crate::placements::slicer_skips(&sliced))
+                .collect(),
+        };
+        crate::placements::write_for_stage(
+            &inputs.out,
+            &mod_dir,
+            inputs.game,
+            &[stage_map],
+            &referenced,
+        )
+        .map_err(stage)?;
+    }
+
+    crate::timings::note(format!("cache store: {}", store.summary()));
     let cache_dir = inputs.out.join("cache");
     std::fs::create_dir_all(&cache_dir).map_err(io(&cache_dir))?;
     std::fs::write(&summary_path, summary.to_cache()).map_err(io(&summary_path))?;
@@ -1988,6 +2158,15 @@ pub(crate) fn write_declutter_section(
     );
     for (rule, count) in &stats.pruned {
         let _ = writeln!(text, "  - {rule}: {count}");
+    }
+    if let Some((rule, named)) = &choice.decorative {
+        let _ = writeln!(
+            text,
+            "- decorative items (unreferenced MISC worth at most {} caps, weighing at most {}): {named} in the window, {} pruned",
+            rule.max_value,
+            rule.max_weight,
+            stats.pruned.get("decorative item").copied().unwrap_or(0)
+        );
     }
     let protected: Vec<String> = stats
         .protected
