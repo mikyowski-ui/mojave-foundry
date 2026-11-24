@@ -2,11 +2,13 @@
 
 > *What if New Vegas had shipped in 1998?*
 
-An offline pipeline that melts down your own Fallout: New Vegas install and
-recasts it as a Fallout 2 format mod layer for [`vault-engine`]. The 3D
-world goes in one end; 256-colour isometric sprites, hex maps and prototype
-tables come out the other, and the Courier gets to walk the Strip the way
-the Chosen One would have seen it.
+An offline pipeline that melts down your own Fallout 3 or Fallout: New
+Vegas install and recasts it as a Fallout 2 format mod layer for
+[`vault-engine`]. The 3D world goes in one end; 256-colour isometric
+sprites, hex maps and prototype tables come out the other, and the Lone
+Wanderer and the Courier get to walk Megaton and the Strip the way the
+Chosen One would have seen them. Both games go through the same pipeline;
+it tells them apart by the master plugin the install holds.
 
 [`vault-engine`]: https://github.com/mikyowski-ui/vault-engine
 
@@ -15,8 +17,9 @@ walk through, with the people who live there standing in them.
 
 ## Ground rules
 
-- **Bring your own games.** You need your own installs of Fallout: New
-  Vegas and Fallout 2. The pipeline reads both and ships neither.
+- **Bring your own games.** You need your own install of Fallout 3 or
+  Fallout: New Vegas, and of Fallout 2. The pipeline reads them and ships
+  none of them.
 - **Personal and non-commercial.** Converted output contains material
   derived from both games. It stays on the machine that owns them: it is
   not shared, uploaded or committed.
@@ -27,7 +30,7 @@ walk through, with the people who live there standing in them.
 The foundry runs as a line of stations. Each one reads what the last one
 wrote, and skips work whose inputs have not changed.
 
-1. **Extract.** Open the New Vegas archives and plugin, and pull out one
+1. **Extract.** Open the game's archives and plugin, and pull out one
    slice of the world: a block of outdoor cells, or a single room. Meshes,
    textures, placed objects, walkable areas and the people in them are
    written to a neutral intermediate format.

@@ -56,6 +56,22 @@
 //!   function, comparison, value, global, param1, param2, run_on,
 //!   reference, is_or)`.
 //! - `bad_records(seq, plugin, offset, sig, form, error)`.
+//! - Since [`RECORDS_REVISION`] 1: `meta` also holds `game` and
+//!   `records_revision`; `terminals`, `terminal_items`, `notes`,
+//!   `note_quests`, `packages`, `actor_packages(actor, seq, package)`,
+//!   `script_refs(owner, context, seq, form)` (every `SCRO` of scripts,
+//!   quest stages, dialogue results, terminal items and package events),
+//!   `quest_targets(quest, objective, seq, target, flags)`; `weapons` has
+//!   the combat columns of `fnv_esm::WeaponCombat`; terminal items and
+//!   packages add rows to `conditions` and `embedded_scripts`.
+//!
+//! # Two games
+//!
+//! A plugin list of Fallout 3 or of New Vegas extracts the same way. The
+//! game is detected from the first plugin ([`extract`]) or given
+//! ([`extract_for_game`]), and recorded: [`Mir::game`],
+//! [`Records::game`]. A directory written before the game was recorded
+//! reads as New Vegas.
 //!
 //! The file is byte-identical across two builds from the same plugins.
 
@@ -70,6 +86,7 @@ pub mod fixture;
 pub mod ground;
 mod index;
 mod landscape;
+mod logic;
 mod model;
 mod paths;
 mod reader;
@@ -78,22 +95,29 @@ mod source;
 pub mod storeys;
 
 pub use actors::{
-    HUMAN_SKELETON, HUMAN_STAND, HUMAN_WALK_FEMALE, HUMAN_WALK_MALE, MAX_CHAIN, USE_BASE_DATA,
-    USE_INVENTORY, USE_MODEL, USE_STATS, USE_TRAITS,
+    ARMED_FAMILIES, DEFAULT_FAMILIES, DEFAULT_WEAPONS, HUMAN_ANIMATIONS, HUMAN_SKELETON,
+    HUMAN_STAND, HUMAN_WALK_FEMALE, HUMAN_WALK_MALE, MAX_CHAIN, USE_BASE_DATA, USE_INVENTORY,
+    USE_MODEL, USE_STATS, USE_TRAITS, human_animation_slots, weapon_family,
 };
 pub use assets::AssetCounts;
 pub use error::MirError;
-pub use extract::{ExtractOptions, ExtractSummary, extract};
+pub use extract::{ExtractOptions, ExtractSummary, extract, extract_for_game};
+pub use fnv_esm::GameVariant;
 pub use ground::{GroundSampler, MAP_SIDE_SQUARES, MapWindow};
 pub use index::content_hash;
 pub use landscape::{DEFAULT_LAND_TEXTURE, DefaultLandTexture, default_land_texture};
+pub use logic::{
+    ConditionRow, NoteRow, PackageLocationRow, PackageRow, PackageTargetRow, QuestTargetRow,
+    RefReason, Referral, TerminalItemRow, TerminalRow,
+};
 pub use model::{
-    ActorAnimations, ActorDoc, ActorEntry, ActorKind, ActorPart, ActorTint, AnimationInfo,
-    ArchiveEntry, AssetEntry, AssetStatus, CELL_UNITS, CellDoc, CellKey, CellLocation, CellRef,
-    EnableParentDoc, Image, InteriorEntry, Issue, LAND_GRID, LAND_SPACING, LandDefault, LandDoc,
-    LandLayer, LayerOpacity, LockDoc, Manifest, MeshInfo, NavDoorLinkDoc, NavExternalLinkDoc,
-    NavTriangleDoc, NavmeshDoc, PartRole, PluginEntry, RawStore, RefFlags, RefGroup, RefKind,
-    Reference, SCHEMA_VERSION, SkeletonInfo, Slice, TeleportDoc, TextureInfo, Transform, cell_of,
+    ActorAnimations, ActorDoc, ActorEntry, ActorKind, ActorPart, ActorTint, ActorWeapon,
+    AnimationInfo, ArchiveEntry, AssetEntry, AssetStatus, CELL_UNITS, CellDoc, CellKey,
+    CellLocation, CellRef, EnableParentDoc, Image, InteriorEntry, Issue, LAND_GRID, LAND_SPACING,
+    LandDefault, LandDoc, LandLayer, LayerOpacity, LockDoc, Manifest, MeshInfo, NavDoorLinkDoc,
+    NavExternalLinkDoc, NavTriangleDoc, NavmeshDoc, PartRole, PluginEntry, RECORDS_REVISION,
+    RawStore, RefFlags, RefGroup, RefKind, Reference, SCHEMA_VERSION, SkeletonInfo, Slice,
+    TeleportDoc, TextureInfo, Transform, cell_of,
 };
 pub use paths::{
     FormKey, MESH_ROOT, TEXTURE_ROOT, creature_model_path, form_file_stem, normalize_mesh_path,

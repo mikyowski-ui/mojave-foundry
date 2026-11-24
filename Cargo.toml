@@ -18,11 +18,13 @@ members = [
     "crates/transpile",
 ]
 
-# Matches vault-engine at the pinned revision: edition 2024, rust-version 1.88.
+# Edition 2024, as vault-engine at the pinned revision. The minimum Rust is
+# 1.89, one above the engine's 1.88: the ragdoll sampler's physics
+# dependencies (nalgebra, wide) require it.
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 publish = false
 license = "Apache-2.0"
 
@@ -43,6 +45,7 @@ foundry-gallery = { path = "crates/foundry-gallery" }
 map-terrain = { path = "crates/map-terrain" }
 map-slicer = { path = "crates/map-slicer" }
 map-builder = { path = "crates/map-builder" }
+ragdoll = { path = "crates/ragdoll" }
 
 bytemuck = { version = "1.24", features = ["derive"] }
 clap = { version = "4.5", features = ["derive"] }

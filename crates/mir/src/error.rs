@@ -108,6 +108,14 @@ pub enum MirError {
     /// The extract options cannot be used.
     #[error("invalid extract options: {0}")]
     Options(String),
+
+    /// `records.sqlite` was written before a table was added
+    /// ([`crate::RECORDS_REVISION`]); extracting again rebuilds it.
+    #[error(
+        "records.sqlite has no table `{0}`: it was written by an older build; extract again \
+         to rebuild it"
+    )]
+    MissingTable(&'static str),
 }
 
 impl MirError {

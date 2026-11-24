@@ -7,11 +7,11 @@ mod common;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use common::scenes::{door_scene, full_base, populated, scene};
 use common::*;
 use map_builder::critters::{CRITTER_RADIUS, DEFAULT_CRITTER_TEAM};
 use map_builder::walk::{Frame, HEXES};
-use map_builder::{BuildError, Built, Role, build_map, read_layer, verify_layer};
-use mir::{CellLocation, FormKey};
+use map_builder::{BuildError, Built, build_map, read_layer, verify_layer};
 use vault_formats::map::{MapFile, ObjectState};
 use vault_formats::pro::{PrototypeData, PrototypeKind, PrototypeLookup};
 use vault_formats::{
@@ -43,12 +43,6 @@ fn digest(layer: &emit::ModLayer) -> u64 {
 const BEFORE_EMPTY: u64 = 0x402c_95f0_06c1_2ebc;
 const BEFORE_BASE: u64 = 0x5950_90e4_3aae_a43e;
 
-fn full_base() -> BTreeMap<String, Vec<u8>> {
-    let mut base = base_files(10);
-    base.extend(critter_base_files());
-    base
-}
-
 fn mounted(layer: &emit::ModLayer, base: &BTreeMap<String, Vec<u8>>) -> LayeredVfs {
     let tree = |files: Vec<(String, Vec<u8>)>| {
         MemoryDir::new(
@@ -76,18 +70,6 @@ fn mounted(layer: &emit::ModLayer, base: &BTreeMap<String, Vec<u8>>) -> LayeredV
 fn parse_map(vfs: &LayeredVfs, path: &str) -> MapFile {
     let catalog = LocalPrototypeCatalog::for_game(vfs, GameProfile::Fallout2);
     MapFile::parse_for(&vfs.read(path).unwrap(), &catalog, GameProfile::Fallout2).unwrap()
-}
-
-/// The town with a full base and two sprite sets (a third unused).
-fn scene() -> Scene {
-    let mut scene = town();
-    scene.base = full_base();
-    scene.critter_art = vec![
-        sprite_set("townsman", 1),
-        sprite_set("townswoman", 2),
-        sprite_set("unused", 3),
-    ];
-    scene
 }
 
 /// The free walkable hex nearest `position` within the radius, by brute
@@ -214,38 +196,6 @@ fn critters_stand_on_the_nearest_free_walkable_hex_and_never_share_one() {
     let without = build_map(&plain.input()).unwrap();
     assert_eq!(without.walkable, built.walkable);
     assert_eq!(without.report.blockers, built.report.blockers);
-}
-
-/// The town plus one door teleporting into an interior.
-fn door_scene() -> Scene {
-    let mut scene = scene();
-    let frame = scene.frame();
-    let hex = hex_at(&frame, 48.0, 48.0);
-    let [x, y] = hex_point(&frame, hex);
-    let centre = scene
-        .cells
-        .iter()
-        .position(|c| matches!(c.location, CellLocation::Exterior { x: 0, y: 0, .. }))
-        .unwrap();
-    scene.cells[centre].references.push(teleport_door(
-        0xb01,
-        [x, y, 100.0],
-        0xc01,
-        0xd01,
-        Some("SynthInterior"),
-        None,
-    ));
-    scene.cells[centre]
-        .references
-        .sort_by(|a, b| a.form.cmp(&b.form));
-    scene.placements.push(placement(
-        4,
-        hex,
-        Role::Door,
-        true,
-        &FormKey::new(PLUGIN, 0xb01).to_string(),
-    ));
-    scene
 }
 
 #[test]
@@ -472,23 +422,6 @@ fn the_critter_budget_names_the_list() {
     scene.critters.pop();
     let built = build_map(&scene.input()).unwrap();
     assert_eq!(built.report.critter_sets[0].row, 4095);
-}
-
-/// Four critters: two the same character, one another name on the same
-/// art, one on the second set.
-fn populated() -> Scene {
-    let mut scene = scene();
-    let frame = scene.frame();
-    let at = |s, t| hex_point(&frame, hex_at(&frame, s, t));
-    scene.critters = vec![
-        critter(1, "synthetic.esm:00a101", "Mae", at(46.0, 52.0), 0.5),
-        critter(0, "synthetic.esm:00a102", "Townsman", at(50.0, 52.0), 2.0),
-        critter(0, "synthetic.esm:00a103", "Townsman", at(54.0, 52.0), -1.0),
-        critter(0, "synthetic.esm:00a104", "Joe", at(50.0, 56.0), 3.0),
-    ];
-    scene.critters[0].female = true;
-    scene.critters[0].hit_points = 18;
-    scene
 }
 
 #[test]

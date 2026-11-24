@@ -29,6 +29,16 @@
 //! decoder did not consume in its `unknown` list. See [`records`] for the
 //! decoding rules.
 //!
+//! # Two games
+//!
+//! Fallout 3 (`HEDR` 0.94) and Fallout: New Vegas (`HEDR` 1.34) plugins
+//! read through the same walker and decoders. [`GameVariant::detect`]
+//! (or [`Plugin::detect_game`]) names the game of a plugin list from its
+//! first plugin. Where a subrecord's layout differs between the games the
+//! decoder tells the forms apart by size, never by game, so a plugin of
+//! either decodes without knowing which it is. [`NEW_VEGAS_ONLY`] lists
+//! the record types only New Vegas has.
+//!
 //! # Form ids
 //!
 //! Form ids are reported as stored. [`MasterList::resolve`] turns one into
@@ -55,6 +65,7 @@ mod bytes;
 mod error;
 pub mod fixture;
 mod formid;
+mod game;
 mod header;
 pub mod records;
 mod sig;
@@ -64,6 +75,7 @@ mod walker;
 
 pub use error::EsmError;
 pub use formid::{FormId, MasterList, ResolvedFormId};
+pub use game::{GameVariant, NEW_VEGAS_ONLY, is_new_vegas_only};
 pub use header::{
     CellChildKind, GroupHeader, GroupKind, HEADER_LEN, RecordFlags, RecordHeader, RecordMeta,
 };

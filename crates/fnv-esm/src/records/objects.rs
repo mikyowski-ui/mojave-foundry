@@ -416,6 +416,93 @@ impl Weapon {
 
 typed_record!(Weapon, WEAP);
 
+impl Weapon {
+    /// The fields of the weapon's `DNAM` that [`WeaponCombat`] reads, from
+    /// the first `DNAM` in `unknown`; `None` when there is none or it is
+    /// too short.
+    pub fn combat(&self) -> Option<WeaponCombat> {
+        self.unknown
+            .iter()
+            .find(|s| s.sig == crate::sig::Sig::new(b"DNAM"))
+            .and_then(|s| WeaponCombat::parse(&s.data))
+    }
+}
+
+/// A few fields of a weapon's large `DNAM`, read in place.
+///
+/// The `DNAM` itself stays in [`Weapon::unknown`], whole, so nothing is
+/// lost; this reads the fields a converter can use. The block is 204 bytes
+/// in most New Vegas weapons and 136 in Fallout 3 (New Vegas appended
+/// fields, and both masters hold some shorter ones: 120 to 200 bytes).
+/// Every field here sits in the first 108 bytes, at the same offset in
+/// both games; checked against both retail masters, where the skill is
+/// always a skill actor value (32 to 45), the reach and spreads are small
+/// non-negative numbers, and the ranges and AP costs are plausible.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct WeaponCombat {
+    /// The animation type, as stored (0 is hand to hand; the codes above
+    /// it name melee, pistol, rifle, launcher and thrown animations).
+    pub animation_type: u32,
+    /// Melee reach multiplier (offset 8).
+    pub reach: f32,
+    /// Minimum spread, degrees (offset 16).
+    pub min_spread: f32,
+    /// Spread, degrees (offset 20).
+    pub spread: f32,
+    /// Base chance to hit in VATS, percent (offset 40).
+    pub vats_to_hit: u8,
+    /// Projectiles per shot (offset 42).
+    pub projectile_count: u8,
+    /// Minimum range, game units (offset 44).
+    pub min_range: f32,
+    /// Maximum range, game units (offset 48).
+    pub max_range: f32,
+    /// Shots per second (offset 64).
+    pub fire_rate: f32,
+    /// The action point cost; 0 means "computed by the game" (offset 68).
+    pub action_points: f32,
+    /// Reload time, seconds (offset 92).
+    pub reload_time: f32,
+    /// The skill used, an actor value index: 32 barter, 33 big guns,
+    /// 34 energy weapons, 35 explosives, 36 lockpick, 37 medicine, 38 melee
+    /// weapons, 39 repair, 40 science, 41 guns (small guns), 42 sneak,
+    /// 43 speech, 44 survival (throwing), 45 unarmed (offset 104).
+    pub skill: u32,
+}
+
+impl WeaponCombat {
+    /// Shortest `DNAM` that holds every field.
+    pub const MIN_LEN: usize = 108;
+
+    /// Reads the fields from a `DNAM` payload of at least
+    /// [`Self::MIN_LEN`] bytes.
+    pub fn parse(dnam: &[u8]) -> Option<Self> {
+        if dnam.len() < Self::MIN_LEN {
+            return None;
+        }
+        let u32_at = |at: usize| {
+            dnam.get(at..at + 4)
+                .and_then(|b| b.try_into().ok())
+                .map(u32::from_le_bytes)
+        };
+        let f32_at = |at: usize| u32_at(at).map(f32::from_bits);
+        Some(Self {
+            animation_type: u32_at(0)?,
+            reach: f32_at(8)?,
+            min_spread: f32_at(16)?,
+            spread: f32_at(20)?,
+            vats_to_hit: *dnam.get(40)?,
+            projectile_count: *dnam.get(42)?,
+            min_range: f32_at(44)?,
+            max_range: f32_at(48)?,
+            fire_rate: f32_at(64)?,
+            action_points: f32_at(68)?,
+            reload_time: f32_at(92)?,
+            skill: u32_at(104)?,
+        })
+    }
+}
+
 fn parse_crdt(data: &[u8]) -> Option<WeaponCritical> {
     let mut rd = Rd::exact(data, 16)?;
     let damage = rd.u16()?;

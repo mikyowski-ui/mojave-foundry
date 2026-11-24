@@ -132,6 +132,18 @@
 //! module has the rules; [`BudgetReport::interior`] the tallies. Off (the
 //! default), nothing changes.
 //!
+//! # Declutter and readability
+//!
+//! [`SlicerConfig::declutter`] ([`DeclutterProfile`]) thins a window for
+//! the oblique view: protected references (interactive, quest, structural)
+//! are never pruned nor demoted by the ladder; micro-clutter, dense piles,
+//! decals and overhangs leave; room shells get a lower cut; wall strips
+//! that hide walkers are cropped to a kerb after rendering; floor and
+//! props get their own tone and interactive sprites an outline; the report
+//! carries [`DeclutterStats`] with the open-floor ratio before and after.
+//! The `declutter` module has the rules. Off (the default), nothing
+//! changes.
+//!
 //! # Budget
 //!
 //! Art is deduplicated over the whole run by content (category, size,
@@ -165,6 +177,8 @@
 
 mod classify;
 mod config;
+mod cutaway;
+mod declutter;
 pub mod engine_view;
 mod error;
 mod floor;
@@ -183,12 +197,17 @@ mod tests;
 
 pub use classify::{Class, ClassKind, Footprint, MeshFacts, SkipReason, classify};
 pub use config::{Budget, BudgetLadder, SlicerConfig};
+pub use declutter::{
+    ClutterRules, Cutaway, DecalMode, DeclutterProfile, DensityRule, OverhangRule, Protection,
+    ShellCut, WalkerCover, floor_stats, walker_cover,
+};
 pub use error::SliceError;
 pub use interior::InteriorSlice;
 pub use render::{Assets, MirAssets};
 pub use report::{
-    BudgetReport, CategoryUse, ClassCount, Contributor, InteriorStats, LadderKind, LadderStep,
-    LandmarkFallback, LandmarkStats, Spread, StripStats,
+    BudgetReport, CategoryUse, ClassCount, Contributor, CutawayStats, DeclutterStats, FloorStats,
+    InteriorStats, KindTally, LadderKind, LadderStep, LandmarkFallback, LandmarkStats, Spread,
+    StripStats,
 };
 pub use slice::{estimate, estimate_with, slice_statics, slice_with};
 

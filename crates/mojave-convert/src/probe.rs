@@ -253,18 +253,35 @@ pub fn nif(path: &Path, step: usize, prefix: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Walks a plugin, decodes every record through the typed table, and
-/// tallies what did not decode cleanly. `needle` selects cells by editor id
-/// substring (case-insensitive) for a closer look.
-pub fn esm(path: &Path, needle: &str) -> Result<(), String> {
+/// Walks a plugin, decodes every record through the typed tables (both of
+/// them, `fnv_esm::records::all_decoders`), and tallies what did not decode
+/// cleanly. `needle` selects cells by editor id substring
+/// (case-insensitive) for a closer look; `cells` (an editor id substring
+/// too) breaks the placed references of the matching cells down by the
+/// record type of their base.
+pub fn esm(path: &Path, needle: &str, cells: &str) -> Result<(), String> {
     use fnv_esm::{Plugin, Record};
     let bytes = std::fs::read(path).map_err(|e| format!("read: {e}"))?;
     let plugin = Plugin::parse(&bytes).map_err(|e| format!("parse: {e}"))?;
     let header = plugin.header();
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let game = match plugin.detect_game(&name, None) {
+        Ok(game) => format!("{} (`{}`)", game.display_name(), game.id()),
+        Err(error) => format!("unknown: {error}"),
+    };
     println!(
-        "plugin: version {}  declared records {}  masters {:?}",
+        "plugin: version {}  game {game}  declared records {}  masters {:?}",
         header.version, header.record_count, header.masters
     );
+    let breakdown = cells.to_ascii_lowercase();
+    // Every record's signature by form id (as stored: one plugin's own
+    // numbering), and the bases of the references in the broken-down cells.
+    let mut sig_of: BTreeMap<u32, String> = BTreeMap::new();
+    let mut broken_down: BTreeMap<u32, String> = BTreeMap::new();
+    let mut bases: BTreeMap<u32, Vec<(String, Option<u32>)>> = BTreeMap::new();
     let needle = needle.to_ascii_lowercase();
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut errors: BTreeMap<String, (usize, usize)> = BTreeMap::new();
@@ -289,6 +306,7 @@ pub fn esm(path: &Path, needle: &str) -> Result<(), String> {
         };
         let sig = record.sig().to_string();
         *counts.entry(sig.clone()).or_default() += 1;
+        sig_of.insert(record.form_id().0, sig.clone());
         let cell = walker.context().cell().map(|id| id.0);
         let decoded = match record.decode() {
             Ok(decoded) => decoded,
@@ -318,6 +336,10 @@ pub fn esm(path: &Path, needle: &str) -> Result<(), String> {
                     interior_cells += 1;
                 }
                 let id = c.common.editor_id.clone().unwrap_or_default();
+                if !breakdown.is_empty() && id.to_ascii_lowercase().contains(&breakdown) {
+                    let grid = c.grid.as_ref().map(|g| (g.x, g.y));
+                    broken_down.insert(decoded.form_id().0, format!("{id} grid {grid:?}"));
+                }
                 if !needle.is_empty() && id.to_ascii_lowercase().contains(&needle) {
                     let grid = c.grid.as_ref().map(|g| (g.x, g.y));
                     cells_of_interest.insert(decoded.form_id().0, format!("{id} grid {grid:?}"));
@@ -338,6 +360,16 @@ pub fn esm(path: &Path, needle: &str) -> Result<(), String> {
                 scripts += 1;
                 script_sources += usize::from(script.body.source.is_some());
             }
+            Record::Placed(placed) => {
+                if let Some(cell) = cell
+                    && broken_down.contains_key(&cell)
+                {
+                    bases
+                        .entry(cell)
+                        .or_default()
+                        .push((sig.clone(), placed.base.map(|b| b.0)));
+                }
+            }
             _ => {}
         }
         if let Some(cell) = cell
@@ -351,12 +383,15 @@ pub fn esm(path: &Path, needle: &str) -> Result<(), String> {
         "records walked: {total}  distinct signatures: {}",
         counts.len()
     );
-    let typed: Vec<String> = fnv_esm::DECODERS
-        .iter()
-        .map(|d| d.sig.to_string())
+    let typed: Vec<(String, &str)> = fnv_esm::records::all_decoders()
+        .map(|d| (d.sig.to_string(), d.type_name))
         .collect();
-    for sig in &typed {
-        println!("  {sig}: {}", counts.get(sig).copied().unwrap_or(0));
+    println!("typed decoders: {}", typed.len());
+    for (sig, type_name) in &typed {
+        println!(
+            "  {sig}: {}  ({type_name})",
+            counts.get(sig).copied().unwrap_or(0)
+        );
     }
     println!("cells: {exterior_cells} exterior, {interior_cells} interior");
     println!("scripts: {scripts}, with source text: {script_sources}");
@@ -378,6 +413,32 @@ pub fn esm(path: &Path, needle: &str) -> Result<(), String> {
             per_cell.get(form).cloned().unwrap_or_default(),
             land_range.get(form)
         );
+    }
+    if !breakdown.is_empty() {
+        println!(
+            "placed references by base record type, cells matching {breakdown:?}: {}",
+            broken_down.len()
+        );
+        for (form, label) in &broken_down {
+            let refs = bases.get(form).map_or(&[][..], Vec::as_slice);
+            let mut by_kind: BTreeMap<String, usize> = BTreeMap::new();
+            for (sig, base) in refs {
+                let kind = match base {
+                    Some(base) => sig_of
+                        .get(base)
+                        .cloned()
+                        .unwrap_or_else(|| "(no record of this plugin)".to_owned()),
+                    None => format!("({sig} without a base)"),
+                };
+                *by_kind.entry(kind).or_default() += 1;
+            }
+            let mut ranked: Vec<_> = by_kind.into_iter().collect();
+            ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            println!("  {form:08x} {label}: {} references", refs.len());
+            for (kind, count) in ranked {
+                println!("    {count:>6}  {kind}");
+            }
+        }
     }
     Ok(())
 }

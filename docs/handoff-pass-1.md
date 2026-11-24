@@ -696,3 +696,203 @@ lines "from another level") and whether the sunken area reads.
 **Not verified.** Look-at text in a window (only the message files were
 read: `pro_crit.msg` names all five appearances); the three other rooms;
 a window build of the engine (all runs headless).
+
+## 11. Fallout 3 first, both games in one pipeline (2026-11-23)
+
+The owner made Fallout 3 the first target. `mojave-convert` now converts
+a Fallout 3 or a New Vegas install through one front end, on the
+parser work of the same day (`fnv_esm::GameVariant`,
+`mir::extract_for_game`, the logic tables, `Records::referenced_refs`,
+child worldspaces on their parent's land). New Vegas output is unchanged.
+Commands and keys are in `docs/running.md` ("Which game", "Fallout 3
+slices", "Declutter and tone"); interfaces in `docs/contracts.md`
+sections 1 and 9.
+
+**Front end.** `--game-dir <install>` with the game read from the master
+in `Data` and confirmed by its header; `--game fo3|fnv`; `--fo3` and
+`--fnv` as aliases that fix the game (`--fnv` behaves exactly as before
+on a New Vegas install). Slices may say `game = "fo3"|"fnv"` (default:
+the master their plugins start with); built-in slices are per game
+(`goodsprings`, `springvale`), and a run without `--slice` takes its
+game's. Every disagreement (flag, `--game`, slice, install, the first
+plugin's header) stops the run before extract and names both games
+(`ConvertError::Source`, which replaces `ConvertError::Fnv` and carries the
+flag that named the install). The game is in `mir/report.md` and
+`manifest.json` (parser crate), `map-report.md` (second line) and
+`map-features.json` (`game`); from Fallout 3 on it is hashed into the
+sprite and map stages' keys (New Vegas keys unchanged). The critter
+stage's key is not mine to change (`critters.rs`); its sprite sets are
+keyed by content already. `probe esm` prints the plugin's game, every
+decoder of both tables, and `--cells <text>` breaks a cell's placed
+references down by base record type. The slicer starts from a per-game
+pattern profile (`map::slicer_defaults`; New Vegas = the slicer's
+defaults).
+
+**Slices** (`slices/fo3/`, editor ids and cells checked against
+`Fallout3.esm` with the probe and an extract): `springvale` (Wasteland,
+x -5..0, y -6..-1, centre (-7100, -11200) among the ranch houses; the
+brief's x -4..-1, y -5..-1 cannot hold a 14,000-unit window plus one
+cell), `super-duper-mart-exterior` (x 1..6, y -7..-2, centre (17400,
+-16800) in cell (4, -5); the brief's three by three cells leave the
+window's west and south strips without land), `super-duper-mart`
+(interior `SuperDuperMart`, cells 3..5 x -6..-4, both doors in (4, -5)),
+`megaton` (`MegatonWorld`, x -2..0, y -8..-6: the worldspace has no other
+cells; the window reaches past them), `megaton-saloon`
+(`MegatonMoriartysSaloon`, cut 120).
+
+**Runs** (each `all --standalone --jobs 2` from an empty `--out` under
+`out/fo3/<slice>/`, then a 2,000-tick headless autoplay, `probe walk` and
+`shots --auto 8 --classic --wide`; binary `out/bin/mojave-convert-dual`):
+
+| | Super-Duper Mart | Moriarty's Saloon | Megaton | Springvale | Super-Duper Mart, outside |
+|---|---|---|---|---|---|
+| references in the window | 1,767 | 458 | 937 | 1,632 | 1,003 |
+| walls / scenery / items added | 2,331 / 230 / 407 | 177 / 50 / 59 | 3,861 / 568 / 25 | 3,490 / 888 / 69 | 3,127 / 1,050 / 25 |
+| floor tiles (of 4,094) | 971 | 67 | 4,093 | 4,077 | 4,087 |
+| budget ladder steps | 0 | 0 | 3 (11 landmarks, 330 pieces; 3 border walls baked as relief) | 0 | 0 |
+| people placed / left out | 8 / 3 (a Protectron; two raiders on the upper level, z +174) | 6 / 0 (Moriarty, Gob, Nova, three settlers) | 3 | 0 | 2 |
+| walkable / reachable | 2,760 / 2,751 | 116 / 110 | 8,922 / 3,350 (37.6 %, 20 components) | 26,421 / 26,292 (99.5 %) | 33,164 / 33,151 |
+| doors | 21 door references; 2 teleport doors drawn, not converted (demo) | 7; 2 teleport doors drawn | 18 teleport doors: 15 exits, all unreachable; 3 not converted | 3 exits, all reachable | 2 exits, both reachable |
+| autoplay, 2,000 ticks | clean, 1,950 actions | clean, 129 actions | clean, 23 actions | clean, 2,000 actions, 1,925 audits | clean, 26 actions (left by an exit) |
+| `all` | 32 s, 707 MB | 89 s (5.8 s rebuilding at cut 120) | 184 s | 126 s, 815 MB | 99 s, 757 MB |
+| shots arrived | 16 of 16 | 16 of 16 | 2 of 2 (one viewpoint) | 16 of 16 | 16 of 16 |
+
+The extract's own counts match the brief: the Super-Duper Mart room holds
+10 NPC, 1 creature, 68 container, 2 terminal and 21 door references;
+Moriarty's 6 NPC, 20 container, 1 terminal. Extracts had no undecodable
+records.
+
+**Best frames** (`out/fo3/best/`, with `contact.png`):
+`super-duper-mart-1.png` and `-2.png` (wide: shelves, freezers, the
+raiders), `-3.png` (classic, the back offices), `megaton-saloon-1.png`
+(the bar, its stools and all six people at cut 120) beside
+`megaton-saloon-cut210.png` (the default cut: joists and the balcony
+over everything), `springvale-1.png` (ruined houses, the water tower and
+the Red Rocket), `springvale-preview.png`, `megaton-preview.png` (the
+map stage's composite: the town reads, the engine cannot reach it),
+`super-duper-mart-exterior-1.png` (the store's side and its car park) and
+`-preview.png`.
+
+**What looks wrong, by owner.**
+1. `map-builder`: Megaton is a town of walkways and ramps at several
+   heights in a crater. Flattened to one level, the inside splits into
+   islands (3,259, 1,275, 405, 340 hexes ...), and the entrance lands in
+   the largest component, which is the ground outside the wall; every
+   exit is unreachable, autoplay does nothing and `shots` gets one
+   viewpoint. An exterior slice needs a way to name its entrance
+   (`entrance_near` exists for interiors only) and multi-level walkways
+   need their own handling.
+2. `map-slicer`: the player stands on top of the Red Rocket's canopy in
+   Springvale (`springvale-2.png`): navmesh under a landmark roof, the
+   known "player on roofs" item of section 9.
+3. `map-slicer`/`foundry-render`: shopping carts (wire meshes) render as
+   brown scribbles on the Super-Duper Mart floor; the store's roof sign
+   letters render as empty frames in the exterior preview.
+4. `map-slicer`: Megaton's border walls (`megatonborderwallreg02`) are
+   baked as relief (`no hex near piece`), the tall-landmark item of
+   section 9.
+5. Fallout 3 trees are SpeedTree `.spt` models, which have no mesh: they
+   are skipped as "no mesh" (62 in the Super-Duper Mart cells). The dead
+   trees that do show are static meshes.
+6. Critter stage: creatures (the Protectron) are not rendered, as before.
+7. Data, not a defect: two Super-Duper Mart raiders stand on the upper
+   level; `clamp_levels = true` would place them.
+
+**Regressions.** Goodsprings with defaults (`all --fnv ... --out
+out/goodsprings`, 344 s) and the Prospector Saloon (`all --standalone
+--slice slices/saloon.toml`) match their baselines in every file outside
+`art/critters/`: maps, prototypes, walls, tiles, scenery, lists and
+messages are byte-identical. The critter art differs and grows (new
+animation sets, `mj0000ak.frm` and others) because of the characters
+agent's work in `critters.rs`, which `README.txt`'s file list follows.
+
+**Determinism.** The Super-Duper Mart built twice into fresh `--out`
+directories (`out/fo3/det-a`, `det-b`): all 6,988 files under
+`mods/mojave` identical, and `map-features.json` too. `map-report.md`
+differed only in the terrain stage's timings inside `## Ground`; the
+report now leaves those lines out.
+
+### Declutter, tone and interactive wiring (same day)
+
+On the declutter agent's `SlicerConfig::declutter` and the builder's
+`BuildOptions::interactive` and `BuildReport::readability`. Off by default
+for both games (`mojave_convert::declutter::default_profile`), so every
+slice keeps its bytes; `--declutter readable` (on `map`, `all`,
+`estimate`) or `[declutter] profile = "readable"` turns it on from the
+game's preset (`readable_for`: New Vegas the slicer's `readable()`,
+Fallout 3 adds paper and litter heaps and shopping carts to the clutter
+patterns). The `[declutter]` keys (`protect_items`, `protected_kinds`,
+`protect_referenced`, clutter thresholds and extra patterns, `density`,
+`decals`/`decal_fade`, `overhang`/`overhang_clearance`,
+`shell_cut`/`shell_cut_height`, `cutaway`/`kerb_height`/
+`cutaway_exteriors`, `outline`/`outline_factor`, `measure_baseline`) and
+`[tone.floor|props|figures]` (`gain`, `gamma`, `saturation`, `contrast`)
+are mapped onto the profile by hand (its types are not serde types); keys
+with the pass off are refused before extract. `protected_refs` is
+`Records::referenced_refs()` (14,274 references in `Fallout3.esm`,
+12,255 in `FalloutNV.esm`); the builder's interactive set is those plus
+every window reference of a protected or item kind and every teleport
+door. The profile name and the preset are in the map stage's key when
+the pass is on. `map-report.md` has `## Declutter` and `## Readability`
+(the latter on every run).
+
+| | Prospector Saloon | Super-Duper Mart | Moriarty's Saloon |
+|---|---|---|---|
+| pruned (clutter, pattern, density, overhang) | 28 (17, 3, 1, 7) | 214 (10, 202 of which 89 carts, 0, 2) | 22 (10, 11, 0, 1) |
+| protected | 155 | 814 | 123 |
+| cutaway: strips cut, walkers hidden before / after | 117 of 186, 135 / 7 | 448 of 939, 635 / 0 | 53 of 91, 47 / 0 |
+| open floor before / after | 26.3 % / 43.4 % | 41.2 % / 56.8 % | 33.3 % / 36.4 % |
+| walkable hexes hidden before / after | 56.5 % / 29.7 % | 46.2 % / 27.9 % | 42.2 % / 37.1 % |
+| reachable, current / readable | 199 / 201 | 2,751 / 2,847 | 110 / 110 |
+| autoplay, readable | clean, 578 actions | clean, 578 actions | clean, 141 actions |
+
+With `protect_items = false` (`$TMPDIR` slice copies; the key is the
+owner's choice): the saloon prunes 125 (112 by size: bottles and glasses
+on the bar and tables), open floor 44.6 %, objects on 24.9 % of the
+floor (29.3 % with items protected); the Super-Duper Mart prunes 480 (the
+cans on its shelves), built before the cart pattern was added.
+
+Frames (same viewpoint hexes before and after; the readable run's
+entrance moves, so its viewpoint numbers are one higher):
+`out/interiors/best/saloon-readable-pairs.png` and
+`saloon-items-pairs.png`; `out/fo3/best/super-duper-mart-readable-pairs.png`,
+`super-duper-mart-items-pairs.png` and `megaton-saloon-readable-pairs.png`;
+runs under `out/interiors/saloon-readable{,-items}/` and
+`out/fo3/{super-duper-mart,megaton-saloon}-readable/`,
+`out/fo3/super-duper-mart-readable-items/`.
+
+**What works.** The saloon's partitions and front walls drop to the
+kerb: the booths, a person behind the south wall and the restrooms show,
+the back office's beams are gone. The Super-Duper Mart loses its planks,
+litter and carts and reads as a store floor; every raider stands in
+view. Moriarty's front railing opens.
+
+**What looks wrong, by owner.**
+1. `map-slicer`: doors stand full height inside walls cut to the kerb
+   (the saloon's south and east doors in every readable frame); the
+   grocery shelves are long and thin enough to count as walls, so the
+   cutaway cuts the aisles to low outlines (`super-duper-mart-readable-pairs.png`,
+   top right). A cutaway exclusion pattern (or a `max_height` for walls)
+   would let a slice keep furniture whole; I can map it to a slice key.
+2. `map-slicer`: an item the slice leaves unprotected loses its outline
+   too (outlined sprites 111 to 17 in the saloon); outline and protection
+   look tied.
+3. `map-builder`: `ReadabilityReport` calls 72 to 100 % of walkable hexes
+   covered (0 clear in both saloons) where the slicer's floor metric
+   finds 28 to 37 % hidden after the pass; the builder's cover test seems
+   to count something that is not upright art over the figure.
+4. Pool table and bar: they are sliced (wall strips), not sprites, so
+   they do block in principle, but a strip does not block a hex in
+   `SlicerConfig::open_hexes`, and the interior run opens every hex the
+   navmesh rasterises (`walk::standable_hexes`, tolerance 24 units, hexes
+   about 70 across). On the written saloon map 8 of the 12 hexes under the
+   pool table and 3 of 6 tested under the two bar pieces are free and reachable
+   (`probe walk --from`), though no navmesh triangle reaches the table's
+   centre. Owner: `map-builder` (which hexes count as standable) with
+   `map-slicer` (open hexes override furniture); from here I could
+   narrow the open set indoors, which would change every interior's bytes.
+5. Not done from here: the floor tone does not reach exterior terrain
+   tiles (`map-terrain` quantizes inside `build_ground`, with no hook
+   before it), and the figures tone is not applied to critter sprites
+   (`critters.rs`, the characters agent's).
+

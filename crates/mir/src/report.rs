@@ -643,6 +643,12 @@ pub fn report(mir: &Mir, params: &ReportParams) -> Result<String, MirError> {
     let _ = writeln!(out, "# MIR report\n");
     let _ = writeln!(
         out,
+        "Game: {} (`{}`).\n",
+        manifest.game.display_name(),
+        manifest.game.id()
+    );
+    let _ = writeln!(
+        out,
         "Slice `{}`: worldspace `{}`, cells x {}..={}, y {}..={}, interior depth {}. \
          Schema version {}; raw store `{}`.\n",
         slice.name,
@@ -687,6 +693,8 @@ pub fn report(mir: &Mir, params: &ReportParams) -> Result<String, MirError> {
         .map(|(k, v)| vec![format!("`{k}`"), v.to_string()])
         .collect();
     table(&mut out, &["Kind", "Records"], &rows);
+    write_not_converted(&mut out, &counts);
+    write_logic(&mut out, &records)?;
 
     // References.
     let corpus_refs = records.reference_counts()?;
@@ -837,6 +845,21 @@ pub fn report(mir: &Mir, params: &ReportParams) -> Result<String, MirError> {
         out,
         "{} skinned primitives across the converted meshes.\n",
         skinned
+    );
+    let other_version = manifest
+        .meshes
+        .values()
+        .filter(|e| {
+            e.status == AssetStatus::Undecodable
+                && e.reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("unsupported NIF version"))
+        })
+        .count();
+    let _ = writeln!(
+        out,
+        "{other_version} meshes skipped because their NIF version is not the supported one \
+         (listed with their paths under \"files missing or not converted\").\n"
     );
     let _ = writeln!(out, "### Block types the mesh parser skipped\n");
     if skipped.is_empty() {
@@ -1043,6 +1066,25 @@ pub fn report(mir: &Mir, params: &ReportParams) -> Result<String, MirError> {
             let _ = writeln!(out, "... and {} more.\n", manifest.issues.len() - limit);
         }
     }
+    let _ = writeln!(out, "{} notes.\n", manifest.notes.len());
+    if !manifest.notes.is_empty() {
+        let rows: Vec<Vec<String>> = manifest
+            .notes
+            .iter()
+            .take(limit)
+            .map(|i| {
+                vec![
+                    format!("`{}`", i.subject),
+                    i.sig.clone().map_or_else(String::new, |s| format!("`{s}`")),
+                    i.error.clone(),
+                ]
+            })
+            .collect();
+        table(&mut out, &["Subject", "Kind", "Note"], &rows);
+        if manifest.notes.len() > limit {
+            let _ = writeln!(out, "... and {} more.\n", manifest.notes.len() - limit);
+        }
+    }
     let failed: Vec<Vec<String>> = manifest
         .meshes
         .iter()
@@ -1116,6 +1158,68 @@ pub fn report(mir: &Mir, params: &ReportParams) -> Result<String, MirError> {
 /// The report line on land layers drawn with the default land texture,
 /// with a leading line break; empty when there are none, so that a report
 /// without them reads as before.
+/// The record types only New Vegas has, by name and count: they are not
+/// converted.
+fn write_not_converted(out: &mut String, counts: &BTreeMap<String, u64>) {
+    let found: Vec<(String, u64)> = fnv_esm::NEW_VEGAS_ONLY
+        .iter()
+        .map(|sig| sig.to_string())
+        .filter_map(|sig| counts.get(&sig).map(|&n| (sig, n)))
+        .collect();
+    if found.is_empty() {
+        let _ = writeln!(out, "Not converted (New Vegas only): none.\n");
+        return;
+    }
+    let total: u64 = found.iter().map(|(_, n)| n).sum();
+    let list: Vec<String> = found.iter().map(|(s, n)| format!("`{s}` {n}")).collect();
+    let _ = writeln!(
+        out,
+        "Not converted (New Vegas only): {total} records: {}.\n",
+        list.join(", ")
+    );
+}
+
+/// Terminals, notes and packages, or why they are not listed.
+fn write_logic(out: &mut String, records: &Records) -> Result<(), MirError> {
+    let counts = |sql: &str| -> Result<i64, MirError> {
+        Ok(records.connection().query_row(sql, [], |r| r.get(0))?)
+    };
+    let tables = [
+        "terminals",
+        "terminal_items",
+        "notes",
+        "packages",
+        "actor_packages",
+    ];
+    for table in tables {
+        let found: i64 = counts(&format!(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '{table}'"
+        ))?;
+        if found == 0 {
+            let _ = writeln!(
+                out,
+                "Terminals, notes and packages: not listed (records.sqlite predates them).\n"
+            );
+            return Ok(());
+        }
+    }
+    let _ = writeln!(
+        out,
+        "Terminals: {} ({} menu items). Notes: {}. Packages: {}, {} of them listed by an NPC \
+         or creature ({} listings).\n",
+        counts("SELECT COUNT(*) FROM terminals")?,
+        counts("SELECT COUNT(*) FROM terminal_items")?,
+        counts("SELECT COUNT(*) FROM notes")?,
+        counts("SELECT COUNT(*) FROM packages")?,
+        counts(
+            "SELECT COUNT(DISTINCT package) FROM actor_packages \
+             WHERE package IN (SELECT form FROM packages)"
+        )?,
+        counts("SELECT COUNT(*) FROM actor_packages")?,
+    );
+    Ok(())
+}
+
 fn default_land_line(manifest: &crate::model::Manifest, exteriors: &[CellDoc]) -> String {
     let layers: Vec<&crate::model::LandLayer> = exteriors
         .iter()

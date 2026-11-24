@@ -5,9 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
-description = "Placeholder for M4: offline ragdoll death baking. Intentionally empty."
+description = "Offline, deterministic ragdoll death sampler: a posed skeleton collapses onto flat ground and is sampled into poses for death sprites."
 
 [dependencies]
+nif.workspace = true
+# Single-threaded pipeline (no `parallel`), libm transcendentals and glam's
+# portable core (`enhanced-determinism`): see the crate documentation.
+rapier3d = { version = "0.36.1", features = ["enhanced-determinism"] }
 
 [lints]
 workspace = true

@@ -4,34 +4,46 @@
 //! For each viewpoint the player is walked from the map's entry along a
 //! route of the written map ([`crate::route`]), in hops short enough for the
 //! engine's capped route search, and the engine captures the frame at the
-//! end. The camera follows the player. Two views per viewpoint: the
-//! 640 × 480 game view with the interface, and the unlocked widescreen view
-//! at 1920 × 1080, zoom 0.5 ([`DEFAULT_WIDE_ZOOM`]; 0.75 on an interior
-//! demo, [`INTERIOR_WIDE_ZOOM`]). The engine draws the wide view at its own
-//! pixel scale whatever the zoom: zoom 0.5 captures 1707 × 760 pixels of
-//! map, 0.75 about 1138 × 507, 1.0 854 × 380 (a saloon fits 0.75).
+//! end. Three views ([`View`]):
+//!
+//! - **classic** (the default): the engine's enhanced view on a 640 × 480
+//!   surface at zoom 1.0, a 640 × 380 frame of map with no interface bar,
+//!   the proportions and pixel scale of the original game;
+//! - **wide** (`--wide`): the enhanced view on a 1920 × 1080 surface at
+//!   zoom 0.5 ([`DEFAULT_WIDE_ZOOM`]; 0.75 on an interior demo,
+//!   [`INTERIOR_WIDE_ZOOM`]). The engine draws it at its own pixel scale
+//!   whatever the zoom: zoom 0.5 captures 1707 × 760 pixels of map, 0.75
+//!   1138 × 507, 1.0 854 × 380;
+//! - **game** (`--game-view`): the Vanilla 640 × 480 view with the
+//!   interface, the *engine-following view*: the engine re-centres it on
+//!   the player at every hex step and no input can hold it still.
+//!
+//! The enhanced views' camera is **stationary** by default: frozen right
+//! after the settle ticks, framed on the walk, and re-centred only at hop
+//! boundaries when the next hop would leave the frame's inner box
+//! ([`crate::replay::plan_camera`]; `--margin`). `--follow-camera` lets it
+//! follow the player as before; with no view named it then captures the
+//! game and wide views, which is what `shots` did before.
 //!
 //! On an interior demo (`map-features.json` names the room) `--auto`
 //! aims at the entrance, then at the people placed, those with a name of
 //! their own first, then at the largest walls, and the viewpoints may lie
 //! [`INTERIOR_SPREAD`] steps apart.
 //!
-//! Output, under `<out>/shots/`: `<map>-NN-<view>.png`, `index.json`, and
-//! `contact.png`. The replay logs, raw frames and engine logs are kept in
-//! `work/` for inspection.
+//! Output, under `<out>/shots/` (or `--dest`): `<map>-NN-<view>.png`,
+//! `index.json`, and `contact.png`. The replay logs, raw frames and engine
+//! logs are kept in `work/` for inspection.
 //!
 //! The engine reports no player position, so arrival is judged by frames
-//! of the wide view, whose camera follows the player to the map's edges
-//! (the game view's stops short of them): a viewpoint's frame is compared
-//! with the entry's (did the player move at all) and with the same walk
-//! less its last hop (did the last hop move). Both must differ in more
-//! than [`MOVED_FRACTION`] of the pixels.
+//! of a following wide view run for the purpose (whatever views are
+//! captured), whose camera follows the player to the map's edges: a
+//! viewpoint's frame is compared with the entry's (did the player move at
+//! all) and with the same walk less its last hop (did the last hop move).
+//! Both must differ in more than [`MOVED_FRACTION`] of the pixels.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use foundry_gallery::{Anchor, Background, Columns, SheetOptions, Tile, contact_sheet};
 use serde::Serialize;
@@ -39,61 +51,34 @@ use vault_formats::HexGrid;
 
 use crate::config::ConvertError;
 use crate::map::{Feature, MapFeatures};
+use crate::replay::{
+    CLASSIC_ZOOM, CameraPlan, Engine, EngineJob, Hop, LogOptions, MAX_MARGIN, Recentre, build_log,
+    fit_steps, frame_size, plan_camera, run_jobs,
+};
+pub use crate::replay::{DEFAULT_MARGIN, TICK_MS, View};
 use crate::route::{self, Route, WalkMap};
 
-/// Milliseconds per engine tick in a replay log.
-pub const TICK_MS: u64 = 16;
-/// Ticks before the first walk: the map settles.
-const SETTLE_TICKS: u64 = 30;
-/// Ticks after the last hop, before the frame is captured.
-const FINAL_TICKS: u64 = 40;
 /// A viewpoint counts as reached when its frame differs from the
 /// comparison frame in more than this fraction of the pixels: a camera
 /// that scrolled changes nearly all of them, an idling townsperson a few.
 pub const MOVED_FRACTION: f64 = 0.10;
 
-fn stage(error: impl std::fmt::Display) -> ConvertError {
+pub(crate) fn stage(error: impl std::fmt::Display) -> ConvertError {
     ConvertError::stage("shots", error)
 }
 
-fn io(path: &Path) -> impl FnOnce(std::io::Error) -> ConvertError + '_ {
+pub(crate) fn io(path: &Path) -> impl FnOnce(std::io::Error) -> ConvertError + '_ {
     move |source| ConvertError::Io {
         path: path.to_owned(),
         source,
     }
 }
 
-/// Ticks a hop of `steps` hexes gets: running, a step takes about 16
-/// ticks; the rest is slack for the route search and the turn.
+/// Ticks a hop of `steps` hexes gets: running, a step takes about 8
+/// ticks (16 walking); the rest is slack for the route search and the
+/// turn, so the player stands still at every waypoint.
 pub fn hop_ticks(steps: usize) -> u64 {
     40 + 18 * steps as u64
-}
-
-/// One of the two views a viewpoint is captured in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum View {
-    /// The 640 × 480 game view with the interface.
-    Game,
-    /// The unlocked widescreen view at 1920 × 1080, zoomed.
-    Wide,
-}
-
-impl View {
-    pub const ALL: [View; 2] = [View::Game, View::Wide];
-
-    pub fn name(self) -> &'static str {
-        match self {
-            View::Game => "game",
-            View::Wide => "wide",
-        }
-    }
-
-    fn surface(self) -> (u32, u32) {
-        match self {
-            View::Game => (640, 480),
-            View::Wide => (1920, 1080),
-        }
-    }
 }
 
 /// The wide view's zoom on an exterior map.
@@ -102,49 +87,149 @@ pub const DEFAULT_WIDE_ZOOM: f32 = 0.5;
 /// which a small room fills.
 pub const INTERIOR_WIDE_ZOOM: f32 = 0.75;
 
-/// A replay input log: the surface, for the wide view the enhanced
-/// settings (at `zoom`), ticks to settle, then per hop a walk to its
-/// waypoint and the ticks to get there, then ticks before the capture.
-/// `hops` holds each waypoint and the steps it is from the one before.
-pub fn replay_log(view: View, hops: &[(i32, usize)], zoom: f32) -> String {
-    let mut out = String::new();
-    let mut id = 0u64;
-    let mut now = 0u64;
-    let mut line = |out: &mut String, body: String| {
-        id += 1;
-        out.push_str(&format!("{{\"command_id\":{id},{body}}}\n"));
-    };
-    let (width, height) = view.surface();
-    line(
-        &mut out,
-        format!("\"kind\":\"surface\",\"width\":{width},\"height\":{height}"),
-    );
-    if view == View::Wide {
-        line(
-            &mut out,
-            format!(
-                "\"kind\":\"enhanced\",\"settings\":{{\"viewport_mode\":\"unlocked_widescreen\",\
-                 \"default_zoom\":{zoom:?},\"smooth_camera\":false,\"roof_peek\":\"hidden\",\
-                 \"ui_scale\":null}}"
-            ),
-        );
-    }
-    let mut ticks = |out: &mut String, n: u64, line: &mut dyn FnMut(&mut String, String)| {
-        for _ in 0..n {
-            now += TICK_MS;
-            line(out, format!("\"kind\":\"tick\",\"now_ms\":{now}"));
+/// How a view's camera behaves in a capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CameraKind {
+    /// Frozen after the settle ticks; re-centred only between hops.
+    Stationary,
+    /// The enhanced camera following the player (`--follow-camera`).
+    Follows,
+    /// The Vanilla game view, which the engine re-centres on the player at
+    /// every step whatever the input.
+    EngineFollowing,
+}
+
+impl CameraKind {
+    pub fn of(view: View, follow: bool) -> Self {
+        if !view.enhanced() {
+            CameraKind::EngineFollowing
+        } else if follow {
+            CameraKind::Follows
+        } else {
+            CameraKind::Stationary
         }
-    };
-    ticks(&mut out, SETTLE_TICKS, &mut line);
-    for &(hex, steps) in hops {
-        line(
-            &mut out,
-            format!("\"kind\":\"bot\",\"action\":{{\"op\":\"walk\",\"hex\":{hex},\"run\":true}}"),
-        );
-        ticks(&mut out, hop_ticks(steps), &mut line);
     }
-    ticks(&mut out, FINAL_TICKS, &mut line);
-    out
+
+    /// The caption `index.json` and the contact sheets use.
+    pub fn label(self) -> &'static str {
+        match self {
+            CameraKind::Stationary => "stationary",
+            CameraKind::Follows => "follows the player",
+            CameraKind::EngineFollowing => "engine-following view",
+        }
+    }
+}
+
+/// Which views are captured and how their camera behaves.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Framing {
+    /// In capture order: game, classic, wide.
+    pub views: Vec<View>,
+    /// The enhanced views' camera follows the player.
+    pub follow: bool,
+    /// The stationary camera's inner box margin ([`DEFAULT_MARGIN`]).
+    pub margin: f64,
+}
+
+impl Default for Framing {
+    fn default() -> Self {
+        Self {
+            views: vec![View::Classic],
+            follow: false,
+            margin: DEFAULT_MARGIN,
+        }
+    }
+}
+
+impl Framing {
+    /// The camera of `view` under this framing.
+    pub fn camera(&self, view: View) -> CameraKind {
+        CameraKind::of(view, self.follow)
+    }
+}
+
+/// The view and camera flags `shots` and `walkthrough` share.
+#[derive(Debug, Clone, PartialEq, clap::Args)]
+pub struct ViewArgs {
+    /// Capture the classic frame: the engine's enhanced view on a 640x480
+    /// surface at zoom 1.0, 640x380 pixels of map without the interface
+    /// bar. The default when no view is named.
+    #[arg(long)]
+    pub classic: bool,
+    /// Capture the widescreen view: a 1920x1080 surface at the wide zoom.
+    #[arg(long)]
+    pub wide: bool,
+    /// Capture the 640x480 game view with its interface. The engine
+    /// re-centres it on the player at every step and nothing holds it
+    /// still, so it is labelled "engine-following view".
+    #[arg(long)]
+    pub game_view: bool,
+    /// Let the enhanced camera follow the player instead of standing
+    /// still. With no view named this captures the game view and the wide
+    /// view, as shots did before stationary framing.
+    #[arg(long)]
+    pub follow_camera: bool,
+    /// The stationary camera's inner box: this fraction of the frame's
+    /// width and height stays clear on each side; a hop that would leave
+    /// the box gets a re-centre before it.
+    #[arg(long, default_value_t = DEFAULT_MARGIN)]
+    pub margin: f64,
+    /// Where to write (default <out>/shots, or <out>/walkthrough).
+    #[arg(long)]
+    pub dest: Option<PathBuf>,
+}
+
+impl ViewArgs {
+    /// The framing these flags ask for.
+    pub fn framing(&self) -> Result<Framing, String> {
+        if !(0.0..=MAX_MARGIN).contains(&self.margin) {
+            return Err(format!(
+                "--margin {}: expected a fraction from 0 to {MAX_MARGIN}",
+                self.margin
+            ));
+        }
+        let mut views = Vec::new();
+        for (on, view) in [
+            (self.game_view, View::Game),
+            (self.classic, View::Classic),
+            (self.wide, View::Wide),
+        ] {
+            if on {
+                views.push(view);
+            }
+        }
+        if views.is_empty() {
+            views = if self.follow_camera {
+                vec![View::Game, View::Wide]
+            } else {
+                vec![View::Classic]
+            };
+        }
+        Ok(Framing {
+            views,
+            follow: self.follow_camera,
+            margin: self.margin,
+        })
+    }
+}
+
+/// A replay input log with the camera following the player: the surface,
+/// for the wide or classic view the enhanced settings (at `zoom`), ticks
+/// to settle, then per hop a walk to its waypoint and the ticks to get
+/// there ([`hop_ticks`]), then ticks before the capture. `hops` holds each
+/// waypoint and the steps it is from the one before. The stationary logs
+/// are built by [`crate::replay::build_log`] with a camera plan.
+pub fn replay_log(view: View, hops: &[(i32, usize)], zoom: f32) -> String {
+    let hops: Vec<Hop> = hops
+        .iter()
+        .map(|&(hex, steps)| Hop {
+            hex,
+            steps,
+            ticks: hop_ticks(steps),
+            path: vec![hex],
+        })
+        .collect();
+    build_log(&LogOptions::shots(view, zoom), &hops, None).text()
 }
 
 /// The hops of a route: waypoints at most `hop` steps apart, closer near
@@ -152,6 +237,19 @@ pub fn replay_log(view: View, hops: &[(i32, usize)], zoom: f32) -> String {
 /// steps on one ([`route::safe_waypoints`]), each with the steps from the
 /// one before.
 pub fn hops(route: &Route, hop: usize, exits: &[i32]) -> Vec<(i32, usize)> {
+    route_hops(route, hop, exits, |_| 0)
+        .into_iter()
+        .map(|h| (h.hex, h.steps))
+        .collect()
+}
+
+/// [`hops`] with each hop's path along the route and `ticks(steps)` ticks.
+pub fn route_hops(
+    route: &Route,
+    hop: usize,
+    exits: &[i32],
+    ticks: impl Fn(usize) -> u64,
+) -> Vec<Hop> {
     let points = route::safe_waypoints(&route.path, hop, exits);
     let mut at = 0usize;
     points
@@ -159,8 +257,14 @@ pub fn hops(route: &Route, hop: usize, exits: &[i32]) -> Vec<(i32, usize)> {
         .map(|hex| {
             let index = route.path.iter().position(|h| *h == hex).unwrap_or(at);
             let steps = index.saturating_sub(at);
+            let path = route.path[at.min(index)..=index].to_vec();
             at = index;
-            (hex, steps)
+            Hop {
+                hex,
+                steps,
+                ticks: ticks(steps),
+                path,
+            }
         })
         .collect()
 }
@@ -409,7 +513,8 @@ pub struct ShotsOptions {
     pub map: Option<String>,
     pub at: Vec<i32>,
     pub auto: usize,
-    /// Steps per walk command.
+    /// Steps per walk command (a stationary view may shorten it so that a
+    /// hop always fits its inner box: [`crate::replay::fit_steps`]).
     pub hop: usize,
     /// Least hex steps between two automatic viewpoints; default
     /// [`DEFAULT_SPREAD`], or [`INTERIOR_SPREAD`] on an interior demo.
@@ -421,6 +526,10 @@ pub struct ShotsOptions {
     pub jobs: usize,
     /// Longest an engine run may take before it is stopped.
     pub timeout: Duration,
+    /// The views and their camera.
+    pub framing: Framing,
+    /// Where to write; default `<out>/shots`.
+    pub dest: Option<PathBuf>,
 }
 
 /// One PNG of `index.json`.
@@ -433,25 +542,41 @@ pub struct Shot {
     pub hex: i32,
     pub steps: usize,
     pub hops: usize,
+    /// `classic`, `wide` or `game`.
     pub view: &'static str,
+    /// `enhanced` or `vanilla`.
+    pub view_kind: &'static str,
+    /// The surface the engine drew on.
+    pub surface: [u32; 2],
+    /// The enhanced view's zoom (1 for the game view).
+    pub zoom: f32,
+    /// The camera stood still while the player walked (re-centred only at
+    /// the hop boundaries in `recentres`).
+    pub stationary: bool,
+    /// `stationary`, `follows the player`, or `engine-following view`.
+    pub camera: &'static str,
+    /// The hex under the stationary camera's first centre.
+    pub camera_centre_hex: Option<i32>,
+    /// The stationary camera's re-centres, in order.
+    pub recentres: Vec<Recentre>,
     /// Relative to the shots directory; empty when the engine gave no frame.
     pub file: String,
     pub width: u32,
     pub height: u32,
-    /// The wide view differs from the entry's (false for a viewpoint that
-    /// is the entry). Judged on the wide view for both views, since only
-    /// its camera follows the player up to the map's edges.
+    /// The arrival check's following wide view differs from the entry's
+    /// (false for a viewpoint that is the entry).
     pub moved: bool,
     /// ...and from the same walk without its last hop: the player made it.
     pub arrived: bool,
-    /// This view's camera moved on the last hop. The game view's camera
-    /// stops short of the map's edges, so near one the player can walk
-    /// out of the 640 x 480 frame.
+    /// This view's camera moved on the last hop (never for a stationary
+    /// camera). The game view's camera stops short of the map's edges, so
+    /// near one the player can walk out of the 640 x 480 frame.
     pub camera_followed: bool,
-    /// Fractions of this view's pixels that differ from the entry's frame
-    /// and from the frame without the last hop.
+    /// Fraction of this view's pixels that differ from the entry's frame.
     pub changed_from_entry: f64,
-    pub changed_by_last_hop: f64,
+    /// ...and from the same view without the last hop (following cameras
+    /// only).
+    pub changed_by_last_hop: Option<f64>,
     /// What went wrong with this capture, if anything.
     pub error: Option<String>,
 }
@@ -460,7 +585,10 @@ pub struct Shot {
 struct Index<'a> {
     map: &'a str,
     entry_hex: i32,
+    /// Steps per walk command used.
+    hop: usize,
     arrival_check: String,
+    camera: String,
     shots: &'a [Shot],
 }
 
@@ -471,30 +599,6 @@ pub struct ShotsSummary {
     pub viewpoints: usize,
     pub shots: Vec<Shot>,
     pub dir: PathBuf,
-}
-
-/// The run kinds of a viewpoint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Run {
-    View(View),
-    /// The same view without the last hop.
-    Check(View),
-}
-
-impl Run {
-    fn name(self) -> String {
-        match self {
-            Run::View(view) => view.name().to_owned(),
-            Run::Check(view) => format!("{}-check", view.name()),
-        }
-    }
-}
-
-struct Job {
-    viewpoint: usize,
-    run: Run,
-    log: String,
-    stem: String,
 }
 
 /// A file of the Fallout 2 install by any of its usual spellings.
@@ -510,12 +614,12 @@ fn find_archive(f2: &Path, name: &str) -> Result<PathBuf, ConvertError> {
 }
 
 /// The map file name under `maps/`.
-fn resolve_map(options: &ShotsOptions, layer: &Path) -> Result<String, ConvertError> {
+fn resolve_map(map: Option<&str>, out: &Path, layer: &Path) -> Result<String, ConvertError> {
     let strip = |name: &str| name.trim_start_matches("maps/").to_owned();
-    if let Some(map) = &options.map {
+    if let Some(map) = map {
         return Ok(strip(map));
     }
-    if let Ok(features) = MapFeatures::read(&options.out) {
+    if let Ok(features) = MapFeatures::read(out) {
         return Ok(strip(&features.map_file));
     }
     let manifest_path = layer.join("vault-mod.toml");
@@ -529,102 +633,119 @@ fn resolve_map(options: &ShotsOptions, layer: &Path) -> Result<String, ConvertEr
         .ok_or_else(|| stage("the layer registers no map; pass --map"))
 }
 
-/// Runs the engine once over a replay log and returns the captured frame.
-#[allow(clippy::too_many_arguments)]
-fn run_engine(
-    options: &ShotsOptions,
-    archives: &(PathBuf, PathBuf),
-    load_order: &Path,
-    map: &str,
-    log: &Path,
-    commands: usize,
-    work: &Path,
-    stem: &str,
-) -> Result<Frame, String> {
-    let frame_path = work.join(format!("{stem}.ppm"));
-    let _ = std::fs::remove_file(&frame_path);
-    let stdout_path = work.join(format!("{stem}.out"));
-    let stderr_path = work.join(format!("{stem}.err"));
-    let file =
-        |path: &Path| std::fs::File::create(path).map_err(|e| format!("{}: {e}", path.display()));
-    let mut child = Command::new(&options.engine)
-        .arg("--replay-inputs")
-        .arg(log)
-        .arg("--replay-frame")
-        .arg(&frame_path)
-        .args(["--game-profile", "fallout2"])
-        .arg("--master-dat")
-        .arg(&archives.0)
-        .arg("--critter-dat")
-        .arg(&archives.1)
-        .arg("--mod-list")
-        .arg(load_order)
-        .arg("--preview-map")
-        .arg(format!("maps/{map}"))
-        .stdin(Stdio::null())
-        .stdout(file(&stdout_path)?)
-        .stderr(file(&stderr_path)?)
-        .spawn()
-        .map_err(|e| format!("{}: {e}", options.engine.display()))?;
-    let started = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() > options.timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "stopped after {} s (see work/{stem}.err)",
-                    options.timeout.as_secs()
-                ));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-            Err(e) => return Err(format!("waiting for the engine: {e}")),
-        }
-    };
-    if !status.success() {
-        return Err(format!(
-            "the engine exited with {status} (see work/{stem}.err)"
-        ));
-    }
-    // The engine's last line says how many commands it replayed.
-    let stdout = std::fs::read_to_string(&stdout_path).unwrap_or_default();
-    let replayed = stdout
-        .lines()
-        .rev()
-        .find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .and_then(|v| v.get("commands").and_then(serde_json::Value::as_u64));
-    if replayed != Some(commands as u64) {
-        return Err(format!(
-            "the engine replayed {replayed:?} of {commands} commands (see work/{stem}.out)"
-        ));
-    }
-    let bytes =
-        std::fs::read(&frame_path).map_err(|e| format!("no frame at work/{stem}.ppm: {e}"))?;
-    decode_ppm(&bytes).map_err(|e| format!("work/{stem}.ppm: {e}"))
+/// What every engine capture of a converted slice needs.
+pub(crate) struct Setup {
+    pub engine: Engine,
+    pub map: String,
+    pub walk_map: WalkMap,
 }
 
-/// Takes the screenshots: see the module documentation.
-pub fn shots(options: &ShotsOptions) -> Result<ShotsSummary, ConvertError> {
-    if !options.engine.is_file() {
-        return Err(stage(format!(
-            "--engine {}: not a file",
-            options.engine.display()
-        )));
+/// Checks the engine, the Fallout 2 archives and the layer, finds the map,
+/// reads it as a walker sees it, and writes `<out>/load_order.toml` (the
+/// same file `scripts/play.sh` writes).
+pub(crate) fn setup(
+    engine: &Path,
+    f2: &Path,
+    out: &Path,
+    map: Option<&str>,
+    timeout: Duration,
+) -> Result<Setup, ConvertError> {
+    if !engine.is_file() {
+        return Err(stage(format!("--engine {}: not a file", engine.display())));
     }
-    let archives = (
-        find_archive(&options.f2, "master.dat")?,
-        find_archive(&options.f2, "critter.dat")?,
-    );
-    let layer = options.out.join("mods").join(crate::map::LAYER_ID);
+    let master_dat = find_archive(f2, "master.dat")?;
+    let critter_dat = find_archive(f2, "critter.dat")?;
+    let layer = out.join("mods").join(crate::map::LAYER_ID);
     if !layer.join("vault-mod.toml").is_file() {
         return Err(stage(format!(
             "no mod layer at {}; run the map stage first",
             layer.display()
         )));
     }
-    let map = resolve_map(options, &layer)?;
+    let map = resolve_map(map, out, &layer)?;
     let walk_map = WalkMap::load(&layer, &map).map_err(stage)?;
+    let load_order = out.join("load_order.toml");
+    std::fs::write(&load_order, "layers = [\"mods/mojave\"]\n").map_err(io(&load_order))?;
+    Ok(Setup {
+        engine: Engine {
+            exe: engine.to_owned(),
+            master_dat,
+            critter_dat,
+            load_order,
+            map: map.clone(),
+            timeout,
+        },
+        map,
+        walk_map,
+    })
+}
+
+/// The zoom a view is captured at.
+pub(crate) fn view_zoom(view: View, wide_zoom: f32) -> f32 {
+    match view {
+        View::Wide => wide_zoom,
+        View::Classic | View::Game => CLASSIC_ZOOM,
+    }
+}
+
+/// The hop length for a walk captured in `framing`: `hop`, shortened so
+/// that every hop fits the inner box of each enhanced view. It does not
+/// depend on `--follow-camera`, so a following capture walks the same hops
+/// as a stationary one.
+pub fn framed_hop(hop: usize, framing: &Framing, wide_zoom: f32) -> usize {
+    framing
+        .views
+        .iter()
+        .filter(|v| v.enhanced())
+        .map(|v| fit_steps(frame_size(*v, view_zoom(*v, wide_zoom)), framing.margin))
+        .fold(hop.max(1), usize::min)
+}
+
+/// Engine jobs, one per distinct log.
+#[derive(Default)]
+struct Jobs {
+    jobs: Vec<EngineJob>,
+    by_log: BTreeMap<String, usize>,
+}
+
+impl Jobs {
+    /// The job running `log`; a log already queued is run once.
+    fn want(&mut self, stem: String, log: String) -> usize {
+        if let Some(i) = self.by_log.get(&log) {
+            return *i;
+        }
+        self.jobs.push(EngineJob {
+            stem,
+            log: log.clone(),
+        });
+        self.by_log.insert(log, self.jobs.len() - 1);
+        self.jobs.len() - 1
+    }
+}
+
+/// One captured view of a viewpoint.
+struct Capture {
+    viewpoint: usize,
+    view: View,
+    camera: CameraKind,
+    plan: Option<CameraPlan>,
+    full: usize,
+    check: Option<usize>,
+}
+
+/// Takes the screenshots: see the module documentation.
+pub fn shots(options: &ShotsOptions) -> Result<ShotsSummary, ConvertError> {
+    let Setup {
+        engine,
+        map,
+        walk_map,
+    } = setup(
+        &options.engine,
+        &options.f2,
+        &options.out,
+        options.map.as_deref(),
+        options.timeout,
+    )?;
     let read = match MapFeatures::read(&options.out) {
         Ok(f) if f.map_file.trim_start_matches("maps/") == map => Some(f),
         Ok(_) => None,
@@ -663,6 +784,17 @@ pub fn shots(options: &ShotsOptions) -> Result<ShotsSummary, ConvertError> {
             "--wide-zoom {wide_zoom}: expected a positive number"
         )));
     }
+    let mut framing = options.framing.clone();
+    if framing.views.is_empty() {
+        framing.views = Framing::default().views;
+    }
+    let hop = framed_hop(options.hop, &framing, wide_zoom);
+    if hop < options.hop {
+        eprintln!(
+            "shots: hops of {hop} steps (not {}) so that each fits an enhanced frame",
+            options.hop
+        );
+    }
     for (n, v) in viewpoints.iter().enumerate() {
         eprintln!(
             "shots: viewpoint {n:02} {}: hex {} (asked {}), {} steps",
@@ -673,180 +805,188 @@ pub fn shots(options: &ShotsOptions) -> Result<ShotsSummary, ConvertError> {
         );
     }
 
-    let dir = options.out.join("shots");
+    let dir = options
+        .dest
+        .clone()
+        .unwrap_or_else(|| options.out.join("shots"));
     let work = dir.join("work");
     std::fs::create_dir_all(&work).map_err(io(&work))?;
-    // The same file `scripts/play.sh` writes: the layer, relative to it.
-    let load_order = options.out.join("load_order.toml");
-    std::fs::write(&load_order, "layers = [\"mods/mojave\"]\n").map_err(io(&load_order))?;
     let map_stem = map.trim_end_matches(".map").to_owned();
     let exits: Vec<i32> = walk_map.exits.iter().map(|e| e.hex).collect();
 
-    let mut jobs: Vec<Job> = Vec::new();
+    let mut jobs = Jobs::default();
+    let mut captures: Vec<Capture> = Vec::new();
+    let mut probes: Vec<(usize, Option<usize>)> = Vec::new();
+    let mut all_hops: Vec<Vec<Hop>> = Vec::new();
     for (n, viewpoint) in viewpoints.iter().enumerate() {
-        let all_hops = hops(&viewpoint.route, options.hop, &exits);
-        let mut runs = vec![Run::View(View::Game), Run::View(View::Wide)];
-        if !all_hops.is_empty() {
-            runs.extend([Run::Check(View::Game), Run::Check(View::Wide)]);
-        }
-        for run in runs {
-            let (view, hop_list) = match run {
-                Run::View(view) => (view, &all_hops[..]),
-                Run::Check(view) => (view, &all_hops[..all_hops.len() - 1]),
-            };
-            jobs.push(Job {
+        let hops = route_hops(&viewpoint.route, hop, &exits, hop_ticks);
+        let cut = &hops[..hops.len().saturating_sub(1)];
+        for &view in &framing.views {
+            let zoom = view_zoom(view, wide_zoom);
+            let camera = framing.camera(view);
+            let log_options = LogOptions::shots(view, zoom);
+            let plan = (camera == CameraKind::Stationary).then(|| {
+                plan_camera(
+                    walk_map.entry,
+                    &hops,
+                    frame_size(view, zoom),
+                    framing.margin,
+                )
+            });
+            let full = jobs.want(
+                format!("{map_stem}-{n:02}-{}", view.name()),
+                build_log(&log_options, &hops, plan.as_ref()).text(),
+            );
+            let check = (camera != CameraKind::Stationary && !hops.is_empty()).then(|| {
+                jobs.want(
+                    format!("{map_stem}-{n:02}-{}-check", view.name()),
+                    build_log(&log_options, cut, None).text(),
+                )
+            });
+            captures.push(Capture {
                 viewpoint: n,
-                run,
-                log: replay_log(view, hop_list, wide_zoom),
-                stem: format!("{map_stem}-{n:02}-{}", run.name()),
+                view,
+                camera,
+                plan,
+                full,
+                check,
             });
         }
+        // The arrival check: the wide view, following.
+        let probe = LogOptions::shots(View::Wide, wide_zoom);
+        let full = jobs.want(
+            format!("{map_stem}-{n:02}-probe"),
+            build_log(&probe, &hops, None).text(),
+        );
+        let check = (!hops.is_empty()).then(|| {
+            jobs.want(
+                format!("{map_stem}-{n:02}-probe-check"),
+                build_log(&probe, cut, None).text(),
+            )
+        });
+        probes.push((full, check));
+        all_hops.push(hops);
     }
+    let results = run_jobs(&engine, &jobs.jobs, &work, options.jobs, false, "shots");
+    let frame = |i: usize| results[i].as_ref();
 
-    let queue: Mutex<VecDeque<usize>> = Mutex::new((0..jobs.len()).collect());
-    let results: Vec<Mutex<Option<Result<Frame, String>>>> =
-        jobs.iter().map(|_| Mutex::new(None)).collect();
-    let mut log_error: Option<ConvertError> = None;
-    for job in &jobs {
-        let path = work.join(format!("{}.jsonl", job.stem));
-        if let Err(e) = std::fs::write(&path, &job.log) {
-            log_error = Some(ConvertError::Io { path, source: e });
-            break;
-        }
-    }
-    if let Some(error) = log_error {
-        return Err(error);
-    }
-    std::thread::scope(|scope| {
-        for _ in 0..options.jobs.clamp(1, 8) {
-            scope.spawn(|| {
-                loop {
-                    let next = queue.lock().ok().and_then(|mut q| q.pop_front());
-                    let Some(i) = next else { break };
-                    let job = &jobs[i];
-                    let started = Instant::now();
-                    let result = run_engine(
-                        options,
-                        &archives,
-                        &load_order,
-                        &map,
-                        &work.join(format!("{}.jsonl", job.stem)),
-                        job.log.lines().count(),
-                        &work,
-                        &job.stem,
-                    );
-                    eprintln!(
-                        "shots: {} {} in {:.1} s",
-                        job.stem,
-                        if result.is_ok() { "captured" } else { "FAILED" },
-                        started.elapsed().as_secs_f64()
-                    );
-                    if let Ok(mut slot) = results[i].lock() {
-                        *slot = Some(result);
-                    }
+    // Arrival, per viewpoint.
+    let arrival: Vec<(bool, bool, Option<String>)> = viewpoints
+        .iter()
+        .zip(&probes)
+        .map(|(viewpoint, &(full, check))| {
+            if viewpoint.route.steps() == 0 {
+                // Standing still, the player is where it was asked to be.
+                return (false, true, None);
+            }
+            let check_frame = check.map(frame);
+            let error = check_frame
+                .and_then(|c| c.err())
+                .map(|e| format!("arrival check: {e}"));
+            match (frame(full), check_frame, frame(probes[0].0)) {
+                (Ok(full), Some(Ok(check)), Ok(first)) => {
+                    let moved = changed_fraction(full, first) > MOVED_FRACTION;
+                    let arrived = moved && changed_fraction(full, check) > MOVED_FRACTION;
+                    (moved, arrived, error)
                 }
-            });
-        }
-    });
-    let mut frames: Vec<Option<Result<Frame, String>>> = results
-        .into_iter()
-        .map(|m| m.into_inner().ok().flatten())
+                (Err(e), ..) => (false, false, Some(format!("arrival check: {e}"))),
+                _ => (false, false, error),
+            }
+        })
         .collect();
-    let mut take = |viewpoint: usize, run: Run| -> Result<Frame, String> {
-        jobs.iter()
-            .position(|j| j.viewpoint == viewpoint && j.run == run)
-            .and_then(|i| frames[i].take())
-            .unwrap_or_else(|| Err("not run".to_owned()))
-    };
 
     let mut shots = Vec::new();
-    let mut entry: [Option<Frame>; 2] = [None, None];
-    for (n, viewpoint) in viewpoints.iter().enumerate() {
+    for capture in &captures {
+        let n = capture.viewpoint;
+        let viewpoint = &viewpoints[n];
+        let (moved, arrived, check_error) = arrival[n].clone();
         let still = viewpoint.route.steps() == 0;
-        let frames = View::ALL.map(|view| take(n, Run::View(view)));
-        let checks = View::ALL.map(|view| (!still).then(|| take(n, Run::Check(view))));
-        if n == 0 {
-            entry = std::array::from_fn(|v| frames[v].as_ref().ok().cloned());
-        }
-        // Per view: changed from the entry, changed by the last hop.
-        let changes: [Option<(f64, f64)>; 2] =
-            std::array::from_fn(|v| match (&frames[v], &checks[v], &entry[v]) {
-                (Ok(frame), Some(Ok(check)), Some(first)) => Some((
-                    changed_fraction(frame, first),
-                    changed_fraction(frame, check),
-                )),
-                _ => None,
-            });
-        let wide = View::ALL.iter().position(|v| *v == View::Wide).unwrap_or(1);
-        let (moved, arrived) = match changes[wide] {
-            // Standing still, the player is where it was asked to be.
-            _ if still => (false, true),
-            Some((from_entry, by_last)) => {
-                let moved = from_entry > MOVED_FRACTION;
-                (moved, moved && by_last > MOVED_FRACTION)
-            }
-            None => (false, false),
-        };
-        let check_error: Vec<String> = checks
+        let entry = captures
             .iter()
-            .flatten()
-            .filter_map(|c| c.as_ref().err())
-            .map(|e| format!("arrival check: {e}"))
-            .collect();
-        for (v, (view, frame)) in View::ALL.into_iter().zip(frames).enumerate() {
-            let (from_entry, by_last) = changes[v].unwrap_or((0.0, 0.0));
-            let mut shot = Shot {
-                viewpoint: n,
-                label: viewpoint.label.clone(),
-                requested_hex: viewpoint.route.requested,
-                hex: viewpoint.route.destination,
-                steps: viewpoint.route.steps(),
-                hops: hops(&viewpoint.route, options.hop, &exits).len(),
-                view: view.name(),
-                file: String::new(),
-                width: 0,
-                height: 0,
-                moved,
-                arrived,
-                camera_followed: still || by_last > MOVED_FRACTION,
-                changed_from_entry: (from_entry * 1e4).round() / 1e4,
-                changed_by_last_hop: (by_last * 1e4).round() / 1e4,
-                error: (!check_error.is_empty()).then(|| check_error.join("; ")),
-            };
-            match frame {
-                Ok(frame) => {
-                    let name = format!("{map_stem}-{n:02}-{}.png", view.name());
-                    let path = dir.join(&name);
-                    let png =
-                        foundry_gallery::encode_png(&frame.to_rgba(), frame.width, frame.height)
-                            .map_err(stage)?;
-                    std::fs::write(&path, png).map_err(io(&path))?;
-                    shot.file = name;
-                    shot.width = frame.width;
-                    shot.height = frame.height;
-                }
-                Err(e) => shot.error = Some(e),
+            .find(|c| c.viewpoint == 0 && c.view == capture.view)
+            .map(|c| frame(c.full));
+        let (from_entry, by_last) = match (frame(capture.full), entry) {
+            (Ok(f), Some(Ok(first))) => (
+                changed_fraction(f, first),
+                capture
+                    .check
+                    .and_then(|c| frame(c).ok())
+                    .map(|check| changed_fraction(f, check)),
+            ),
+            _ => (0.0, None),
+        };
+        let round = |x: f64| (x * 1e4).round() / 1e4;
+        let mut shot = Shot {
+            viewpoint: n,
+            label: viewpoint.label.clone(),
+            requested_hex: viewpoint.route.requested,
+            hex: viewpoint.route.destination,
+            steps: viewpoint.route.steps(),
+            hops: all_hops[n].len(),
+            view: capture.view.name(),
+            view_kind: capture.view.kind(),
+            surface: capture.view.surface(),
+            zoom: view_zoom(capture.view, wide_zoom),
+            stationary: capture.camera == CameraKind::Stationary,
+            camera: capture.camera.label(),
+            camera_centre_hex: capture.plan.as_ref().and_then(|p| p.centre_hex),
+            recentres: capture
+                .plan
+                .as_ref()
+                .map(|p| p.recentres.clone())
+                .unwrap_or_default(),
+            file: String::new(),
+            width: 0,
+            height: 0,
+            moved,
+            arrived,
+            camera_followed: capture.camera != CameraKind::Stationary
+                && (still || by_last.is_some_and(|b| b > MOVED_FRACTION)),
+            changed_from_entry: round(from_entry),
+            changed_by_last_hop: by_last.map(round),
+            error: check_error,
+        };
+        match frame(capture.full) {
+            Ok(frame) => {
+                let name = format!("{map_stem}-{n:02}-{}.png", capture.view.name());
+                let path = dir.join(&name);
+                let png = foundry_gallery::encode_png(&frame.to_rgba(), frame.width, frame.height)
+                    .map_err(stage)?;
+                std::fs::write(&path, png).map_err(io(&path))?;
+                shot.file = name;
+                shot.width = frame.width;
+                shot.height = frame.height;
             }
-            shots.push(shot);
+            Err(e) => shot.error = Some(e.clone()),
         }
+        shots.push(shot);
     }
 
     let index = Index {
         map: &map,
         entry_hex: walk_map.entry,
+        hop,
         arrival_check: format!(
-            "frame comparison on the wide view, whose camera follows the player to the map's \
-             edges: moved when it differs from the entry's in more than {:.0} % of the pixels, \
-             arrived when it also differs that much from the same walk without its last hop; \
-             the engine reports no player position",
+            "frame comparison on a following wide view run for the check, whose camera follows \
+             the player to the map's edges: moved when it differs from the entry's in more than \
+             {:.0} % of the pixels, arrived when it also differs that much from the same walk \
+             without its last hop; the engine reports no player position",
             MOVED_FRACTION * 100.0
+        ),
+        camera: format!(
+            "stationary: the enhanced camera is frozen after the settle ticks by a middle-button \
+             drag and the pointer leaves the window; it is framed on the walk and re-centred \
+             (Home, a tick, another drag) only before a hop that would leave the inner box \
+             ({:.0} % margin); the game view is the engine-following view, re-centred on the \
+             player at every step, and cannot be held still",
+            framing.margin * 100.0
         ),
         shots: &shots,
     };
     let index_path = dir.join("index.json");
     let json = serde_json::to_string_pretty(&index).map_err(stage)?;
     std::fs::write(&index_path, json + "\n").map_err(io(&index_path))?;
-    contact(&dir, &map, &shots)?;
+    contact(&dir, &map, &shots, framing.views.len() as u32)?;
     Ok(ShotsSummary {
         map,
         viewpoints: viewpoints.len(),
@@ -903,9 +1043,9 @@ pub fn contact_page(
     Ok(())
 }
 
-/// `contact.png`: every shot, the game view beside the wide view, with
-/// its viewpoint, hex and arrival.
-fn contact(dir: &Path, map: &str, shots: &[Shot]) -> Result<(), ConvertError> {
+/// `contact.png`: every shot, the views of a viewpoint side by side, with
+/// its viewpoint, hex, arrival and camera.
+fn contact(dir: &Path, map: &str, shots: &[Shot], columns: u32) -> Result<(), ConvertError> {
     struct Entry {
         label: String,
         metrics: Vec<(String, String)>,
@@ -916,17 +1056,22 @@ fn contact(dir: &Path, map: &str, shots: &[Shot]) -> Result<(), ConvertError> {
         let path = dir.join(&shot.file);
         let bytes = std::fs::read(&path).map_err(io(&path))?;
         let image = foundry_gallery::decode_png(&bytes).map_err(stage)?;
-        let mut metrics = vec![
+        let mut camera = shot.camera.to_owned();
+        if !shot.recentres.is_empty() {
+            camera.push_str(&format!(", {} re-centres", shot.recentres.len()));
+        }
+        if !shot.stationary && !shot.camera_followed {
+            camera.push_str(", did not follow the player");
+        }
+        let metrics = vec![
             ("hex".to_owned(), shot.hex.to_string()),
             ("steps".to_owned(), shot.steps.to_string()),
             (
                 "arrived".to_owned(),
                 if shot.arrived { "yes" } else { "no" }.to_owned(),
             ),
+            ("camera".to_owned(), camera),
         ];
-        if !shot.camera_followed {
-            metrics.push(("camera".to_owned(), "did not follow the player".to_owned()));
-        }
         entries.push(Entry {
             label: format!("{:02} {} {}", shot.viewpoint, shot.view, shot.label),
             metrics,
@@ -948,7 +1093,7 @@ fn contact(dir: &Path, map: &str, shots: &[Shot]) -> Result<(), ConvertError> {
         })
         .collect();
     let options = SheetOptions {
-        columns: Columns::Fixed(2),
+        columns: Columns::Fixed(columns.clamp(1, 3)),
         max_cell: [960, 540],
         anchor: Anchor::Centre,
         background: Background::Solid([0, 0, 0, 255]),
@@ -964,6 +1109,7 @@ fn contact(dir: &Path, map: &str, shots: &[Shot]) -> Result<(), ConvertError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::replay::{FINAL_TICKS, SETTLE_TICKS};
 
     fn parse(log: &str) -> Vec<serde_json::Value> {
         log.lines()

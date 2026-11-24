@@ -10,6 +10,8 @@ use quantize::{Dither, PaletteMap};
 use sha2::{Digest, Sha256};
 
 use crate::classify::{Footprint, MeshFacts};
+use crate::cutaway;
+use crate::declutter::{self, DecalMode, Decision};
 use crate::floor;
 use crate::hex::{self, Plane};
 use crate::interior::{self, Split};
@@ -17,7 +19,8 @@ use crate::landmark;
 use crate::overlay::{self, GroundPiece};
 use crate::render::{self, Assets, CanvasError, MirAssets};
 use crate::report::{
-    BudgetReport, Contributor, InteriorStats, LadderKind, LadderStep, LandmarkFallback, Spread,
+    BudgetReport, Contributor, CutawayStats, InteriorStats, LadderKind, LadderStep,
+    LandmarkFallback, Spread,
 };
 use crate::strips;
 use crate::{
@@ -76,6 +79,9 @@ pub(crate) struct RenderKey {
     /// Interior mode, for a render that is split and cut: the origin's
     /// height above the floor, rounded to a unit. `None` otherwise.
     lift: Option<i64>,
+    /// Declutter, interior mode: a lower ceiling cut for a room shell,
+    /// above the floor, rounded to a unit. `None`: the interior's own.
+    cut: Option<i64>,
 }
 
 impl RenderKey {
@@ -93,6 +99,20 @@ impl RenderKey {
         self.lift.map(|v| v as f32)
     }
 
+    /// The key of a render cut at `cut` above the floor instead of the
+    /// interior's own height (`None` keeps that).
+    pub(crate) fn with_cut(self, cut: Option<f32>) -> Self {
+        RenderKey {
+            cut: cut.map(|c| f64::from(c).round() as i64),
+            ..self
+        }
+    }
+
+    /// The rounded shell cut of a split render.
+    pub(crate) fn cut(&self) -> Option<f32> {
+        self.cut.map(|v| v as f32)
+    }
+
     pub(crate) fn of(reference: &Reference, config: &SlicerConfig) -> Option<Self> {
         let q = |v: f32, step: f32| (f64::from(v) / f64::from(step)).round() as i64;
         Some(RenderKey {
@@ -103,6 +123,7 @@ impl RenderKey {
                 .map(|a| q(a, config.rotation_quantum)),
             scale: q(reference.transform.scale, config.scale_quantum),
             lift: None,
+            cut: None,
         })
     }
 
@@ -125,6 +146,51 @@ struct Prepared<'r> {
     refs: Vec<&'r Reference>,
     classes: Vec<Class>,
     meshes: BTreeMap<String, MeshSlot>,
+    /// The classes before the declutter pass (the baseline's).
+    plain: Vec<Class>,
+    /// The declutter pass's decisions, when it is on.
+    decision: Option<Decision>,
+}
+
+impl Prepared<'_> {
+    /// Whether the declutter pass protects reference `i`.
+    fn protected(&self, i: usize) -> bool {
+        self.decision.as_ref().is_some_and(|d| d.protected[i])
+    }
+
+    /// Runs the declutter pass's classification rules (the `declutter`
+    /// module) when `config` turns it on.
+    fn declutter(
+        &mut self,
+        plane: &Plane,
+        projection: &Projection,
+        window: &MapWindow,
+        config: &SlicerConfig,
+    ) {
+        let Some(profile) = &config.declutter else {
+            return;
+        };
+        let meshes = &self.meshes;
+        let facts = |r: &Reference| {
+            r.mesh
+                .as_ref()
+                .and_then(|h| meshes.get(h))
+                .and_then(|m| m.as_ref().ok())
+                .map(|(_, f)| *f)
+        };
+        let decision = declutter::decide(
+            &self.refs,
+            &mut self.classes,
+            &facts,
+            projection.tile_units(),
+            plane,
+            projection,
+            window,
+            config,
+            profile,
+        );
+        self.decision = Some(decision);
+    }
 }
 
 fn prepare<'r>(
@@ -179,8 +245,10 @@ fn prepare<'r>(
     }
     Prepared {
         refs,
+        plain: classes.clone(),
         classes,
         meshes,
+        decision: None,
     }
 }
 
@@ -379,7 +447,8 @@ pub fn slice_with(
     let plane =
         Plane::new(projection, window.x_west, window.y_north).ok_or(SliceError::Projection)?;
     let tile_units = projection.tile_units();
-    let prepared = prepare(assets, references, tile_units, config);
+    let mut prepared = prepare(assets, references, tile_units, config);
+    prepared.declutter(&plane, projection, window, config);
     let inputs = Inputs {
         assets,
         window,
@@ -390,13 +459,59 @@ pub fn slice_with(
         plane: &plane,
     };
     let first = run_once(&inputs, renderer, &prepared, &prepared.classes, config)?;
-    let done = if first.sliced.report.fits() || !config.ladder.enabled {
+    let mut done = if first.sliced.report.fits() || !config.ladder.enabled {
         first
     } else {
         climb(&inputs, renderer, &prepared, config, first)?
     };
+    if let Some(profile) = &config.declutter {
+        measure(&inputs, renderer, &prepared, config, profile, &mut done)?;
+    }
     done.sliced.report.check()?;
     Ok(done.sliced)
+}
+
+/// The declutter pass's floor metrics: this run's, and with
+/// `measure_baseline` the same window's without the pass (its classes
+/// before the pass, no ladder).
+fn measure(
+    inputs: &Inputs<'_>,
+    renderer: &mut dyn Renderer,
+    prepared: &Prepared<'_>,
+    config: &SlicerConfig,
+    profile: &declutter::DeclutterProfile,
+    done: &mut Run,
+) -> Result<(), SliceError> {
+    let walkers = profile.walkers_of(config);
+    let mut floor = walkers.clone();
+    if let Some(i) = &done.sliced.report.interior {
+        floor.extend(i.floor_hexes.iter().copied());
+    }
+    let stats = |sliced: &Sliced| {
+        declutter::floor_stats(
+            sliced,
+            &walkers,
+            &floor,
+            config.walker_box,
+            profile.cover_min_pixels,
+        )
+    };
+    let after = stats(&done.sliced);
+    let before = if profile.measure_baseline {
+        let plain = SlicerConfig {
+            declutter: None,
+            ..config.clone()
+        };
+        let baseline = run_once(inputs, renderer, prepared, &prepared.plain, &plain)?;
+        Some(stats(&baseline.sliced))
+    } else {
+        None
+    };
+    if let Some(d) = &mut done.sliced.report.declutter {
+        d.floor_after = Some(after);
+        d.floor_before = before;
+    }
+    Ok(())
 }
 
 /// What every run of one window shares.
@@ -619,8 +734,10 @@ fn climb(
                     if picked.iter().any(|(m, _)| *m == c.model) {
                         continue;
                     }
+                    // Protected references (the declutter pass) stay.
                     let members: Vec<usize> = (0..classes.len())
                         .filter(|&i| demotable(&classes[i]) && models[i] == c.model)
+                        .filter(|&i| !prepared.protected(i))
                         .collect();
                     if members.is_empty() {
                         continue;
@@ -688,6 +805,21 @@ fn run_once(
     };
     let floor_z = interior.map(|i| i.floor_z);
     let mut indoor = interior.map(InteriorStats::new);
+    // The declutter pass (the `declutter` module), when it is on.
+    let decision = config.declutter.as_ref().zip(prepared.decision.as_ref());
+    let walkers = decision.map(|(profile, _)| profile.walkers_of(config));
+    let cutaway = decision.and_then(|(profile, _)| {
+        profile.cutaway.as_ref().filter(|c| {
+            if interior.is_some() {
+                c.interiors
+            } else {
+                c.exteriors
+            }
+        })
+    });
+    let mut cut_stats = CutawayStats::default();
+    let mut covered = (BTreeSet::new(), BTreeSet::new());
+    let mut outlined = 0usize;
     // Floor meshes split off renders, and (floor mesh, reference) to bake.
     let mut floor_meshes: Vec<StaticMesh> = Vec::new();
     let mut floor_bake: Vec<(usize, usize)> = Vec::new();
@@ -718,9 +850,9 @@ fn run_once(
             Class::Sprite(_) | Class::Sliced | Class::Landmark => match RenderKey::of(r, config) {
                 Some(key) => {
                     let key = match interior {
-                        Some(indoors) if splits(class) => {
-                            key.lifted(r.transform.position[2] - indoors.floor_z)
-                        }
+                        Some(indoors) if splits(class) => key
+                            .lifted(r.transform.position[2] - indoors.floor_z)
+                            .with_cut(decision.and_then(|(_, d)| d.cuts[i])),
                         _ => key,
                     };
                     groups.entry(key).or_default().push(i)
@@ -754,12 +886,13 @@ fn run_once(
         // Indoors: the floor leaves for the bake, the rest is cut at the
         // ceiling, and only that is rendered upright.
         let mut split = match (key.lift(), interior) {
-            (Some(lift), Some(indoors)) => Some(interior::split(
+            (Some(lift), Some(indoors)) => Some(interior::split_at(
                 mesh,
                 &key.matrix(config),
                 lift,
                 indoors,
                 config.floor_min_up,
+                key.cut().unwrap_or(indoors.cut_height),
             )),
             _ => None,
         };
@@ -831,7 +964,7 @@ fn run_once(
                 }
             }
         };
-        let canvas = match render::render_canonical(
+        let mut canvas = match render::render_canonical(
             renderer,
             projection,
             mesh,
@@ -876,6 +1009,9 @@ fn run_once(
                 continue;
             }
         };
+        if let Some((profile, _)) = decision {
+            profile.tones.props.apply(&mut canvas.rgba);
+        }
         if !(0..canvas.width as usize * canvas.height as usize).any(|i| canvas.opaque(i)) {
             if floor_index.is_some() {
                 floor_only(&mut skipped, &mut report, &mut indoor, &mut floor_bake);
@@ -911,6 +1047,7 @@ fn run_once(
         };
         report.class_mut(first_kind).renders += 1;
         let mut sprite_frame: Option<Result<PlacedFrame, String>> = None;
+        let mut outlined_frame: Option<Result<PlacedFrame, String>> = None;
 
         for &i in members {
             let r = prepared.refs[i];
@@ -930,10 +1067,29 @@ fn run_once(
                         demote(&mut report, class.kind());
                         continue;
                     };
-                    let frame = sprite_frame.get_or_insert_with(|| {
-                        emit::placed_frame(&indexed, canvas.width, canvas.height, canvas.origin)
-                            .map_err(|e| e.to_string())
-                    });
+                    let rim = decision
+                        .filter(|(_, d)| d.outlined[i])
+                        .and_then(|(profile, _)| profile.outline);
+                    let frame = match rim {
+                        None => sprite_frame.get_or_insert_with(|| {
+                            emit::placed_frame(&indexed, canvas.width, canvas.height, canvas.origin)
+                                .map_err(|e| e.to_string())
+                        }),
+                        Some(rim) => outlined_frame.get_or_insert_with(|| {
+                            let rimmed =
+                                quantize::rim(&indexed, canvas.width, canvas.height, map, &rim)
+                                    .map_err(|e| e.to_string())?;
+                            let origin = [
+                                canvas.origin[0] + rimmed.offset[0],
+                                canvas.origin[1] + rimmed.offset[1],
+                            ];
+                            emit::placed_frame(&rimmed.pixels, rimmed.width, rimmed.height, origin)
+                                .map_err(|e| e.to_string())
+                        }),
+                    };
+                    if rim.is_some() && frame.is_ok() {
+                        outlined += 1;
+                    }
                     let frame = match frame {
                         Ok(frame) => frame,
                         Err(e) => {
@@ -1054,12 +1210,15 @@ fn run_once(
                     placed(i, &mut indoor, &mut floor_bake);
                 }
                 Class::Sliced => {
-                    let polygon: Vec<[f64; 2]> = prepared
+                    let footprint = prepared
                         .meshes
                         .get(&key.mesh)
                         .and_then(|m| m.as_ref().ok())
                         .and_then(|(_, facts)| facts.bounds)
-                        .map(|b| Footprint::of(&r.transform, b).polygon)
+                        .map(|b| Footprint::of(&r.transform, b));
+                    let polygon: Vec<[f64; 2]> = footprint
+                        .as_ref()
+                        .map(|f| f.polygon.as_slice())
                         .unwrap_or_default()
                         .iter()
                         .map(|p| plane.tile_of_source(*p))
@@ -1112,13 +1271,60 @@ fn run_once(
                         max_perimeter_run: config.max_perimeter_run,
                         blocks: &blocks,
                     };
-                    let cut = match strips::cut(
-                        strip_canvas,
-                        strip_indexed,
-                        ground,
-                        projection,
-                        &options,
-                    ) {
+                    // The foreground cutaway crops the strips of walls that
+                    // hide walkers (the `cutaway` module).
+                    let trim = match (cutaway, &walkers) {
+                        (Some(settings), Some(walkers))
+                            if decision.is_some_and(|(_, d)| d.cutaway[i]) =>
+                        {
+                            Some(cutaway::Trim {
+                                settings,
+                                walkers,
+                                walker_box: config.walker_box.map(i64::from),
+                                offset,
+                                // The kerb stands on the wall's own foot
+                                // (a raised ring, a sunken pit), never
+                                // below the floor band or the terrain.
+                                lift: r.transform.position[2]
+                                    - footprint.as_ref().map_or(ground_z, |f| {
+                                        f.z[0].max(match interior {
+                                            Some(indoors) => ground_z + indoors.floor_band[0],
+                                            None => ground_z,
+                                        })
+                                    }),
+                            })
+                        }
+                        _ => None,
+                    };
+                    let mut trimmed = None;
+                    let cut = match &trim {
+                        None => {
+                            strips::cut(strip_canvas, strip_indexed, ground, projection, &options)
+                        }
+                        Some(t) => strips::cut_with(
+                            strip_canvas,
+                            strip_indexed,
+                            ground,
+                            projection,
+                            &options,
+                            &mut |owner| {
+                                trimmed =
+                                    Some(cutaway::trim(strip_canvas, owner, ground, projection, t));
+                            },
+                        ),
+                    };
+                    let emptied = trimmed.as_ref().is_some_and(|t| !t.emptied.is_empty());
+                    if let Some(t) = trimmed {
+                        cut_stats.strips_considered += t.considered;
+                        cut_stats.strips_cut += t.cut;
+                        cut_stats.pixels_removed += t.pixels_removed;
+                        cut_stats.strips_emptied += t.emptied.len();
+                        covered.0.extend(t.covered_before);
+                        covered.1.extend(t.covered_after);
+                        // A strip cut to nothing still blocks its hex.
+                        blocked.extend(t.emptied.into_iter().filter(|&h| blocks(h)));
+                    }
+                    let cut = match cut {
                         Ok(cut) => cut,
                         Err(e) => {
                             skip(&mut skipped, r, SkipReason::Failed(e));
@@ -1127,7 +1333,7 @@ fn run_once(
                         }
                     };
                     report.strips.dropped_pixels += cut.dropped;
-                    if cut.strips.is_empty() && floor_pieces.is_empty() {
+                    if cut.strips.is_empty() && floor_pieces.is_empty() && !emptied {
                         if floor_index.is_some() {
                             // Indoors, its walls are off the map but its
                             // floor may not be.
@@ -1222,12 +1428,14 @@ fn run_once(
                 return true;
             };
             let lift = r.transform.position[2] - indoors.floor_z;
-            let s = interior::split(
+            let cut = decision.and_then(|(_, d)| d.cuts[i]);
+            let s = interior::split_at(
                 mesh,
                 &key.matrix(config),
                 lift,
                 indoors,
                 config.floor_min_up,
+                cut.unwrap_or(indoors.cut_height),
             );
             if let Some(t) = &mut indoor {
                 t.cut_triangles += s.cut_triangles;
@@ -1287,9 +1495,36 @@ fn run_once(
         t.floor_references = floor_bake.len();
         t.floor_overlays = baked.len();
         t.floor_hexes = hexes.into_iter().collect();
+        let mut baked = baked;
+        if let Some((profile, _)) = decision {
+            for o in &mut baked {
+                profile.tones.floor.apply(&mut o.rgba);
+            }
+        }
         overlays.extend(baked);
     }
-    for (members, flatten) in [(&flat, true), (&relief, false)] {
+    // Declutter: faded decals bake on their own, after the other flat
+    // meshes, with their alpha scaled.
+    let mut faded = Vec::new();
+    if let Some((profile, d)) = decision
+        && let DecalMode::Fade(_) = profile.decals
+    {
+        flat.retain(|&i| {
+            if d.faded[i] {
+                faded.push(i);
+            }
+            !d.faded[i]
+        });
+    }
+    let fade = match decision.map(|(profile, _)| profile.decals) {
+        Some(DecalMode::Fade(alpha)) => alpha,
+        _ => 1.0,
+    };
+    let mut bakes = vec![(&flat, true, false), (&relief, false, false)];
+    if !faded.is_empty() {
+        bakes.insert(1, (&faded, true, true));
+    }
+    for (members, flatten, fading) in bakes {
         let mut pieces = Vec::new();
         for &i in members {
             let r = prepared.refs[i];
@@ -1339,14 +1574,30 @@ fn run_once(
             };
             report.class_mut(kind).renders += 1;
         }
-        overlays.extend(overlay::bake(
+        let mut baked = overlay::bake(
             renderer,
             projection,
             anchor,
             &pieces,
             textures,
             config.render_tile,
-        )?);
+        )?;
+        if let Some((profile, _)) = decision {
+            let tone = if flatten {
+                &profile.tones.floor
+            } else {
+                &profile.tones.props
+            };
+            for o in &mut baked {
+                tone.apply(&mut o.rgba);
+                if fading {
+                    for px in o.rgba.as_chunks_mut::<4>().0 {
+                        px[3] = (f32::from(px[3]) * fade + 0.5) as u8;
+                    }
+                }
+            }
+        }
+        overlays.extend(baked);
     }
 
     // Accounting.
@@ -1363,6 +1614,14 @@ fn run_once(
         t.count_skips(&report.skips);
     }
     report.interior = indoor;
+    if let Some((_, d)) = decision {
+        let mut stats = d.stats.clone();
+        cut_stats.walkers_covered_before = covered.0.len();
+        cut_stats.walkers_covered_after = covered.1.len();
+        stats.cutaway = cut_stats;
+        stats.outlined = outlined;
+        report.declutter = Some(stats);
+    }
     report.overlays = overlays.len();
     report.blocked_hexes = blocked.len();
     let contributors = store.contributors();
@@ -1402,7 +1661,8 @@ pub fn estimate_with(
     let plane =
         Plane::new(projection, window.x_west, window.y_north).ok_or(SliceError::Projection)?;
     let tile_units = projection.tile_units();
-    let prepared = prepare(assets, references, tile_units, config);
+    let mut prepared = prepare(assets, references, tile_units, config);
+    prepared.declutter(&plane, projection, window, config);
     let mut report = BudgetReport::new(true, budget);
     let mut sprite_keys: BTreeSet<(ArtCategory, RenderKey)> = BTreeSet::new();
     let mut renders: BTreeMap<ClassKind, BTreeSet<RenderKey>> = BTreeMap::new();
@@ -1512,6 +1772,7 @@ pub fn estimate_with(
         stats.count_skips(&report.skips);
         stats
     });
+    report.declutter = prepared.decision.map(|d| d.stats);
     Ok(report)
 }
 

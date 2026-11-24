@@ -99,7 +99,12 @@ impl Topic {
 
 typed_record!(Topic, DIAL);
 
-/// An `INFO`'s `DATA`: 4 bytes, or 2 in the older form.
+/// An `INFO`'s `DATA`: 4 bytes, or 3 or 2 in the older forms.
+///
+/// Measured on the Fallout 3 master: 634 infos have the 3-byte form (one
+/// flag byte), the rest the 4-byte one. The 3-byte form's flag byte is the
+/// low byte of `flags` here, its high byte zero; encoding always writes the
+/// 4-byte form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct InfoData {
     /// The dialogue type, as stored (same codes as
@@ -112,7 +117,12 @@ pub struct InfoData {
     pub flags: Option<u16>,
 }
 
-/// A response's `TRDT` (24 bytes).
+/// A response's `TRDT`: 24 bytes, or 20 or 16 in the older forms.
+///
+/// Measured on the Fallout 3 master: 2,230 responses have the 16-byte form
+/// (no sound, no flags) and 1,589 the 20-byte form (no flags), besides the
+/// 24-byte one. The fields a short form lacks read as a null sound and
+/// zero flags; encoding always writes the 24-byte form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ResponseData {
     /// The emotion type, as stored: 0 neutral, 1 anger, 2 disgust, 3 fear,
@@ -372,29 +382,45 @@ impl Info {
 typed_record!(Info, INFO);
 
 fn parse_data(data: &[u8]) -> Option<InfoData> {
-    if !matches!(data.len(), 2 | 4) {
+    if !matches!(data.len(), 2..=4) {
         return None;
     }
     let mut rd = Rd::new(data);
+    let info_type = rd.u8()?;
+    let next_speaker = rd.u8()?;
+    let flags = match data.len() {
+        4 => rd.u16(),
+        3 => rd.u8().map(u16::from),
+        _ => None,
+    };
     Some(InfoData {
-        info_type: rd.u8()?,
-        next_speaker: rd.u8()?,
-        flags: rd.u16(),
+        info_type,
+        next_speaker,
+        flags,
     })
 }
 
 fn parse_trdt(data: &[u8]) -> Option<ResponseData> {
-    let mut rd = Rd::exact(data, 24)?;
+    if !matches!(data.len(), 16 | 20 | 24) {
+        return None;
+    }
+    let mut rd = Rd::new(data);
     let emotion_type = rd.u32()?;
     let emotion_value = rd.i32()?;
     rd.skip(4)?;
     let response_number = rd.u8()?;
     rd.skip(3)?;
+    let sound = if data.len() >= 20 {
+        rd.form()?
+    } else {
+        FormId::NULL
+    };
+    let flags = if data.len() >= 24 { rd.u8()? } else { 0 };
     Some(ResponseData {
         emotion_type,
         emotion_value,
         response_number,
-        sound: rd.form()?,
-        flags: rd.u8()?,
+        sound,
+        flags,
     })
 }

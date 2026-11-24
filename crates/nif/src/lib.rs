@@ -74,7 +74,7 @@ pub use skin_blocks::{
     BodyPart, NiSkinData, NiSkinInstance, NiSkinPartition, SkinDataBone, SkinPartition,
 };
 
-pub use pose::{Pose, pose};
+pub use pose::{LocalPose, Pose, blend, compose, layer, local_pose, pose, subtree_mask};
 pub use skeleton::{Bone, BoneTransform, Skeleton, extract_skeleton};
 pub use skin::{Skin, SkinBone, skin};
 

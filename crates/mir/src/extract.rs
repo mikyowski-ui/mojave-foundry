@@ -14,7 +14,7 @@ use crate::error::MirError;
 use crate::index::{Index, load_plugins};
 use crate::model::{
     ActorEntry, ArchiveEntry, AssetStatus, CellDoc, CellKey, Manifest, PartRole, PluginEntry,
-    RawStore, SCHEMA_VERSION, Slice,
+    RECORDS_REVISION, RawStore, SCHEMA_VERSION, Slice,
 };
 use crate::paths::form_file_stem;
 use crate::reader::{
@@ -75,6 +75,10 @@ pub struct ExtractSummary {
     pub animations: AssetCounts,
     /// Problems listed in the manifest.
     pub issues: usize,
+    /// Notes listed in the manifest ([`Manifest::notes`]): not problems.
+    pub notes: usize,
+    /// The game of the plugin list; `None` only in a default value.
+    pub game: Option<fnv_esm::GameVariant>,
     /// Wall-clock time of each step, in order. Not written anywhere.
     pub timings: Vec<(String, Duration)>,
 }
@@ -137,6 +141,19 @@ fn remove_stale(root: &Path, dir: &str, keep: &BTreeSet<PathBuf>) -> Result<(), 
     walk(root, Path::new(dir), keep, 0)
 }
 
+/// The game of the plugin list, from its first plugin.
+fn detect_game(
+    first: &crate::index::PluginFile,
+    game: Option<fnv_esm::GameVariant>,
+) -> Result<fnv_esm::GameVariant, MirError> {
+    let plugin_error = |source| MirError::Plugin {
+        plugin: first.name.clone(),
+        source,
+    };
+    let plugin = fnv_esm::Plugin::parse(&first.bytes).map_err(plugin_error)?;
+    plugin.detect_game(&first.name, game).map_err(plugin_error)
+}
+
 /// The name of a part role, as its JSON form writes it.
 fn role_name(role: PartRole) -> &'static str {
     match role {
@@ -147,7 +164,23 @@ fn role_name(role: PartRole) -> &'static str {
     }
 }
 
+/// Extracts a slice of an install into a MIR directory, the game detected
+/// from the first plugin ([`extract_for_game`] with no override).
+///
+/// # Errors
+///
+/// As [`extract_for_game`].
+pub fn extract(options: &ExtractOptions) -> Result<ExtractSummary, MirError> {
+    extract_for_game(options, None)
+}
+
 /// Extracts a slice of an install into a MIR directory.
+///
+/// The game is detected from the first plugin of the list
+/// ([`fnv_esm::GameVariant::detect`]: its `HEDR` version, cross-checked
+/// with its file name) unless `game` names it. It is recorded in the
+/// manifest and in `records.sqlite`; [`Mir::game`] and
+/// [`crate::Records::game`] read it back.
 ///
 /// `records.sqlite` covers every record of the plugin list; cells,
 /// interiors, meshes and textures cover the slice; `skeletons/` and
@@ -157,9 +190,14 @@ fn role_name(role: PartRole) -> &'static str {
 ///
 /// # Errors
 ///
-/// When a plugin cannot be read or its header does not parse, the slice's
-/// worldspace does not exist, or an output cannot be written.
-pub fn extract(options: &ExtractOptions) -> Result<ExtractSummary, MirError> {
+/// When a plugin cannot be read or its header does not parse, the first
+/// plugin's game cannot be told (an unknown `HEDR` version, or a master
+/// named for the other game) and `game` is `None`, the slice's worldspace
+/// does not exist, or an output cannot be written.
+pub fn extract_for_game(
+    options: &ExtractOptions,
+    game: Option<fnv_esm::GameVariant>,
+) -> Result<ExtractSummary, MirError> {
     if options.plugins.is_empty() {
         return Err(MirError::Options("the plugin list is empty".to_owned()));
     }
@@ -200,6 +238,8 @@ pub fn extract(options: &ExtractOptions) -> Result<ExtractSummary, MirError> {
             sha256: f.sha256.clone(),
         })
         .collect();
+    let game = detect_game(&files[0], game)?;
+    summary.game = Some(game);
     let source = DataSource::new(&options.data_dir, &options.plugins)?;
     lap(&mut summary, "read plugins");
     let index = Index::build(&files)?;
@@ -208,11 +248,13 @@ pub fn extract(options: &ExtractOptions) -> Result<ExtractSummary, MirError> {
     let records_path = out.join(RECORDS);
     let reusable = previous.as_ref().is_some_and(|m| {
         m.schema_version == SCHEMA_VERSION
+            && m.records_revision == RECORDS_REVISION
+            && m.game == game
             && m.plugins == plugins
             && m.raw_store == options.raw_store
     }) && records_path.is_file();
     if !reusable {
-        let stats = db::build(&records_path, &index, &files, options.raw_store, jobs)?;
+        let stats = db::build(&records_path, &index, &files, options.raw_store, jobs, game)?;
         summary.records_rebuilt = true;
         summary.records = stats.records;
         summary.raw_subrecords = stats.raw_subrecords;
@@ -270,6 +312,7 @@ pub fn extract(options: &ExtractOptions) -> Result<ExtractSummary, MirError> {
         skeleton_paths.extend(doc.skeleton_path.clone());
         animation_paths.extend(doc.stand_path.clone());
         animation_paths.extend(doc.walk_path.clone());
+        animation_paths.extend(doc.animation_paths.values().cloned());
     }
     let skeleton_paths: Vec<String> = skeleton_paths.into_iter().collect();
     let animation_paths: Vec<String> = animation_paths.into_iter().collect();
@@ -377,10 +420,30 @@ pub fn extract(options: &ExtractOptions) -> Result<ExtractSummary, MirError> {
             .walk_path
             .clone()
             .and_then(|p| link(doc, "walk", &p, &animations.entries));
+        // Further slots: the converted ones only; one that does not
+        // convert is noted, as the stand and the walk are.
+        let mut more = BTreeMap::new();
+        for (slot, path) in doc.animation_paths.clone() {
+            if let Some(hash) = link(
+                doc,
+                &format!("animation {slot}"),
+                &path,
+                &animations.entries,
+            ) {
+                more.insert(slot, hash);
+            }
+        }
         doc.animations = match (stand, walk) {
-            (Some(stand), Some(walk)) => Some(crate::model::ActorAnimations { stand, walk }),
+            (Some(stand), Some(walk)) => Some(crate::model::ActorAnimations { stand, walk, more }),
             _ => None,
         };
+        for weapon in &mut doc.weapons {
+            weapon.mesh = meshes
+                .entries
+                .get(&weapon.path)
+                .and_then(|e| e.converted_hash())
+                .map(str::to_owned);
+        }
         for part in &mut doc.parts {
             let entry = meshes.entries.get(&part.path);
             part.mesh = entry.and_then(|e| e.converted_hash()).map(str::to_owned);
@@ -425,6 +488,16 @@ pub fn extract(options: &ExtractOptions) -> Result<ExtractSummary, MirError> {
     summary.exterior_cells = cell_keys.len();
     summary.interior_cells = interiors.len();
     summary.issues = built.issues.len();
+    let mut notes = built.notes;
+    notes.extend(index.remapped.iter().map(|r| crate::model::Issue {
+        subject: r.form.as_ref().map_or_else(String::new, |f| f.to_string()),
+        sig: Some(r.sig.clone()),
+        offset: Some(r.offset),
+        error: r.error.clone(),
+    }));
+    notes.sort();
+    notes.dedup();
+    summary.notes = notes.len();
     lap(&mut summary, "cell documents");
 
     let errors: BTreeMap<String, String> = source.archive_errors().into_iter().collect();
@@ -457,6 +530,9 @@ pub fn extract(options: &ExtractOptions) -> Result<ExtractSummary, MirError> {
         animation_info: animations.info,
         issues: built.issues,
         default_land_texture: Some(default_land.path),
+        game,
+        records_revision: RECORDS_REVISION,
+        notes,
     };
     write_atomic(&out.join(MANIFEST), &json_bytes(&manifest, true)?)?;
 

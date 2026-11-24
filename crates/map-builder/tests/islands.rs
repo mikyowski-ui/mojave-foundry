@@ -7,21 +7,13 @@ mod common;
 
 use std::collections::BTreeSet;
 
+use common::scenes::{add_door, cut_town, hexes_where};
 use common::*;
 use map_builder::cover::{Cover, Sight};
 use map_builder::islands::{self, components};
-use map_builder::walk::{Frame, HEXES};
 use map_builder::{ArtCategory, Built, Role, build_map};
-use mir::{CellLocation, FormKey};
 use vault_formats::map::MapFile;
 use vault_formats::{ByteSource, GameProfile, HexGrid, LocalPrototypeCatalog, MemoryDir};
-
-/// Every hex whose centre's tile coordinates `keep` accepts.
-fn hexes_where(frame: &Frame, keep: impl Fn(f64, f64) -> bool) -> Vec<i32> {
-    (0..HEXES as i32)
-        .filter(|hex| frame.hex_centre_tile(*hex).is_some_and(|[s, t]| keep(s, t)))
-        .collect()
-}
 
 /// The exterior map of a build, parsed back.
 fn exterior(built: &Built) -> MapFile {
@@ -49,73 +41,6 @@ fn reaches(built: &Built, hex: i32) -> bool {
     let blocked = islands::engine_blocked(&map.objects.elevations[0]);
     let comps = components(|h| !blocked[h as usize]);
     comps.of(map.header.entry_hex).is_some() && comps.of(map.header.entry_hex) == comps.of(hex)
-}
-
-/// The centre cell's index in a town scene's cells.
-fn centre_cell(scene: &Scene) -> usize {
-    scene
-        .cells
-        .iter()
-        .position(|c| matches!(c.location, CellLocation::Exterior { x: 0, y: 0, .. }))
-        .unwrap()
-}
-
-/// Add a door on `hex` teleporting into interior `interior`, whose own
-/// door teleports back to `back` (source space), when given.
-fn add_door(scene: &mut Scene, hex: i32, form: u32, interior: u32, back: Option<[f32; 2]>) {
-    let frame = scene.frame();
-    let [x, y] = hex_point(&frame, hex);
-    let centre = centre_cell(scene);
-    let inner_door = form + 0x100;
-    scene.cells[centre].references.push(teleport_door(
-        form,
-        [x, y, 100.0],
-        inner_door,
-        interior,
-        Some("SynthInterior"),
-        None,
-    ));
-    scene.cells[centre]
-        .references
-        .sort_by(|a, b| a.form.cmp(&b.form));
-    scene.placements.push(placement(
-        4,
-        hex,
-        Role::Door,
-        true,
-        &FormKey::new(PLUGIN, form).to_string(),
-    ));
-    if let Some([bx, by]) = back {
-        let mut cell = exterior_cell(9, 9);
-        cell.form = FormKey::new(PLUGIN, interior);
-        cell.location = CellLocation::Interior;
-        let mut door = teleport_door(
-            inner_door,
-            [0.0, 0.0, 0.0],
-            form,
-            0x7777,
-            None,
-            Some((0, 0)),
-        );
-        door.teleport.as_mut().unwrap().position = [bx, by, 100.0];
-        cell.references.push(door);
-        scene.cells.push(cell);
-    }
-}
-
-/// The town cut along tile row 52 (two hexes deep, far wider than the
-/// navmesh), with a teleporting door in the smaller, southern part.
-fn cut_town() -> (Scene, Vec<i32>) {
-    let mut scene = town();
-    let frame = scene.frame();
-    let line = hexes_where(&frame, |s, t| {
-        (25.0..75.0).contains(&s) && (52.0..53.0).contains(&t)
-    });
-    // The town's own item stands on the line; keep it, it blocks nothing.
-    scene.blocked.extend(&line);
-    let door = hex_at(&frame, 50.0, 57.0);
-    add_door(&mut scene, door, 0xb01, 0xd01, None);
-    (scene, line)
 }
 
 #[test]

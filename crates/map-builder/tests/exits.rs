@@ -5,10 +5,10 @@ mod common;
 
 use std::collections::BTreeMap;
 
+use common::scenes::doors_scene;
 use common::*;
 use map_builder::exits::STUB_ENTRY;
 use map_builder::{ArtCategory, BuildOptions, Built, GroundTiles, Role, build_map};
-use mir::{CellLocation, FormKey};
 use vault_formats::map::{MapFile, ObjectDetail, ObjectState};
 use vault_formats::pro::PrototypeLookup;
 use vault_formats::{ByteSource, GameProfile, HexGrid, LocalPrototypeCatalog, MemoryDir};
@@ -107,67 +107,6 @@ fn check_chain(built: &Built, base: &BTreeMap<String, Vec<u8>>) {
         .collect();
     let numbers: Vec<u32> = report.maps.iter().map(|(_, n)| *n).collect();
     assert_eq!(registered, numbers);
-}
-
-/// The town scene plus two doors into one interior, one into another, one
-/// to another exterior position, and one whose destination is unknown.
-fn doors_scene() -> Scene {
-    let mut scene = town();
-    let frame = scene.frame();
-    let door_art = 4;
-    let specs = [
-        (0xb01, hex_at(&frame, 48.0, 48.0), 0xc01, 0xd01, None),
-        (0xb02, hex_at(&frame, 56.0, 48.0), 0xc02, 0xd01, None),
-        (0xb03, hex_at(&frame, 48.0, 57.0), 0xc03, 0xd02, None),
-        (
-            0xb04,
-            hex_at(&frame, 57.0, 57.0),
-            0xc04,
-            0xd03,
-            Some((1, 1)),
-        ),
-    ];
-    let centre = scene
-        .cells
-        .iter()
-        .position(|c| matches!(c.location, CellLocation::Exterior { x: 0, y: 0, .. }))
-        .unwrap();
-    for (form, hex, destination, interior, exterior) in specs {
-        let [x, y] = hex_point(&frame, hex);
-        scene.cells[centre].references.push(teleport_door(
-            form,
-            [x, y, 100.0],
-            destination,
-            interior,
-            Some("SynthInterior"),
-            exterior,
-        ));
-        scene.placements.push(placement(
-            door_art,
-            hex,
-            Role::Door,
-            true,
-            &FormKey::new(PLUGIN, form).to_string(),
-        ));
-    }
-    // A door whose teleport has no destination cell.
-    let hex = hex_at(&frame, 52.0, 58.0);
-    let [x, y] = hex_point(&frame, hex);
-    let mut lost = teleport_door(0xb05, [x, y, 100.0], 0xc05, 0xd04, None, None);
-    lost.teleport.as_mut().unwrap().cell = None;
-    scene.cells[centre].references.push(lost);
-    scene.placements.push(placement(
-        door_art,
-        hex,
-        Role::Door,
-        true,
-        &FormKey::new(PLUGIN, 0xb05).to_string(),
-    ));
-    // References must stay sorted by form for `CellDoc::reference`.
-    scene.cells[centre]
-        .references
-        .sort_by(|a, b| a.form.cmp(&b.form));
-    scene
 }
 
 #[test]

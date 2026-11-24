@@ -1,65 +1,45 @@
-//! [`build`]: from the input to a checked mod layer.
+//! [`build_layer`]: from the input to a checked mod layer, and [`build`],
+//! the single-map adapter behind [`crate::build_map`].
+//!
+//! The order (`DESIGN-levels.md` (2)): validate every input; plan every
+//! map (phase A, `plan`); resolve stub exits, door links and stairs between
+//! the plans (phase B, `links`); join islands, choose entrances, place
+//! critters (phase C); check the layer's budgets; write through the
+//! [`LayerBuilder`]; register the maps and ship the tables; verify.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use emit::map::{CritterPlacement as CritterRecord, MAP_NAME_BYTES, empty_map, plain_object};
 use emit::proto::{self, DoorSpec, ItemStats, Material, ObjectFlags, ProtoCommon};
 use emit::{
-    ArtList, CRITTER_LIST_PATH, CritterList, CritterSpec, EmitError, FID_INDEX_CAP, FormatWriters,
-    FrmDirection, FrmFrameSpec, FrmSpec, LocalWriters, ModLayer, MsgFile, ProtoList,
-    critter_object, critter_prototype,
+    CRITTER_LIST_PATH, CritterList, CritterSpec, FID_INDEX_CAP, ProtoList, critter_object,
+    critter_prototype,
 };
-use vault_formats::fallout2::Diagnostics;
-use vault_formats::fallout2::maps::{MAX_MAP, MapsTable};
-use vault_formats::fid::ART_DIRECTORIES;
 use vault_formats::map::{MAX_OBJECTS, MapObject, ObjectDetail, ObjectState, TilePair};
 use vault_formats::pro::{BasicFlags, Category, LockFlags};
 use vault_formats::{Fid, Prototype};
 
-use vault_formats::HexGrid;
-
-use crate::cover::{Cover, Sight};
+use crate::budget::{ART_CRITTERS, ART_MISC, ART_SCENERY, ART_TILES, BUILD_LISTS};
 use crate::critters::{self, AI_TXT};
-use crate::exits::{self, DoorExit, STUB_ENTRY, STUB_EXIT_RADIUS, STUB_FLOOR_RADIUS};
+use crate::exits::{DoorExit, STUB_ENTRY, STUB_EXIT_RADIUS, STUB_FLOOR_RADIUS};
+use crate::furniture::FurnitureReport;
 use crate::islands;
-use crate::names::{ArtNames, map_stem, message_text, stub_stem};
-use crate::passages;
-use crate::walk::{self, Frame, HEXES};
+use crate::layer::{BLANK_TILE, LayerBuilder, art_category, art_key, base_error, directory};
+use crate::loot::MapLoot;
+use crate::loot_build::Loot;
+use crate::names::{map_stem, message_text, stub_stem};
+use crate::plan::{self, CellIndex, CritterLevel, DoorMode, effective_blocking};
+use crate::walk::{Frame, HEXES};
 use crate::{
-    ArtCategory, ArtListReport, BLANK_SQUARE, BuildError, BuildInput, BuildReport, Built,
-    CRITTER_BASE_FROM, ComponentReport, CritterComponent, CritterPrototypeReport, CritterSetReport,
-    EntranceReport, ExitComponents, ExitReport, InteriorBuild, InteriorDoor, InteriorReport,
-    LANGUAGE, PlacedCritter, Role, SkippedTeleport, base_file_paths,
+    ArtListReport, BLANK_SQUARE, BuildError, BuildInput, BuildReport, Built, BuiltLayer, BuiltMap,
+    ComponentReport, CritterComponent, CritterPrototypeReport, CritterSetReport, ElevationInput,
+    ElevationReport, ExitComponents, ExitReport, InteriorReport, LayerInput, LayerOptions,
+    LinkReport, MapInput, PlacedCritter, Role,
 };
 
-use crate::budget::{
-    ART_CRITTERS, ART_ITEMS, ART_MISC, ART_SCENERY, ART_TILES, ART_WALLS, BUILD_LISTS,
-};
-/// A floor tile's size.
-pub(crate) const TILE_WIDTH: usize = 80;
-pub(crate) const TILE_HEIGHT: usize = 36;
-/// Tile art indexes 0 and 1 are reserved: 1 is the blank tile, and a roof
-/// of index 1 is not drawn (SPEC-003 §2.8).
-const RESERVED_TILES: usize = emit::RESERVED_TILE_ENTRIES;
 /// The exit-grid prototype every exit uses (variant 0).
 pub(crate) const EXIT_GRID_PID: u32 = 0x0500_0010;
-pub(crate) const MAPS_TXT: &str = "data/maps.txt";
-
-fn art_category(category: ArtCategory) -> u8 {
-    match category {
-        ArtCategory::Walls => ART_WALLS,
-        ArtCategory::Scenery => ART_SCENERY,
-        ArtCategory::Items => ART_ITEMS,
-    }
-}
-
-fn role_art(role: Role) -> ArtCategory {
-    match role {
-        Role::WallStrip => ArtCategory::Walls,
-        Role::Scenery | Role::Door | Role::FloorPiece => ArtCategory::Scenery,
-        Role::Container | Role::Item => ArtCategory::Items,
-    }
-}
+pub(crate) use crate::layer::MAPS_TXT;
 
 fn role_category(role: Role) -> Category {
     match role {
@@ -69,18 +49,7 @@ fn role_category(role: Role) -> Category {
     }
 }
 
-/// Items never block (the engine ignores item art for movement anyway).
-fn effective_blocking(role: Role, blocking: bool) -> bool {
-    blocking && !matches!(role, Role::Item | Role::FloorPiece)
-}
-
-/// Whether the engine stops a walker at this object: blocking, and wall
-/// or scenery art (item and misc art never block movement).
-fn engine_blocks(role: Role, blocking: bool) -> bool {
-    blocking && matches!(role, Role::WallStrip | Role::Scenery | Role::Door)
-}
-
-fn object_flags(role: Role, blocking: bool) -> ObjectFlags {
+pub(crate) fn object_flags(role: Role, blocking: bool) -> ObjectFlags {
     match role {
         Role::FloorPiece => ObjectFlags::FLOOR,
         Role::Item => ObjectFlags {
@@ -121,518 +90,13 @@ fn material(role: Role) -> Material {
     }
 }
 
-fn directory(category: u8) -> &'static str {
-    ART_DIRECTORIES[usize::from(category)]
-}
-
-/// A one-direction, one-frame FRM.
-fn frm(
-    width: usize,
-    height: usize,
-    pixels: Vec<u8>,
-    shift: [i16; 2],
-) -> Result<Vec<u8>, BuildError> {
-    let dimension = |v: usize| {
-        u16::try_from(v)
-            .ok()
-            .filter(|v| *v <= emit::frm::FRM_MAX_FIELD)
-            .ok_or_else(|| {
-                BuildError::Input(format!("an image dimension of {v} exceeds the format"))
-            })
-    };
-    let spec = FrmSpec {
-        fps: 0,
-        action_frame: 0,
-        directions: vec![FrmDirection {
-            shift,
-            frames: vec![FrmFrameSpec {
-                width: dimension(width)?,
-                height: dimension(height)?,
-                displacement: [0, 0],
-                pixels,
-            }],
-        }],
-    };
-    LocalWriters
-        .frm(&spec)
-        .map_err(|error| BuildError::emit("FRM", error))
-}
-
-/// The lists the layer extends, with what it changed.
-struct Lists {
-    art: BTreeMap<u8, ArtList>,
-    /// Entries each art list started with (the base list, or the reserved
-    /// entries of a standalone one).
-    art_base: BTreeMap<u8, usize>,
-    /// Entries of each base art list (0 without one).
-    art_base_entries: BTreeMap<u8, usize>,
-    protos: BTreeMap<Category, ProtoList>,
-    messages: BTreeMap<Category, MsgFile>,
-    touched_art: BTreeSet<u8>,
-    touched_protos: BTreeSet<Category>,
-    touched_messages: BTreeSet<Category>,
-}
-
-fn base_error(file: &str, error: impl std::fmt::Display) -> BuildError {
-    BuildError::Base {
-        file: file.into(),
-        message: error.to_string(),
-    }
-}
-
-impl Lists {
-    fn load(base: &BTreeMap<String, Vec<u8>>, standalone: bool) -> Result<Self, BuildError> {
-        let mut art = BTreeMap::new();
-        let mut art_base = BTreeMap::new();
-        let mut art_base_entries = BTreeMap::new();
-        for category in BUILD_LISTS {
-            let (list, entries) = crate::budget::start_list(category, base, standalone)?;
-            art_base.insert(category, list.len());
-            art_base_entries.insert(category, entries);
-            art.insert(category, list);
-        }
-        let mut protos = BTreeMap::new();
-        let mut messages = BTreeMap::new();
-        for category in [
-            Category::Item,
-            Category::Scenery,
-            Category::Wall,
-            Category::Misc,
-        ] {
-            let path = proto::prototype_list_path(category);
-            let list = match base.get(&path) {
-                Some(bytes) => {
-                    ProtoList::from_base(category, bytes).map_err(|e| base_error(&path, e))?
-                }
-                None => ProtoList::new(category),
-            };
-            protos.insert(category, list);
-            if category != Category::Misc {
-                let path = proto::message_file_path(category, LANGUAGE);
-                let file = match base.get(&path) {
-                    Some(bytes) => MsgFile::from_base(bytes).map_err(|e| base_error(&path, e))?,
-                    None => MsgFile::new(),
-                };
-                messages.insert(category, file);
-            }
-        }
-        Ok(Self {
-            art,
-            art_base,
-            art_base_entries,
-            protos,
-            messages,
-            touched_art: BTreeSet::new(),
-            touched_protos: BTreeSet::new(),
-            touched_messages: BTreeSet::new(),
-        })
-    }
-
-    fn art_list(&mut self, category: u8) -> &mut ArtList {
-        self.art
-            .get_mut(&category)
-            .expect("every art list is loaded")
-    }
-
-    /// Load the critter prototype list and `pro_crit.msg` (base or empty).
-    fn load_critters(&mut self, base: &BTreeMap<String, Vec<u8>>) -> Result<(), BuildError> {
-        let path = proto::prototype_list_path(Category::Critter);
-        let list = match base.get(&path) {
-            Some(bytes) => {
-                ProtoList::from_base(Category::Critter, bytes).map_err(|e| base_error(&path, e))?
-            }
-            None => ProtoList::new(Category::Critter),
-        };
-        self.protos.insert(Category::Critter, list);
-        let path = proto::message_file_path(Category::Critter, LANGUAGE);
-        let file = match base.get(&path) {
-            Some(bytes) => MsgFile::from_base(bytes).map_err(|e| base_error(&path, e))?,
-            None => MsgFile::new(),
-        };
-        self.messages.insert(Category::Critter, file);
-        Ok(())
-    }
-
-    /// Write `bytes` as the next free name of `category` and append it.
-    fn add_art(
-        &mut self,
-        layer: &mut ModLayer,
-        category: u8,
-        names: &mut ArtNames,
-        bytes: Vec<u8>,
-    ) -> Result<Fid, BuildError> {
-        let list = self.art_list(category);
-        let name = names.next(list)?;
-        let index = list
-            .push(&name)
-            .map_err(|error| BuildError::emit(list.list_path(), error))?;
-        let fid = list.fid(index);
-        let path = format!("art/{}/{name}", directory(category));
-        layer
-            .insert(&path, bytes)
-            .map_err(|error| BuildError::emit(path.clone(), error))?;
-        self.touched_art.insert(category);
-        Ok(fid)
-    }
-
-    /// Append a prototype of `category` built by `make`, with its name and
-    /// description messages.
-    fn add_prototype(
-        &mut self,
-        layer: &mut ModLayer,
-        category: Category,
-        common: impl FnOnce(u32, i32) -> ProtoCommon,
-        make: impl FnOnce(ProtoCommon) -> Result<Prototype, EmitError>,
-        name: &str,
-        description: &str,
-    ) -> Result<Prototype, BuildError> {
-        self.add_prototype_file(layer, category, common, make, name, description)
-            .map(|(prototype, _)| prototype)
-    }
-
-    /// [`Lists::add_prototype`], also returning the prototype's path.
-    fn add_prototype_file(
-        &mut self,
-        layer: &mut ModLayer,
-        category: Category,
-        common: impl FnOnce(u32, i32) -> ProtoCommon,
-        make: impl FnOnce(ProtoCommon) -> Result<Prototype, EmitError>,
-        name: &str,
-        description: &str,
-    ) -> Result<(Prototype, String), BuildError> {
-        let list = self
-            .protos
-            .get_mut(&category)
-            .expect("every prototype list is loaded");
-        let list_path = list.list_path();
-        let (pid, file) = list
-            .push_next()
-            .map_err(|error| BuildError::emit(list_path.clone(), error))?;
-        let base = proto::default_message_base(pid & proto::PID_INDEX_CAP).ok_or_else(|| {
-            BuildError::Input(format!(
-                "{list_path}: no message number for PID {pid:#010x}"
-            ))
-        })?;
-        let path = proto::prototype_path(category, &file);
-        let prototype = make(common(pid, base)).map_err(|e| BuildError::emit(path.clone(), e))?;
-        let bytes = LocalWriters
-            .pro(&prototype)
-            .map_err(|e| BuildError::emit(path.clone(), e))?;
-        layer
-            .insert(&path, bytes)
-            .map_err(|e| BuildError::emit(path.clone(), e))?;
-        let message_path = proto::message_file_path(category, LANGUAGE);
-        let messages = self
-            .messages
-            .get_mut(&category)
-            .ok_or_else(|| BuildError::Input(format!("no message file for {category:?}")))?;
-        let entries = proto::message_entries(base, name.as_bytes(), description.as_bytes())
-            .map_err(|e| BuildError::emit(message_path.clone(), e))?;
-        for entry in entries {
-            if messages.contains(entry.id) {
-                return Err(base_error(
-                    &message_path,
-                    format!(
-                        "message {} already exists; PID {pid:#010x} needs it",
-                        entry.id
-                    ),
-                ));
-            }
-            messages
-                .push(&entry)
-                .map_err(|e| BuildError::emit(message_path.clone(), e))?;
-        }
-        self.touched_protos.insert(category);
-        self.touched_messages.insert(category);
-        Ok((prototype, path))
-    }
-
-    /// Append a prototype file to `category`'s list with no message.
-    fn add_raw_prototype(
-        &mut self,
-        layer: &mut ModLayer,
-        category: Category,
-        make: impl FnOnce(u32) -> Result<Prototype, EmitError>,
-    ) -> Result<Prototype, BuildError> {
-        let list = self
-            .protos
-            .get_mut(&category)
-            .expect("every prototype list is loaded");
-        let list_path = list.list_path();
-        let (pid, file) = list
-            .push_next()
-            .map_err(|error| BuildError::emit(list_path, error))?;
-        let path = proto::prototype_path(category, &file);
-        let prototype = make(pid).map_err(|e| BuildError::emit(path.clone(), e))?;
-        let bytes = LocalWriters
-            .pro(&prototype)
-            .map_err(|e| BuildError::emit(path.clone(), e))?;
-        layer
-            .insert(&path, bytes)
-            .map_err(|e| BuildError::emit(path, e))?;
-        self.touched_protos.insert(category);
-        Ok(prototype)
-    }
-
-    /// Put every changed list and message file in the layer.
-    fn finish(&self, layer: &mut ModLayer) -> Result<(), BuildError> {
-        for category in &self.touched_art {
-            let list = &self.art[category];
-            let path = list.list_path();
-            layer
-                .insert(&path, list.to_bytes())
-                .map_err(|e| BuildError::emit(path, e))?;
-        }
-        for category in &self.touched_protos {
-            let list = &self.protos[category];
-            let path = list.list_path();
-            layer
-                .insert(&path, list.to_bytes())
-                .map_err(|e| BuildError::emit(path, e))?;
-        }
-        for category in &self.touched_messages {
-            let path = proto::message_file_path(*category, LANGUAGE);
-            layer
-                .insert(&path, self.messages[category].to_bytes())
-                .map_err(|e| BuildError::emit(path, e))?;
-        }
-        Ok(())
-    }
-}
-
-/// An art image's identity for sharing one FRM.
-type ArtKey = (u8, u32, u32, [i16; 2], Vec<u8>);
-
-fn validate(input: &BuildInput) -> Result<(), BuildError> {
-    if !input.base_files.is_empty() {
-        let paths = base_file_paths();
-        let mut needed: Vec<&str> = paths[..CRITTER_BASE_FROM].to_vec();
-        if !input.critters.is_empty() {
-            needed.extend(
-                paths[CRITTER_BASE_FROM..]
-                    .iter()
-                    .filter(|path| **path != AI_TXT || input.options.critter_ai_packet.is_none()),
-            );
-        }
-        let missing: Vec<&str> = needed
-            .into_iter()
-            .filter(|path| !input.base_files.contains_key(*path))
-            .collect();
-        if !missing.is_empty() {
-            return Err(BuildError::Input(format!(
-                "base files are supplied but {} missing: {}; a layer list built without its \
-                 base file would replace the install's list with a shorter one",
-                if missing.len() == 1 {
-                    "this one is"
-                } else {
-                    "these are"
-                },
-                missing.join(", ")
-            )));
-        }
-    }
-    let ground = &input.ground;
-    if ground.squares.len() != 10_000 {
-        return Err(BuildError::Input(format!(
-            "the ground has {} squares; a map has 10000",
-            ground.squares.len()
-        )));
-    }
-    for (index, tile) in ground.tiles.iter().enumerate() {
-        if tile.len() != TILE_WIDTH * TILE_HEIGHT {
-            return Err(BuildError::Input(format!(
-                "library tile {index} has {} bytes; a tile is 80 × 36",
-                tile.len()
-            )));
-        }
-    }
-    if let Some((square, tile)) = ground
-        .squares
-        .iter()
-        .enumerate()
-        .find(|(_, tile)| **tile != BLANK_SQUARE && usize::from(**tile) >= ground.tiles.len())
-    {
-        return Err(BuildError::Input(format!(
-            "square {square} names library tile {tile}; the library has {}",
-            ground.tiles.len()
-        )));
-    }
-    for (index, image) in input.art.iter().enumerate() {
-        let area = (image.width as usize).checked_mul(image.height as usize);
-        if area != Some(image.pixels.len()) {
-            return Err(BuildError::Input(format!(
-                "art {index} ({}) has {} pixel bytes for {}×{}",
-                image.source,
-                image.pixels.len(),
-                image.width,
-                image.height
-            )));
-        }
-    }
-    for (index, placement) in input.placements.iter().enumerate() {
-        let Some(image) = input.art.get(placement.art) else {
-            return Err(BuildError::Input(format!(
-                "placement {index} names art {}; there are {}",
-                placement.art,
-                input.art.len()
-            )));
-        };
-        if !(0..HEXES as i32).contains(&placement.hex) {
-            return Err(BuildError::Input(format!(
-                "placement {index} is on hex {}, outside 0 to 39999",
-                placement.hex
-            )));
-        }
-        if image.category != role_art(placement.role) {
-            return Err(BuildError::Input(format!(
-                "placement {index} is a {:?} with {:?} art; it needs {:?} art",
-                placement.role,
-                image.category,
-                role_art(placement.role)
-            )));
-        }
-    }
-    if let Some(hex) = input
-        .blocked_hexes
-        .iter()
-        .find(|hex| !(0..HEXES as i32).contains(*hex))
-    {
-        return Err(BuildError::Input(format!(
-            "blocked hex {hex} is outside 0 to 39999"
-        )));
-    }
-    for (index, critter) in input.critters.iter().enumerate() {
-        if critter.art >= input.critter_art.len() {
-            return Err(BuildError::Input(format!(
-                "critter {index} ({}) names critter art {}; there are {}",
-                critter.reference,
-                critter.art,
-                input.critter_art.len()
-            )));
-        }
-    }
-    if !input.critters.is_empty() {
-        let options = &input.options;
-        if options.critter_team <= 0 {
-            return Err(BuildError::Input(format!(
-                "critter team {} is not allowed: team 0 is the player's and teams are not \
-                 negative",
-                options.critter_team
-            )));
-        }
-        if options.critter_ai_packet.is_some_and(|packet| packet < 0) {
-            return Err(BuildError::Input(format!(
-                "critter AI packet {:?} is negative",
-                options.critter_ai_packet
-            )));
-        }
-    }
-    if let Some(interior) = &input.options.interior {
-        let finite_point = |p: [f32; 2]| p.iter().all(|v| v.is_finite());
-        if !interior.floor_z.is_finite()
-            || !(interior.below.is_finite() && interior.below >= 0.0)
-            || !(interior.above.is_finite() && interior.above >= 0.0)
-        {
-            return Err(BuildError::Input(format!(
-                "interior floor z {} with band -{} / +{}: the floor must be finite and the band \
-                 finite and not negative",
-                interior.floor_z, interior.below, interior.above
-            )));
-        }
-        if interior.entrance_near.is_some_and(|p| !finite_point(p)) {
-            return Err(BuildError::Input(format!(
-                "interior entrance point {:?} is not finite",
-                interior.entrance_near
-            )));
-        }
-        if interior.clamp_radius < 0 {
-            return Err(BuildError::Input(format!(
-                "interior clamp radius {} is negative",
-                interior.clamp_radius
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Every teleport door of the interior cells, sorted by form key, with the
-/// hex of its door placement when there is one.
-fn interior_doors(input: &BuildInput) -> Vec<InteriorDoor> {
-    let mut doors: BTreeMap<String, InteriorDoor> = BTreeMap::new();
-    for cell in input.cells.iter().filter(|cell| cell.is_interior()) {
-        for reference in &cell.references {
-            let Some(teleport) = &reference.teleport else {
-                continue;
-            };
-            let form = reference.form.to_string();
-            doors.entry(form.clone()).or_insert_with(|| InteriorDoor {
-                hex: input
-                    .placements
-                    .iter()
-                    .find(|p| p.role == Role::Door && p.reference == form)
-                    .map(|p| p.hex),
-                door: form,
-                destination: teleport.cell.as_ref().map(|c| c.form.to_string()),
-                destination_editor_id: teleport.cell.as_ref().and_then(|c| c.editor_id.clone()),
-            });
-        }
-    }
-    doors.into_values().collect()
-}
-
-/// Where each critter stands relative to the interior's floor level.
-enum CritterLevel {
-    Floor,
-    /// Its reference is not in the cells.
-    Unknown,
-    Other(f32),
-}
-
-fn critter_levels(input: &BuildInput, interior: &InteriorBuild) -> Vec<CritterLevel> {
-    let heights: BTreeMap<String, f32> = input
-        .cells
-        .iter()
-        .filter(|cell| cell.is_interior())
-        .flat_map(|cell| cell.references.iter())
-        .map(|r| (r.form.to_string(), r.transform.position[2]))
-        .collect();
-    input
-        .critters
-        .iter()
-        .map(|critter| match heights.get(&critter.reference) {
-            None => CritterLevel::Unknown,
-            Some(z) if interior.in_band(*z) => CritterLevel::Floor,
-            Some(z) => CritterLevel::Other(*z),
-        })
-        .collect()
-}
-
-/// A critter's search radius by its level, or why it is skipped.
-fn critter_radius(
-    levels: &[CritterLevel],
-    interior: Option<&InteriorBuild>,
-    index: usize,
-) -> Result<i32, String> {
-    let Some(interior) = interior else {
-        return Ok(critters::CRITTER_RADIUS);
-    };
-    match levels.get(index) {
-        Some(CritterLevel::Other(_)) if interior.clamp_levels => Ok(interior.clamp_radius),
-        Some(CritterLevel::Other(z)) => {
-            let [low, high] = interior.band();
-            Err(format!(
-                "on another level: it stands at z {z:.0}, the floor level is z {low:.0} to \
-                 {high:.0} (InteriorBuild::clamp_levels places it anyway)"
-            ))
-        }
-        _ => Ok(critters::CRITTER_RADIUS),
-    }
-}
-
-/// The AI packet for this build's critters, and a note when it fell back.
-fn critter_packet(input: &BuildInput) -> Result<(i32, Option<String>), BuildError> {
-    let ai_txt = input.base_files.get(AI_TXT);
-    match (input.options.critter_ai_packet, ai_txt) {
+/// The AI packet for this layer's critters, and a note when it fell back.
+fn critter_packet(
+    base_files: &BTreeMap<String, Vec<u8>>,
+    packet: Option<i32>,
+) -> Result<(i32, Option<String>), BuildError> {
+    let ai_txt = base_files.get(AI_TXT);
+    match (packet, ai_txt) {
         (Some(packet), Some(table)) => {
             if critters::has_ai_packet(table, packet)? {
                 Ok((packet, None))
@@ -677,9 +141,6 @@ fn largest(labels: impl IntoIterator<Item = String>) -> Vec<(String, usize)> {
     out
 }
 
-/// The blank floor tile's art index (drawn black).
-const BLANK_TILE: u16 = 1;
-
 /// A square's floor art index: its library tile's, or the blank tile for
 /// [`BLANK_SQUARE`].
 fn floor_of(tile_index: &[u16], library: u16) -> u16 {
@@ -696,37 +157,42 @@ fn tile_word(floor: u16) -> TilePair {
     TilePair { stored: word, word }
 }
 
+/// An exit grid on `elevation` (its list slot) leading to `map` at hex
+/// `to`, elevation `to_elevation`, facing `facing`.
+#[allow(clippy::too_many_arguments)]
 fn exit_object(
     id: u32,
     fid: Fid,
     hex: i32,
+    elevation: u8,
     flags: BasicFlags,
     map: u32,
     to: i32,
+    to_elevation: u8,
     facing: u8,
 ) -> MapObject {
-    let mut object = plain_object(id, EXIT_GRID_PID, fid, hex, 0, flags);
+    let mut object = plain_object(id, EXIT_GRID_PID, fid, hex, elevation, flags);
     object.state = ObjectState::Other {
         word: 0,
         detail: ObjectDetail::ExitGrid {
             map: map as i32,
             hex: to,
-            elevation: 0,
+            elevation: i32::from(to_elevation),
             orientation: i32::from(facing),
         },
     };
     object
 }
 
-/// The exterior map's objects read by the engine's movement rule: its
-/// components that hold a walkable hex, and where the entrance, exits,
-/// returns and placed critters (`report.critters`) are in them.
+/// One elevation's objects read by the engine's movement rule: its
+/// components that hold a walkable hex, and where the entrance (`main`),
+/// exits, returns and `critters` are in them.
 fn component_report(
     objects: &[MapObject],
     walkable: &[bool],
-    entry: i32,
+    main_hex: Option<i32>,
     door_exits: &[DoorExit],
-    report: &BuildReport,
+    critters: &[PlacedCritter],
 ) -> ComponentReport {
     let blocked = islands::engine_blocked(objects);
     let comps =
@@ -754,10 +220,12 @@ fn component_report(
         first_hexes: (0..comps.len())
             .filter_map(|id| comps.first_hex(id))
             .collect(),
-        main: comps.of(entry),
+        main: match main_hex {
+            Some(hex) => comps.of(hex),
+            None => (!comps.is_empty()).then_some(0),
+        },
         exits,
-        critters: report
-            .critters
+        critters: critters
             .iter()
             .map(|critter| CritterComponent {
                 reference: critter.reference.clone(),
@@ -769,77 +237,6 @@ fn component_report(
     }
 }
 
-/// The walkability pass's own grid, before any passage.
-fn walkable_before(verdicts: &[walk::Verdict]) -> Vec<bool> {
-    verdicts
-        .iter()
-        .map(|v| *v == walk::Verdict::Walkable)
-        .collect()
-}
-
-/// The entrance by the crate notes' rule: in the largest component, off
-/// the border and `avoid`, clearest [`Sight`] first, nearest `centre`
-/// within a tier; else the walkable hex nearest `centre` off `grids`.
-fn entrance(
-    frame: &Frame,
-    walkable: &[bool],
-    centre: [f64; 2],
-    grids: &BTreeSet<i32>,
-    avoid: &BTreeSet<i32>,
-    cover: &Cover,
-    figure: [u32; 2],
-) -> Option<EntranceReport> {
-    let nearest = walk::nearest_walkable(frame, walkable, centre, grids)?;
-    let comps = islands::components(|h| walkable[h as usize]);
-    let distance = |hex: i32| {
-        frame.hex_centre_tile(hex).map_or(f64::INFINITY, |c| {
-            (c[0] - centre[0]).powi(2) + (c[1] - centre[1]).powi(2)
-        })
-    };
-    let mut candidates: Vec<(f64, i32)> = comps
-        .members(0)
-        .filter(|hex| !islands::on_border(*hex) && !avoid.contains(hex))
-        .map(|hex| (distance(hex), hex))
-        .collect();
-    candidates.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-    let steps = |hex: i32| HexGrid::lattice_distance(nearest, hex).unwrap_or(0);
-    let mut fallback: [Option<i32>; 2] = [None, None];
-    for (_, hex) in candidates {
-        match cover.sight(hex, figure) {
-            Sight::Clear => {
-                return Some(EntranceReport {
-                    hex,
-                    sight: Sight::Clear,
-                    in_main: true,
-                    steps_from_centre: steps(hex),
-                });
-            }
-            Sight::Behind => {
-                fallback[0].get_or_insert(hex);
-            }
-            Sight::Covered => {
-                fallback[1].get_or_insert(hex);
-            }
-        }
-    }
-    for (slot, sight) in [(fallback[0], Sight::Behind), (fallback[1], Sight::Covered)] {
-        if let Some(hex) = slot {
-            return Some(EntranceReport {
-                hex,
-                sight,
-                in_main: true,
-                steps_from_centre: steps(hex),
-            });
-        }
-    }
-    Some(EntranceReport {
-        hex: nearest,
-        sight: cover.sight(nearest, figure),
-        in_main: comps.of(nearest) == Some(0),
-        steps_from_centre: 0,
-    })
-}
-
 fn header_name(stem: &str) -> Result<String, BuildError> {
     let name = format!("{}.MAP", stem.to_ascii_uppercase());
     if name.len() > MAP_NAME_BYTES {
@@ -848,254 +245,226 @@ fn header_name(stem: &str) -> Result<String, BuildError> {
     Ok(name)
 }
 
+/// The single-map adapter (`DESIGN-levels.md` (f)).
 pub(crate) fn build(input: &BuildInput) -> Result<Built, BuildError> {
-    validate(input)?;
-    let stem = map_stem(input.map_name)?;
+    let mut options = input.options.clone();
+    let interior = options.interior.take();
+    let layer_options = LayerOptions {
+        standalone: options.standalone,
+        write_maps_txt: options.write_maps_txt,
+        critter_ai_packet: options.critter_ai_packet,
+        critter_team: options.critter_team,
+        isolated: interior.is_some(),
+        link_doors: false,
+        catalogue: options.catalogue.clone(),
+    };
+    let layer = LayerInput {
+        layer_id: input.layer_id,
+        layer_name: input.layer_name,
+        base_files: input.base_files,
+        critter_art: input.critter_art,
+        maps: vec![MapInput {
+            map_name: input.map_name,
+            map_number: input.map_number,
+            window: input.window,
+            projection: input.projection,
+            elevations: vec![ElevationInput {
+                sampler: input.sampler,
+                ground: input.ground,
+                art: input.art,
+                placements: input.placements,
+                blocked_hexes: input.blocked_hexes,
+                interior,
+            }],
+            entrance_elevation: None,
+            cells: input.cells,
+            critters: input.critters,
+            options,
+        }],
+        stairs: Vec::new(),
+        options: layer_options,
+    };
+    let built = build_layer(&layer)?;
+    let mut map = built
+        .maps
+        .into_iter()
+        .next()
+        .ok_or_else(|| BuildError::Input("the layer holds no map".into()))?;
+    Ok(Built {
+        layer: built.layer,
+        walkable: map.walkable.swap_remove(0),
+        report: map.report,
+        loot: built.loot,
+        furniture: map.furniture,
+    })
+}
+
+/// A stub map planned for a door leading outside the build.
+struct Stub {
+    owner: usize,
+    elevation: usize,
+    door: String,
+    /// Indices into the owner elevation's `door_exits`.
+    exits: Vec<usize>,
+    stem: String,
+    number: u32,
+}
+
+pub(crate) fn build_layer(input: &LayerInput) -> Result<BuiltLayer, BuildError> {
+    if input.maps.is_empty() {
+        return Err(BuildError::Input("a layer needs at least one map".into()));
+    }
+    let single = input.maps.len() == 1 && input.maps[0].elevations.len() == 1;
+    let several_maps = input.maps.len() > 1;
     let options = &input.options;
-    let mut report = BuildReport::default();
-    let mut layer = ModLayer::new(input.layer_id, input.layer_name, env!("CARGO_PKG_VERSION"))
-        .map_err(|e| BuildError::emit("vault-mod.toml", e))?;
-    let mut lists = Lists::load(input.base_files, options.standalone)?;
-
-    // Map numbers.
-    let maps_txt = input.base_files.get(MAPS_TXT);
-    let record_count = match maps_txt {
-        Some(bytes) => MapsTable::parse(bytes, &mut Diagnostics::default())
-            .map_err(|e| base_error(MAPS_TXT, e))?
-            .count(),
-        None => 0,
-    };
-    let first_number = (*vault_formats::mod_manifest::MAP_NUMBERS.start())
-        .max(u32::try_from(record_count).unwrap_or(u32::MAX));
-    report.first_map_number = first_number;
-    let exterior_number = input.map_number.unwrap_or(first_number);
-    if exterior_number < first_number {
-        return Err(BuildError::Input(format!(
-            "map number {exterior_number} is below {first_number}, the first one a layer may \
-             register here"
-        )));
+    plan::validate_base(input)?;
+    for map in &input.maps {
+        plan::validate_map(map, input, !single)?;
     }
-    let ship_maps_txt = options.write_maps_txt && maps_txt.is_some();
-
-    // Walkability.
-    let frame = Frame::new(&input.window, input.projection)?;
-    let mut blocked = vec![false; HEXES];
-    let mut engine_blocked = vec![false; HEXES];
-    let mut open = vec![false; HEXES];
-    for hex in input.blocked_hexes {
-        blocked[*hex as usize] = true;
-    }
-    for placement in input.placements {
-        let hex = placement.hex as usize;
-        if effective_blocking(placement.role, placement.blocking) {
-            blocked[hex] = true;
-        }
-        if engine_blocks(placement.role, placement.blocking) {
-            engine_blocked[hex] = true;
-        }
-        if placement.role == Role::Door {
-            open[hex] = true;
-        }
-    }
-    let (verdicts, stats) = walk::verdicts(&frame, input.sampler, input.cells, &blocked, options);
-    let mut walkable: Vec<bool> = verdicts
-        .iter()
-        .map(|v| *v == walk::Verdict::Walkable)
-        .collect();
-    if stats.walkable == 0 {
-        return Err(BuildError::NoWalkableHex);
-    }
-    let interior = options.interior.as_ref();
-    if let Some(interior) = interior {
-        let [low, high] = interior.band();
-        report.notes.push(format!(
-            "interior demo: walkable ground is the navmesh from z {low:.0} to {high:.0} \
-             ({} of {} triangles; {} on other levels ignored)",
-            stats.triangles_rasterized, stats.triangles, stats.triangles_off_level
-        ));
-    } else if stats.triangles == 0 {
-        report.notes.push(
-            "no exterior cell of the window has a navmesh: walkability is the slope test alone"
-                .into(),
-        );
-    } else if stats.slope_only > 0 {
-        report.notes.push(format!(
-            "{} hexes lie in cells without a navmesh and were judged by slope alone",
-            stats.slope_only
+    crate::links::validate_stairs(&input.stairs, &input.maps)?;
+    if options.isolated && !input.stairs.is_empty() {
+        return Err(BuildError::Input(
+            "an isolated layer holds no exit grid, so it takes no stairs".into(),
         ));
     }
-    report.walk = stats;
-
-    // Exits; none on an interior demo, whose doors are listed instead.
-    let interior_doors = if interior.is_some() {
-        interior_doors(input)
-    } else {
-        Vec::new()
-    };
-    let (door_exits, skipped, unknown_doors) = if interior.is_some() {
-        let skipped = interior_doors
-            .iter()
-            .map(|door| SkippedTeleport {
-                door: door.door.clone(),
-                reason: format!(
-                    "not converted on an interior demo{}",
-                    match (&door.destination_editor_id, &door.destination) {
-                        (Some(id), _) => format!(" (it leads to {id})"),
-                        (None, Some(form)) => format!(" (it leads to {form})"),
-                        (None, None) => String::new(),
-                    }
-                ),
-            })
-            .collect();
-        (Vec::new(), skipped, 0)
-    } else {
-        exits::plan(
-            &frame,
-            input.placements,
-            input.cells,
-            &verdicts,
-            options.door_reach,
-        )
-    };
-    if unknown_doors > 0 {
-        report.notes.push(format!(
-            "{unknown_doors} door placements name references the cells do not hold; they are \
-             plain doors"
-        ));
+    let mut stems = Vec::new();
+    for map in &input.maps {
+        let stem = map_stem(map.map_name)?;
+        if let Some(other) = stems.iter().position(|s| *s == stem) {
+            return Err(BuildError::Input(format!(
+                "maps {} and {} share the file stem {stem}",
+                input.maps[other].map_name, map.map_name
+            )));
+        }
+        stems.push(stem);
     }
-    report.skipped_teleports = skipped;
-    let grid_hexes: BTreeSet<i32> = door_exits
-        .iter()
-        .flat_map(|exit| exit.grid_hexes.iter().copied())
-        .collect();
-    // One stub per door, so that leaving an interior with several doors
-    // comes out at the door that was used.
-    let mut stubs: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    for (index, exit) in door_exits.iter().enumerate() {
-        stubs.entry(exit.door.clone()).or_default().push(index);
+    let mut builder = LayerBuilder::new(
+        input.layer_id,
+        input.layer_name,
+        input.base_files,
+        options.standalone,
+        options.write_maps_txt,
+    )?;
+
+    // Map numbers: given ones honoured, the rest the next free ones.
+    let first_number = builder.first_number;
+    let mut used: BTreeSet<u32> = BTreeSet::new();
+    for map in &input.maps {
+        if let Some(number) = map.map_number {
+            if number < first_number {
+                return Err(BuildError::Input(format!(
+                    "map number {number} is below {first_number}, the first one a layer may \
+                     register here"
+                )));
+            }
+            if !used.insert(number) {
+                return Err(BuildError::Input(format!(
+                    "map number {number} is given to two maps"
+                )));
+            }
+        }
+    }
+    let mut next = first_number;
+    let mut numbers = Vec::new();
+    for map in &input.maps {
+        numbers.push(match map.map_number {
+            Some(number) => number,
+            None => {
+                while used.contains(&next) {
+                    next = next
+                        .checked_add(1)
+                        .ok_or_else(|| BuildError::Input("map numbers overflow".into()))?;
+                }
+                used.insert(next);
+                next
+            }
+        });
     }
 
-    let door_hexes: BTreeSet<i32> = input
-        .placements
-        .iter()
-        .filter(|placement| placement.role == Role::Door)
-        .map(|placement| placement.hex)
-        .collect();
-    let return_hexes: BTreeSet<i32> = door_exits.iter().map(|exit| exit.return_hex).collect();
-
-    // Islands: join those holding an exit, a return hex or a critter (where
-    // it would stand, the entrance aside) to the largest component.
-    let cover = Cover::new(input.art, input.placements);
-    let levels = match interior {
-        Some(interior) => critter_levels(input, interior),
-        None => Vec::new(),
-    };
-    let radius = |index: usize| critter_radius(&levels, interior, index);
-    let provisional: Vec<(String, i32)> = if input.critters.is_empty() {
-        Vec::new()
+    // Phase A.
+    let mode = if options.isolated {
+        DoorMode::Isolated
+    } else if options.link_doors {
+        DoorMode::Linked
     } else {
-        let mut reserved: BTreeSet<i32> = grid_hexes.clone();
-        reserved.extend(&return_hexes);
-        reserved.extend(&door_hexes);
-        critters::place(&frame, input.critters, &walkable, &reserved, radius)
-            .0
-            .into_iter()
-            .map(|spot| (input.critters[spot.index].reference.clone(), spot.hex))
-            .collect()
+        DoorMode::Stubs
     };
-    let targets = passages::targets(&door_exits, &provisional);
-    let (passages, islands_left) = passages::reconnect(
-        &mut walkable,
-        &targets,
-        || {
-            passages::open_costs(
-                &frame,
-                input.sampler,
-                input.cells,
-                options,
-                &walkable_before(&verdicts),
-                input.placements,
-                |p| effective_blocking(p.role, p.blocking),
-                &cover,
-            )
-        },
-        options,
-        options.reconnect,
-    );
-    let opened: BTreeSet<i32> = passages
-        .iter()
-        .flat_map(|p| p.opened.iter().copied())
-        .collect();
-    report.opened_hexes = opened.len();
-    report.passages = passages;
-    report.islands_left = islands_left;
-    let border = walk::sealing_border(&walkable, &engine_blocked, &open);
-
-    // Entrance (crate notes); an interior's is near its given point or its
-    // floor's navmesh centre.
-    let window = &input.window;
-    let window_centre = [
-        f64::from(window.x_west) + f64::from(window.size) / 2.0,
-        f64::from(window.y_north) - f64::from(window.size) / 2.0,
-    ];
-    let entrance_near = interior.map(|interior| match interior.entrance_near {
-        Some(p) => ([f64::from(p[0]), f64::from(p[1])], true),
-        None => (
-            walk::navmesh_centre(input.cells, interior)
-                .map_or(window_centre, |p| [f64::from(p[0]), f64::from(p[1])]),
-            false,
-        ),
-    });
-    let target = entrance_near.map_or(window_centre, |(p, _)| p);
-    let centre = frame.tile_of_source(target[0], target[1]);
-    let mut avoid = grid_hexes.clone();
-    avoid.extend(&return_hexes);
-    report.entrance = entrance(
-        &frame,
-        &walkable,
-        centre,
-        &grid_hexes,
-        &avoid,
-        &cover,
-        options.entrance_box,
-    )
-    .ok_or(BuildError::NoWalkableHex)?;
-    let entry = report.entrance.hex;
-    report.entry_hex = entry;
-
-    // Critters: every sprite set a critter names is checked; then each
-    // critter gets its hex, clear of exits, doors, the entrance and the
-    // return hexes (critter art blocks movement).
+    let index = CellIndex::new(&input.maps);
+    let mut references: BTreeMap<String, mir::Reference> = BTreeMap::new();
+    if mode == DoorMode::Linked {
+        for map in &input.maps {
+            for cell in map.cells {
+                for reference in &cell.references {
+                    references
+                        .entry(reference.form.to_string())
+                        .or_insert_with(|| reference.clone());
+                }
+            }
+        }
+    }
+    let mut plans = Vec::new();
+    for (m, map) in input.maps.iter().enumerate() {
+        plans.push(plan::plan_map(
+            map,
+            stems[m].clone(),
+            numbers[m],
+            mode,
+            &index,
+            &references,
+            single,
+        )?);
+    }
+    // Phase B.
+    crate::links::resolve(&mut plans, input, &index)?;
+    // Phase C: islands and entrances, then the sprite sets, then critters.
+    for plan in &mut plans {
+        plan::reconnect(plan).map_err(|e| match e {
+            BuildError::NoWalkableHex if !single => BuildError::Input(format!(
+                "map {}: no walkable hex is left for the entrance",
+                plan.input.map_name
+            )),
+            other => other,
+        })?;
+    }
+    // The catalogue, checked against every plan before anything is
+    // written.
+    let mut loot = match &options.catalogue {
+        Some(catalogue) => Some(Loot::prepare(catalogue, input, &plans)?),
+        None => None,
+    };
+    let figure_sets: BTreeSet<usize> = loot
+        .as_ref()
+        .map_or_else(BTreeSet::new, |l| l.figure_sets.clone());
     let mut critter_files: BTreeMap<usize, BTreeMap<String, Vec<u8>>> = BTreeMap::new();
-    for critter in input.critters {
-        if let std::collections::btree_map::Entry::Vacant(slot) = critter_files.entry(critter.art) {
-            slot.insert(critters::checked_art(
-                critter.art,
-                &input.critter_art[critter.art],
-            )?);
+    let wanted_sets = input
+        .maps
+        .iter()
+        .flat_map(|map| map.critters.iter().map(|c| c.art))
+        .chain(figure_sets.iter().copied());
+    for art in wanted_sets {
+        if let std::collections::btree_map::Entry::Vacant(slot) = critter_files.entry(art) {
+            slot.insert(critters::checked_art(art, &input.critter_art[art])?);
         }
     }
-    let spots = if input.critters.is_empty() {
-        Vec::new()
-    } else {
-        // A critter standing in a passage would close it again.
-        let mut reserved: BTreeSet<i32> = grid_hexes.clone();
-        reserved.insert(entry);
-        reserved.extend(&return_hexes);
-        reserved.extend(&door_hexes);
-        reserved.extend(&opened);
-        let (spots, skipped) =
-            critters::place(&frame, input.critters, &walkable, &reserved, radius);
-        report.skipped_critters = skipped;
-        spots
-    };
-    let used_sets: BTreeSet<usize> = spots
+    for plan in &mut plans {
+        plan::place_critters(plan);
+    }
+    let any_spot = plans
         .iter()
-        .map(|spot| input.critters[spot.index].art)
+        .any(|p| p.elevations.iter().any(|e| !e.spots.is_empty()));
+    let used_sets: BTreeSet<usize> = plans
+        .iter()
+        .flat_map(|p| {
+            p.elevations
+                .iter()
+                .flat_map(|e| e.spots.iter().map(|s| p.input.critters[s.index].art))
+        })
+        .chain(figure_sets.iter().copied())
         .collect();
     let mut critter_list = None;
     let mut critter_ai = (0, 0);
-    if !spots.is_empty() {
+    let mut packet_note = None;
+    if any_spot || !figure_sets.is_empty() {
         let list = match input.base_files.get(CRITTER_LIST_PATH) {
             Some(bytes) => {
                 CritterList::from_base(bytes).map_err(|e| base_error(CRITTER_LIST_PATH, e))?
@@ -1117,64 +486,100 @@ pub(crate) fn build(input: &BuildInput) -> Result<Built, BuildError> {
             });
         }
         critter_list = Some(list);
-        lists.load_critters(input.base_files)?;
-        let (packet, note) = critter_packet(input)?;
-        report.notes.extend(note);
+        builder.lists.load_critters(input.base_files)?;
+        let (packet, note) = critter_packet(input.base_files, options.critter_ai_packet)?;
+        packet_note = note;
         critter_ai = (packet, options.critter_team);
-        report.critter_ai_packet = Some(packet);
-        report.critter_team = Some(options.critter_team);
     }
 
-    // The FID budget, checked before anything is written.
-    let mut unique: BTreeMap<ArtKey, usize> = BTreeMap::new();
+    // The FID budget of the whole layer, checked before anything is
+    // written.
+    let mut unique: BTreeSet<crate::layer::ArtKey> = BTreeSet::new();
     let mut new_labels: BTreeMap<u8, Vec<String>> = BTreeMap::new();
-    for (index, image) in input.art.iter().enumerate() {
-        let category = art_category(image.category);
-        let key = (
-            category,
-            image.width,
-            image.height,
-            image.shift,
-            image.pixels.clone(),
-        );
-        if let std::collections::btree_map::Entry::Vacant(slot) = unique.entry(key) {
-            slot.insert(index);
-            new_labels
-                .entry(category)
-                .or_default()
-                .push(image.source.clone());
-        } else {
-            report.art_duplicates += 1;
+    let mut duplicates = vec![0usize; plans.len()];
+    for (m, plan) in plans.iter().enumerate() {
+        for elevation in &plan.elevations {
+            for image in elevation.input.art {
+                if unique.insert(art_key(image)) {
+                    new_labels
+                        .entry(art_category(image.category))
+                        .or_default()
+                        .push(if several_maps {
+                            plan.stem.clone()
+                        } else {
+                            image.source.clone()
+                        });
+                } else {
+                    duplicates[m] += 1;
+                }
+            }
         }
     }
-    let tile_pad = RESERVED_TILES.saturating_sub(lists.art_base[&ART_TILES]);
+    let tile_pad = builder.tile_pad();
     // An interior's all-transparent library tiles are the blank tile.
-    let blank_tile: Vec<bool> = input
-        .ground
-        .tiles
+    let blank_tiles: Vec<Vec<Vec<bool>>> = plans
         .iter()
-        .map(|tile| interior.is_some() && tile.iter().all(|p| *p == 0))
+        .map(|plan| {
+            plan.elevations
+                .iter()
+                .map(|elevation| {
+                    elevation
+                        .input
+                        .ground
+                        .tiles
+                        .iter()
+                        .map(|tile| {
+                            elevation.input.interior.is_some() && tile.iter().all(|p| *p == 0)
+                        })
+                        .collect()
+                })
+                .collect()
+        })
         .collect();
-    let written_tiles = blank_tile.iter().filter(|blank| !**blank).count();
-    new_labels
-        .entry(ART_TILES)
-        .or_default()
-        .extend(std::iter::repeat_n(
-            "ground tiles".to_owned(),
-            written_tiles + tile_pad,
-        ));
+    let mut seen_tiles: BTreeSet<&[u8]> = BTreeSet::new();
+    let mut tile_labels = Vec::new();
+    for (m, plan) in plans.iter().enumerate() {
+        for (e, elevation) in plan.elevations.iter().enumerate() {
+            let mut group = Vec::new();
+            for (tile, blank) in elevation.input.ground.tiles.iter().zip(&blank_tiles[m][e]) {
+                if *blank {
+                    continue;
+                }
+                if !seen_tiles.contains(tile.as_slice()) {
+                    tile_labels.push(if several_maps {
+                        format!("{} ground tiles", plan.stem)
+                    } else {
+                        "ground tiles".to_owned()
+                    });
+                }
+                group.push(tile.as_slice());
+            }
+            seen_tiles.extend(group);
+        }
+    }
+    tile_labels.extend(std::iter::repeat_n("ground tiles".to_owned(), tile_pad));
+    new_labels.entry(ART_TILES).or_default().extend(tile_labels);
     new_labels
         .entry(ART_SCENERY)
         .or_default()
         .push("invisible blocker".into());
-    if !door_exits.is_empty() {
+    let any_grid = plans.iter().any(|p| {
+        p.elevations
+            .iter()
+            .any(|e| !e.door_exits.is_empty() || !e.links.is_empty())
+    });
+    if any_grid {
         new_labels
             .entry(ART_MISC)
             .or_default()
             .push("exit grid marker".into());
     }
+    if let Some(loot) = &loot {
+        builder.lists.load_inventory(input.base_files)?;
+        loot.budget(&mut unique, &mut new_labels);
+    }
     for (category, labels) in &new_labels {
-        let base = lists.art_base[category];
+        let base = builder.lists.art_base[category];
         let requested = base + labels.len();
         if requested > FID_INDEX_CAP {
             return Err(BuildError::FidBudget {
@@ -1187,182 +592,68 @@ pub(crate) fn build(input: &BuildInput) -> Result<Built, BuildError> {
         }
     }
 
-    // Floor tiles: the reserved positions of an empty list, then the
-    // library in order.
-    let mut tile_names = ArtNames::new("mft");
-    for _ in 0..tile_pad {
-        let blank = frm(
-            TILE_WIDTH,
-            TILE_HEIGHT,
-            vec![0; TILE_WIDTH * TILE_HEIGHT],
-            [0, 0],
-        )?;
-        lists.add_art(&mut layer, ART_TILES, &mut tile_names, blank)?;
-    }
-    let mut tile_index = Vec::with_capacity(input.ground.tiles.len());
-    for (tile, blank) in input.ground.tiles.iter().zip(&blank_tile) {
-        if *blank {
-            tile_index.push(BLANK_TILE);
-            continue;
+    // Floor tiles: the reserved positions of an empty list, then each
+    // elevation's library in order.
+    builder.pad_tiles()?;
+    let mut tile_index: Vec<Vec<Vec<u16>>> = Vec::new();
+    for (m, plan) in plans.iter().enumerate() {
+        let mut per = Vec::new();
+        for (e, elevation) in plan.elevations.iter().enumerate() {
+            per.push(builder.add_tiles(elevation.input.ground.tiles, &blank_tiles[m][e])?);
         }
-        let bytes = frm(TILE_WIDTH, TILE_HEIGHT, tile.clone(), [0, 0])?;
-        let fid = lists.add_art(&mut layer, ART_TILES, &mut tile_names, bytes)?;
-        tile_index.push(fid.base());
+        tile_index.push(per);
     }
-
-    // Sprites, one FRM per distinct image.
-    let mut names: BTreeMap<u8, ArtNames> = [
-        (ART_ITEMS, ArtNames::new("mfi")),
-        (ART_SCENERY, ArtNames::new("mfs")),
-        (ART_WALLS, ArtNames::new("mfw")),
-        (ART_MISC, ArtNames::new("mfm")),
-    ]
-    .into();
-    let mut art_fid: Vec<Fid> = Vec::with_capacity(input.art.len());
-    let mut written: BTreeMap<usize, Fid> = BTreeMap::new();
-    for image in input.art {
-        let category = art_category(image.category);
-        let key = (
-            category,
-            image.width,
-            image.height,
-            image.shift,
-            image.pixels.clone(),
-        );
-        let first = unique[&key];
-        if let Some(fid) = written.get(&first) {
-            art_fid.push(*fid);
-            continue;
+    // Sprites, one FRM per distinct image of the layer.
+    let mut art_fid: Vec<Vec<Vec<Fid>>> = Vec::new();
+    for plan in &plans {
+        let mut per = Vec::new();
+        for elevation in &plan.elevations {
+            let mut fids = Vec::with_capacity(elevation.input.art.len());
+            for image in elevation.input.art {
+                fids.push(builder.add_sprite(image)?);
+            }
+            per.push(fids);
         }
-        let (width, height, pixels) = if image.pixels.is_empty() {
-            (1, 1, vec![0])
-        } else {
-            (
-                image.width as usize,
-                image.height as usize,
-                image.pixels.clone(),
-            )
-        };
-        let bytes = frm(width, height, pixels, image.shift)?;
-        let namer = names.get_mut(&category).expect("a namer per sprite list");
-        let fid = lists.add_art(&mut layer, category, namer, bytes)?;
-        written.insert(first, fid);
-        art_fid.push(fid);
+        art_fid.push(per);
     }
-    let blocker_fid = {
-        let bytes = frm(1, 1, vec![0], [0, 0])?;
-        let namer = names.get_mut(&ART_SCENERY).expect("a scenery namer");
-        lists.add_art(&mut layer, ART_SCENERY, namer, bytes)?
-    };
-    let exit_fid = if door_exits.is_empty() {
-        None
+    let blocker_fid = builder.add_marker(ART_SCENERY)?;
+    let exit_fid = if any_grid {
+        Some(builder.add_marker(ART_MISC)?)
     } else {
-        let bytes = frm(1, 1, vec![0], [0, 0])?;
-        let namer = names.get_mut(&ART_MISC).expect("a misc namer");
-        Some(lists.add_art(&mut layer, ART_MISC, namer, bytes)?)
+        None
     };
-    for category in &lists.touched_art {
-        let added = lists.art[category].len() - lists.art_base[category];
-        report
-            .art_entries
-            .insert(directory(*category).into(), added);
+    if let Some(loot) = loot.as_mut() {
+        loot.write_art(&mut builder, &art_fid)?;
     }
-    for category in BUILD_LISTS {
-        let kept = lists.art_base[&category];
-        let len = lists.art[&category].len();
-        report.art_lists.insert(
-            directory(category).into(),
-            ArtListReport {
-                replaced: crate::budget::replaced(category, options.standalone),
-                base_entries: lists.art_base_entries[&category],
-                kept,
-                added: len - kept,
-                free_before: FID_INDEX_CAP - kept,
-                free_after: FID_INDEX_CAP - len,
-                shipped: lists.touched_art.contains(&category),
-            },
-        );
-    }
-
-    // Prototypes: one per distinct (art, role, blocking).
-    let mut prototypes: BTreeMap<(usize, Role, bool), (u32, BasicFlags)> = BTreeMap::new();
-    for placement in input.placements {
-        let blocking = effective_blocking(placement.role, placement.blocking);
-        let key = (placement.art, placement.role, blocking);
-        if prototypes.contains_key(&key) {
-            continue;
+    let mut art_entries: BTreeMap<String, usize> = BTreeMap::new();
+    let mut art_lists: BTreeMap<String, ArtListReport> = BTreeMap::new();
+    {
+        let lists = &builder.lists;
+        for category in &lists.touched_art {
+            let added = lists.art[category].len() - lists.art_base[category];
+            art_entries.insert(directory(*category).into(), added);
         }
-        let role = placement.role;
-        let fid = art_fid[placement.art];
-        let flags = object_flags(role, blocking);
-        let source = message_text(&input.art[placement.art].source, 48);
-        let name = format!("{} ({source})", role.label());
-        let description = format!("Converted from {source}.");
-        let common = |pid, message_base| ProtoCommon {
-            pid,
-            fid,
-            message_base,
-            flags,
-            material: material(role),
-        };
-        let capacity = options.container_capacity;
-        let prototype = lists.add_prototype(
-            &mut layer,
-            role_category(role),
-            common,
-            |common| match role {
-                Role::WallStrip => proto::wall(common),
-                Role::Scenery | Role::FloorPiece => proto::scenery(common),
-                Role::Door => proto::door(common, DoorSpec::default()),
-                Role::Container => proto::container(common, ItemStats::default(), capacity, false),
-                Role::Item => proto::misc_item(common, ItemStats::default()),
-            },
-            &name,
-            &description,
-        )?;
-        prototypes.insert(key, (prototype.pid, prototype.flags));
-    }
-    let blocker = lists.add_prototype(
-        &mut layer,
-        Category::Scenery,
-        |pid, message_base| ProtoCommon {
-            pid,
-            fid: blocker_fid,
-            message_base,
-            flags: BLOCKER_FLAGS,
-            material: Material::Stone,
-        },
-        proto::scenery,
-        "Impassable ground",
-        "You cannot go that way.",
-    )?;
-    let exit_flags = ObjectFlags::DECAL.bits();
-    if let Some(exit_fid) = exit_fid {
-        // Exit grids are misc PIDs 16 to 23 by number: a base list that
-        // already reaches position 16 keeps its own; a shorter one is
-        // padded with placeholder misc prototypes up to it.
-        let misc_len = lists.protos[&Category::Misc].len();
-        if misc_len < 16 {
-            let grid = proto::exit_grid(0, exit_fid, proto::NO_MESSAGE)
-                .map_err(|e| BuildError::emit("proto/misc", e))?;
-            for _ in misc_len..15 {
-                let template = grid.clone();
-                lists.add_raw_prototype(&mut layer, Category::Misc, |pid| {
-                    Ok(Prototype { pid, ..template })
-                })?;
-            }
-            let placed = lists.add_raw_prototype(&mut layer, Category::Misc, |_| Ok(grid))?;
-            if placed.pid != EXIT_GRID_PID {
-                return Err(BuildError::Input(format!(
-                    "the exit-grid prototype landed at PID {:#010x}",
-                    placed.pid
-                )));
-            }
+        for category in BUILD_LISTS {
+            let kept = lists.art_base[&category];
+            let len = lists.art[&category].len();
+            art_lists.insert(
+                directory(category).into(),
+                ArtListReport {
+                    replaced: crate::budget::replaced(category, options.standalone),
+                    base_entries: lists.art_base_entries[&category],
+                    kept,
+                    added: len - kept,
+                    free_before: FID_INDEX_CAP - kept,
+                    free_after: FID_INDEX_CAP - len,
+                    shipped: lists.touched_art.contains(&category),
+                },
+            );
         }
     }
 
     // Critter sprite sets: one list row each, in ascending art index.
     let mut set_art: BTreeMap<usize, (String, Fid)> = BTreeMap::new();
+    let mut critter_sets = Vec::new();
     if let Some(list) = critter_list.as_mut() {
         let mut next_stem = 0;
         for art in &used_sets {
@@ -1373,7 +664,8 @@ pub(crate) fn build(input: &BuildInput) -> Result<Built, BuildError> {
             let mut files = Vec::new();
             for (suffix, bytes) in &critter_files[art] {
                 let path = format!("art/critters/{stem}{suffix}.frm");
-                layer
+                builder
+                    .layer
                     .insert(&path, bytes.clone())
                     .map_err(|e| BuildError::emit(path.clone(), e))?;
                 files.push(path);
@@ -1395,7 +687,7 @@ pub(crate) fn build(input: &BuildInput) -> Result<Built, BuildError> {
             }
             let stand = stand.ok_or_else(|| BuildError::Input("no stand FID".into()))?;
             set_art.insert(*art, (stem.clone(), stand));
-            report.critter_sets.push(CritterSetReport {
+            critter_sets.push(CritterSetReport {
                 art: *art,
                 label: input.critter_art[*art].label.clone(),
                 stem,
@@ -1403,14 +695,13 @@ pub(crate) fn build(input: &BuildInput) -> Result<Built, BuildError> {
                 files,
             });
         }
-        layer
+        builder
+            .layer
             .insert(CRITTER_LIST_PATH, list.to_bytes())
             .map_err(|e| BuildError::emit(CRITTER_LIST_PATH, e))?;
-        report
-            .art_entries
-            .insert(directory(ART_CRITTERS).into(), used_sets.len());
+        art_entries.insert(directory(ART_CRITTERS).into(), used_sets.len());
         let kept = list.len() - used_sets.len();
-        report.art_lists.insert(
+        art_lists.insert(
             directory(ART_CRITTERS).into(),
             ArtListReport {
                 replaced: false,
@@ -1424,200 +715,653 @@ pub(crate) fn build(input: &BuildInput) -> Result<Built, BuildError> {
         );
     }
 
-    // Critter prototypes: one per distinct character, in placement order.
-    type CritterKey = (usize, String, String, i32, bool);
-    let mut critter_protos: BTreeMap<CritterKey, Prototype> = BTreeMap::new();
-    let mut spot_keys: Vec<CritterKey> = Vec::with_capacity(spots.len());
-    for spot in &spots {
-        let critter = &input.critters[spot.index];
-        let name = message_text(&critter.name, 128);
-        let description = critter_description(&critter.description, &name);
-        let key = (
-            critter.art,
-            name.clone(),
-            description.clone(),
-            critter.hit_points,
-            critter.female,
-        );
-        spot_keys.push(key.clone());
-        if critter_protos.contains_key(&key) {
-            continue;
-        }
-        let (stem, stand) = set_art[&critter.art].clone();
-        let mut spec = CritterSpec::human(critter.hit_points, critter_ai.0, critter_ai.1);
-        spec.female = critter.female;
-        let (prototype, file) = lists.add_prototype_file(
-            &mut layer,
-            Category::Critter,
-            |pid, message_base| ProtoCommon {
-                pid,
-                fid: stand,
-                message_base,
-                flags: ObjectFlags::SOLID,
-                material: Material::default(),
-            },
-            |common| critter_prototype(common, &spec),
-            &name,
-            &description,
-        )?;
-        report.critter_prototypes.push(CritterPrototypeReport {
-            pid: prototype.pid,
-            file,
-            stem,
-            name,
-            description,
-            hit_points: critter.hit_points,
-            female: critter.female,
-        });
-        critter_protos.insert(key, prototype);
+    // Catalogue items: one prototype per definition, after the sprite sets
+    // (armour figures) and before every other item prototype.
+    if let Some(loot) = loot.as_mut() {
+        let figures: BTreeMap<usize, Fid> = set_art
+            .iter()
+            .map(|(art, (_, stand))| (*art, *stand))
+            .collect();
+        loot.write_items(&mut builder, &figures)?;
     }
-    // The exterior map's objects: placements, blockers, exit grids.
-    let mut objects: Vec<MapObject> = Vec::new();
-    let mut next_id = 1u32;
-    let mut take_id = || {
-        let id = next_id;
-        next_id += 1;
-        id
-    };
-    for placement in input.placements {
-        let blocking = effective_blocking(placement.role, placement.blocking);
-        let (pid, flags) = prototypes[&(placement.art, placement.role, blocking)];
-        let mut object = plain_object(
-            take_id(),
-            pid,
-            art_fid[placement.art],
-            placement.hex,
-            0,
-            flags,
-        );
-        object.displacement = placement.displacement;
-        object.state = ObjectState::Other {
-            word: 0,
-            detail: match placement.role {
-                Role::Door => ObjectDetail::Door(LockFlags(0)),
-                Role::Item => ObjectDetail::Charges(0),
-                _ => ObjectDetail::Plain,
-            },
-        };
-        objects.push(object);
-    }
-    for hex in &border {
-        objects.push(plain_object(
-            take_id(),
-            blocker.pid,
-            blocker_fid,
-            *hex,
-            0,
-            blocker.flags,
-        ));
-    }
-    report.blockers = border.len();
 
-    // Stub numbering: doors sorted by form key.
-    let mut stub_numbers: BTreeMap<String, (String, u32)> = BTreeMap::new();
-    for (index, door) in stubs.keys().enumerate() {
-        let number = exterior_number
-            .checked_add(1 + index as u32)
-            .ok_or_else(|| BuildError::Input("map numbers overflow".into()))?;
-        stub_numbers.insert(door.clone(), (stub_stem(&stem, index)?, number));
-    }
-    let mut placed_grids = BTreeSet::new();
-    if let Some(exit_fid) = exit_fid {
-        for exit in &door_exits {
-            let (_, number) = &stub_numbers[&exit.door];
-            for hex in &exit.grid_hexes {
-                if placed_grids.insert(*hex) {
-                    objects.push(exit_object(
-                        take_id(),
-                        exit_fid,
-                        *hex,
-                        exit_flags,
-                        *number,
-                        STUB_ENTRY,
-                        0,
-                    ));
+    // Prototypes: per map, one per distinct (elevation, art, role,
+    // blocking), and with a catalogue per distinct extra (a reference's
+    // name, a container's capacity, a door's key); catalogue items lying
+    // on the map take their definition's prototype instead.
+    type ProtoKey = (usize, usize, Role, bool, Option<String>);
+    let mut prototypes: Vec<BTreeMap<ProtoKey, (u32, BasicFlags)>> = Vec::new();
+    for (m, plan) in plans.iter().enumerate() {
+        let mut map_protos = BTreeMap::new();
+        for (e, elevation) in plan.elevations.iter().enumerate() {
+            for placement in elevation.placements.iter() {
+                if placement.role == Role::Item
+                    && loot
+                        .as_ref()
+                        .is_some_and(|l| l.is_item(&placement.reference))
+                {
+                    continue;
+                }
+                let blocking = effective_blocking(placement.role, placement.blocking);
+                let extra = loot
+                    .as_ref()
+                    .and_then(|l| l.extra(&placement.reference, placement.role));
+                let key = (
+                    e,
+                    placement.art,
+                    placement.role,
+                    blocking,
+                    extra.as_ref().map(|x| x.label.clone()),
+                );
+                if map_protos.contains_key(&key) {
+                    continue;
+                }
+                let role = placement.role;
+                let fid = art_fid[m][e][placement.art];
+                let flags = object_flags(role, blocking);
+                let source = message_text(&elevation.input.art[placement.art].source, 48);
+                let name = format!("{} ({source})", role.label());
+                let description = format!("Converted from {source}.");
+                let common = |pid, message_base| ProtoCommon {
+                    pid,
+                    fid,
+                    message_base,
+                    flags,
+                    material: material(role),
+                };
+                let capacity = extra
+                    .as_ref()
+                    .and_then(|x| x.capacity)
+                    .unwrap_or(plan.input.options.container_capacity);
+                let door = DoorSpec {
+                    key: extra.as_ref().and_then(|x| x.key).unwrap_or(-1),
+                    ..DoorSpec::default()
+                };
+                let make = |common| match role {
+                    Role::WallStrip => proto::wall(common),
+                    Role::Scenery | Role::FloorPiece => proto::scenery(common),
+                    Role::Door => proto::door(common, door),
+                    Role::Container => {
+                        proto::container(common, ItemStats::default(), capacity, false)
+                    }
+                    Role::Item => proto::misc_item(common, ItemStats::default()),
+                };
+                let prototype = match extra.as_ref().and_then(|x| x.text.as_ref()) {
+                    Some(text) => {
+                        builder
+                            .lists
+                            .add_described(
+                                &mut builder.layer,
+                                role_category(role),
+                                common,
+                                make,
+                                text,
+                            )?
+                            .0
+                    }
+                    None => builder.lists.add_prototype(
+                        &mut builder.layer,
+                        role_category(role),
+                        common,
+                        make,
+                        &name,
+                        &description,
+                    )?,
+                };
+                map_protos.insert(key, (prototype.pid, prototype.flags));
+                if let Some(loot) = loot.as_mut() {
+                    loot.report.named_prototypes += usize::from(extra.is_some());
+                    loot.set.insert(prototype);
                 }
             }
         }
+        prototypes.push(map_protos);
     }
-    for (spot, key) in spots.iter().zip(&spot_keys) {
-        let critter = &input.critters[spot.index];
-        let prototype = &critter_protos[key];
-        let record =
-            CritterRecord::from_prototype(prototype, take_id(), spot.hex, 0, spot.orientation)
+    let blocker = builder.lists.add_prototype(
+        &mut builder.layer,
+        Category::Scenery,
+        |pid, message_base| ProtoCommon {
+            pid,
+            fid: blocker_fid,
+            message_base,
+            flags: BLOCKER_FLAGS,
+            material: Material::Stone,
+        },
+        proto::scenery,
+        "Impassable ground",
+        "You cannot go that way.",
+    )?;
+    let exit_flags = ObjectFlags::DECAL.bits();
+    if let Some(exit_fid) = exit_fid {
+        // Exit grids are misc PIDs 16 to 23 by number: a base list that
+        // already reaches position 16 keeps its own; a shorter one is
+        // padded with placeholder misc prototypes up to it.
+        let misc_len = builder.lists.protos[&Category::Misc].len();
+        if misc_len < 16 {
+            let grid = proto::exit_grid(0, exit_fid, proto::NO_MESSAGE)
+                .map_err(|e| BuildError::emit("proto/misc", e))?;
+            for _ in misc_len..15 {
+                let template = grid.clone();
+                builder
+                    .lists
+                    .add_raw_prototype(&mut builder.layer, Category::Misc, |pid| {
+                        Ok(Prototype { pid, ..template })
+                    })?;
+            }
+            let placed =
+                builder
+                    .lists
+                    .add_raw_prototype(&mut builder.layer, Category::Misc, |_| Ok(grid))?;
+            if placed.pid != EXIT_GRID_PID {
+                return Err(BuildError::Input(format!(
+                    "the exit-grid prototype landed at PID {:#010x}",
+                    placed.pid
+                )));
+            }
+        }
+    }
+
+    // Critter prototypes: one per distinct character, in placement order
+    // (maps, elevations, spots); with a catalogue, per distinct fighter
+    // spec, AI packet and team too.
+    type CritterKey = (usize, String, String, i32, bool, Option<String>);
+    let mut critter_protos: BTreeMap<CritterKey, Prototype> = BTreeMap::new();
+    let mut critter_prototypes = Vec::new();
+    let mut spot_keys: Vec<Vec<Vec<CritterKey>>> = Vec::new();
+    let ai_table = input.base_files.get(AI_TXT).map(Vec::as_slice);
+    for plan in &plans {
+        let mut per = Vec::new();
+        for elevation in &plan.elevations {
+            let mut keys = Vec::with_capacity(elevation.spots.len());
+            for spot in &elevation.spots {
+                let critter = &plan.input.critters[spot.index];
+                let name = message_text(&critter.name, 128);
+                let description = critter_description(&critter.description, &name);
+                let kit = match &loot {
+                    Some(loot) => loot.critter_proto(critter, critter_ai, ai_table)?,
+                    None => None,
+                };
+                let key = (
+                    critter.art,
+                    name.clone(),
+                    description.clone(),
+                    critter.hit_points,
+                    critter.female,
+                    kit.as_ref().map(|(label, _)| label.clone()),
+                );
+                keys.push(key.clone());
+                if critter_protos.contains_key(&key) {
+                    continue;
+                }
+                let (stem, stand) = set_art[&critter.art].clone();
+                let mut spec = CritterSpec::human(critter.hit_points, critter_ai.0, critter_ai.1);
+                spec.female = critter.female;
+                let (prototype, file) = builder.lists.add_prototype_file(
+                    &mut builder.layer,
+                    Category::Critter,
+                    |pid, message_base| ProtoCommon {
+                        pid,
+                        fid: stand,
+                        message_base,
+                        flags: ObjectFlags::SOLID,
+                        material: Material::default(),
+                    },
+                    |common| match &kit {
+                        Some((_, kit)) => kit.make(common),
+                        None => critter_prototype(common, &spec),
+                    },
+                    &name,
+                    &description,
+                )?;
+                critter_prototypes.push(CritterPrototypeReport {
+                    pid: prototype.pid,
+                    file,
+                    stem,
+                    name,
+                    description,
+                    hit_points: kit
+                        .as_ref()
+                        .map_or(critter.hit_points, |(_, kit)| kit.hit_points()),
+                    female: kit.as_ref().map_or(critter.female, |(_, kit)| kit.female()),
+                });
+                if let Some(loot) = loot.as_mut() {
+                    loot.report.critter_prototypes += usize::from(kit.is_some());
+                    loot.set.insert(prototype.clone());
+                }
+                critter_protos.insert(key, prototype);
+            }
+            per.push(keys);
+        }
+        spot_keys.push(per);
+    }
+
+    // Stub maps: per owning map, one per door (sorted by form key),
+    // numbered after every real map.
+    let mut stubs: Vec<Stub> = Vec::new();
+    let mut stub_number = numbers.iter().copied().max().unwrap_or(first_number);
+    for (m, plan) in plans.iter().enumerate() {
+        let mut doors: BTreeMap<String, (usize, Vec<usize>)> = BTreeMap::new();
+        for (e, elevation) in plan.elevations.iter().enumerate() {
+            for (i, exit) in elevation.door_exits.iter().enumerate() {
+                let entry = doors.entry(exit.door.clone()).or_insert((e, Vec::new()));
+                if entry.0 == e {
+                    entry.1.push(i);
+                }
+            }
+        }
+        for (index, (door, (e, exits))) in doors.into_iter().enumerate() {
+            stub_number = stub_number
+                .checked_add(1)
+                .ok_or_else(|| BuildError::Input("map numbers overflow".into()))?;
+            stubs.push(Stub {
+                owner: m,
+                elevation: e,
+                door,
+                exits,
+                stem: stub_stem(&plan.stem, index)?,
+                number: stub_number,
+            });
+        }
+    }
+    {
+        let mut all: BTreeMap<&str, &str> = BTreeMap::new();
+        for plan in &plans {
+            all.insert(&plan.stem, plan.input.map_name);
+        }
+        for stub in &stubs {
+            let owner = plans[stub.owner].input.map_name;
+            if let Some(other) = all.insert(&stub.stem, owner) {
+                return Err(BuildError::Input(format!(
+                    "the stub map {} of map {owner} collides with a map of {other}; rename one \
+                     of them (stub stems are a map's first four letters)",
+                    stub.stem
+                )));
+            }
+        }
+    }
+    let stub_of = |m: usize, door: &str| {
+        stubs
+            .iter()
+            .find(|s| s.owner == m && s.door == door)
+            .map(|s| s.number)
+    };
+
+    // The maps' objects and files.
+    let mut built_maps: Vec<BuiltMap> = Vec::new();
+    for (m, plan) in plans.iter().enumerate() {
+        let mut report = BuildReport {
+            interactive: plan.interactive,
+            art_duplicates: duplicates[m],
+            notes: plan.notes.clone(),
+            first_map_number: first_number,
+            ..BuildReport::default()
+        };
+        let placed_any = plan.elevations.iter().any(|e| !e.spots.is_empty());
+        if placed_any {
+            report.notes.extend(packet_note.clone());
+            report.critter_ai_packet = Some(critter_ai.0);
+            report.critter_team = Some(critter_ai.1);
+        }
+        let mut next_id = 1u32;
+        let mut take_id = || {
+            let id = next_id;
+            next_id += 1;
+            id
+        };
+        let mut counts = MapLoot {
+            file: format!("maps/{}.map", plan.stem),
+            ..MapLoot::default()
+        };
+        let mut per_objects: Vec<Vec<MapObject>> = Vec::new();
+        let mut placed_critters: Vec<(u8, PlacedCritter)> = Vec::new();
+        let mut elevation_critters: Vec<Vec<PlacedCritter>> = Vec::new();
+        for (e, elevation) in plan.elevations.iter().enumerate() {
+            let level = e as u8;
+            let mut objects: Vec<MapObject> = Vec::new();
+            for placement in elevation.placements.iter() {
+                let fid = art_fid[m][e][placement.art];
+                if let Some(loot) = loot.as_mut()
+                    && placement.role == Role::Item
+                    && loot.is_item(&placement.reference)
+                {
+                    let placed =
+                        loot.objects(placement, None, fid, level, &mut take_id, &mut counts)?;
+                    objects.extend(placed.unwrap_or_default());
+                    continue;
+                }
+                let blocking = effective_blocking(placement.role, placement.blocking);
+                let extra = loot
+                    .as_ref()
+                    .and_then(|l| l.extra(&placement.reference, placement.role));
+                let (pid, flags) = prototypes[m][&(
+                    e,
+                    placement.art,
+                    placement.role,
+                    blocking,
+                    extra.as_ref().map(|x| x.label.clone()),
+                )];
+                if let Some(loot) = loot.as_mut() {
+                    counts.named_placements +=
+                        usize::from(extra.as_ref().is_some_and(|x| x.text.is_some()));
+                    if let Some(placed) = loot.objects(
+                        placement,
+                        Some((pid, fid)),
+                        fid,
+                        level,
+                        &mut take_id,
+                        &mut counts,
+                    )? {
+                        objects.extend(placed);
+                        continue;
+                    }
+                }
+                let mut object = plain_object(
+                    take_id(),
+                    pid,
+                    art_fid[m][e][placement.art],
+                    placement.hex,
+                    level,
+                    flags,
+                );
+                object.displacement = placement.displacement;
+                object.state = ObjectState::Other {
+                    word: 0,
+                    detail: match placement.role {
+                        Role::Door => ObjectDetail::Door(LockFlags(0)),
+                        Role::Item => ObjectDetail::Charges(0),
+                        _ => ObjectDetail::Plain,
+                    },
+                };
+                objects.push(object);
+            }
+            for hex in &elevation.border {
+                objects.push(plain_object(
+                    take_id(),
+                    blocker.pid,
+                    blocker_fid,
+                    *hex,
+                    level,
+                    blocker.flags,
+                ));
+            }
+            let mut placed_grids = BTreeSet::new();
+            if let Some(exit_fid) = exit_fid {
+                for exit in &elevation.door_exits {
+                    let number = stub_of(m, &exit.door)
+                        .ok_or_else(|| BuildError::Input("an exit without its stub".into()))?;
+                    for hex in &exit.grid_hexes {
+                        if placed_grids.insert(*hex) {
+                            objects.push(exit_object(
+                                take_id(),
+                                exit_fid,
+                                *hex,
+                                level,
+                                exit_flags,
+                                number,
+                                STUB_ENTRY,
+                                0,
+                                0,
+                            ));
+                        }
+                    }
+                }
+                for link in &elevation.links {
+                    let (dm, de, to, facing) = link.to;
+                    for hex in &link.grid {
+                        if placed_grids.insert(*hex) {
+                            objects.push(exit_object(
+                                take_id(),
+                                exit_fid,
+                                *hex,
+                                level,
+                                exit_flags,
+                                plans[dm].number,
+                                to,
+                                de,
+                                facing,
+                            ));
+                        }
+                    }
+                }
+            }
+            let mut here = Vec::new();
+            for (spot, key) in elevation.spots.iter().zip(&spot_keys[m][e]) {
+                let critter = &plan.input.critters[spot.index];
+                let prototype = &critter_protos[key];
+                let record = CritterRecord::from_prototype(
+                    prototype,
+                    take_id(),
+                    spot.hex,
+                    level,
+                    spot.orientation,
+                )
                 .map_err(|e| BuildError::emit(format!("critter {}", critter.reference), e))?;
-        objects.push(
-            critter_object(&record)
-                .map_err(|e| BuildError::emit(format!("critter {}", critter.reference), e))?,
-        );
-        report.critters.push(PlacedCritter {
-            reference: critter.reference.clone(),
-            index: spot.index,
-            hex: spot.hex,
-            orientation: spot.orientation,
-            steps: spot.steps,
-            moved: spot.moved,
-            pid: prototype.pid,
-            stem: set_art[&critter.art].0.clone(),
+                let kitted = match loot.as_mut() {
+                    Some(loot) => loot.critter_object(
+                        &record,
+                        &critter.reference,
+                        &critter_files[&critter.art],
+                        &mut take_id,
+                        &mut counts,
+                    )?,
+                    None => None,
+                };
+                objects.push(match kitted {
+                    Some(object) => object,
+                    None => critter_object(&record).map_err(|e| {
+                        BuildError::emit(format!("critter {}", critter.reference), e)
+                    })?,
+                });
+                let placed = PlacedCritter {
+                    reference: critter.reference.clone(),
+                    index: spot.index,
+                    hex: spot.hex,
+                    orientation: spot.orientation,
+                    steps: spot.steps,
+                    moved: spot.moved,
+                    pid: prototype.pid,
+                    stem: set_art[&critter.art].0.clone(),
+                };
+                here.push(placed.clone());
+                placed_critters.push((level, placed));
+            }
+            elevation_critters.push(here);
+            per_objects.push(objects);
+        }
+        let total: usize = per_objects.iter().map(Vec::len).sum();
+        if total > MAX_OBJECTS {
+            return Err(BuildError::Input(format!(
+                "the map needs {total} objects; the format holds {MAX_OBJECTS}"
+            )));
+        }
+        if let Some(loot) = loot.as_mut() {
+            let records: usize = per_objects
+                .iter()
+                .map(|objects| crate::loot_build::inventory_records(objects))
+                .sum();
+            if total + records > MAX_OBJECTS {
+                return Err(BuildError::Input(format!(
+                    "map {}: {total} objects and {records} inventory records; the format reads \
+                     at most {MAX_OBJECTS} records in all",
+                    plan.input.map_name
+                )));
+            }
+            counts.inventory_records = records;
+            loot.report.maps.push(counts);
+        }
+        report.objects = total;
+        placed_critters.sort_by_key(|(_, c)| c.index);
+        report.critters = placed_critters.iter().map(|(_, c)| c.clone()).collect();
+        let critter_elevations: Vec<u8> = placed_critters.iter().map(|(e, _)| *e).collect();
+        let mut skipped_critters: Vec<_> = plan
+            .elevations
+            .iter()
+            .flat_map(|e| e.skipped_critters.iter().cloned())
+            .collect();
+        skipped_critters.sort_by_key(|s| s.index);
+        report.skipped_critters = skipped_critters;
+        report.skipped_teleports = plan
+            .elevations
+            .iter()
+            .flat_map(|e| e.skipped.iter().cloned())
+            .collect();
+        let entry = plan.entrance_hex().ok_or(BuildError::NoWalkableHex)?;
+        let mut elevations = Vec::new();
+        for (e, elevation) in plan.elevations.iter().enumerate() {
+            let main_hex = if e == plan.entrance_elevation {
+                Some(entry)
+            } else {
+                elevation.arrivals.first().map(|(hex, _)| *hex)
+            };
+            let components = component_report(
+                &per_objects[e],
+                &elevation.walkable,
+                main_hex,
+                &elevation.door_exits,
+                &elevation_critters[e],
+            );
+            if components.leaked > 0 {
+                report.notes.push(format!(
+                    "{}{} hexes that are not walkable can be walked onto from walkable ones: the \
+                     sealing border leaks",
+                    if plan.elevations.len() > 1 && e > 0 {
+                        format!("elevation {e}: ")
+                    } else {
+                        String::new()
+                    },
+                    components.leaked
+                ));
+            }
+            let readability = crate::readability::measure(
+                &elevation.verdicts,
+                &elevation.walkable,
+                &elevation.placement_blocks,
+                &elevation.cover,
+                elevation.options.entrance_box,
+            );
+            let blocked = islands::engine_blocked(&per_objects[e]);
+            let comps = islands::components(|h| !blocked[h as usize])
+                .retain_holding(|h| elevation.walkable[h as usize]);
+            elevations.push(ElevationReport {
+                elevation: e as u8,
+                band: elevation.options.interior.as_ref().map(|i| i.band()),
+                walk: elevation.stats.clone(),
+                entrance: elevation.entrance,
+                components,
+                passages: elevation.passages.clone(),
+                islands_left: elevation.islands_left.clone(),
+                opened_hexes: elevation.opened.len(),
+                blockers: elevation.border.len(),
+                objects: per_objects[e].len(),
+                readability,
+                arrivals: elevation
+                    .arrivals
+                    .iter()
+                    .map(|(hex, what)| (what.clone(), *hex, comps.of(*hex)))
+                    .collect(),
+                critters: elevation_critters[e]
+                    .iter()
+                    .map(|c| c.reference.clone())
+                    .collect(),
+            });
+        }
+        // Furniture: the footprints used, and upright art walkers can stand
+        // inside.
+        let footprints = &plan.input.options.footprints;
+        let mut furniture = FurnitureReport {
+            footprints_given: footprints.len(),
+            ..FurnitureReport::default()
+        };
+        let mut used: BTreeSet<&str> = BTreeSet::new();
+        let mut empty: BTreeSet<&str> = BTreeSet::new();
+        for (e, elevation) in plan.elevations.iter().enumerate() {
+            used.extend(elevation.footprints.used.iter().map(String::as_str));
+            empty.extend(elevation.footprints.empty.iter().map(String::as_str));
+            furniture.blocked_hexes += elevation.footprint_blocked;
+            furniture.suspects.extend(crate::furniture::suspects(
+                e as u8,
+                elevation.input.art,
+                &elevation.placements,
+                &elevation.walkable,
+                &elevation.cover,
+                footprints,
+            ));
+        }
+        furniture.footprints_used = used.len();
+        furniture.empty_footprints = empty.into_iter().map(str::to_owned).collect();
+        let main = &elevations[plan.entrance_elevation];
+        report.entrance = main.entrance.unwrap_or_default();
+        report.entry_hex = entry;
+        report.walk = main.walk.clone();
+        report.components = main.components.clone();
+        report.passages = main.passages.clone();
+        report.islands_left = main.islands_left.clone();
+        report.opened_hexes = main.opened_hexes;
+        report.blockers = main.blockers;
+        report.readability = main.readability;
+
+        // The map file.
+        let map_file = format!("{}.map", plan.stem);
+        let mut map = empty_map(&header_name(&plan.stem)?, plan.number as i32, entry)
+            .map_err(|e| BuildError::emit(map_file.clone(), e))?;
+        map.header.entry_elevation = plan.entrance_elevation as u8;
+        for (e, elevation) in plan.elevations.iter().enumerate() {
+            map.tiles[e] = Some(
+                elevation
+                    .input
+                    .ground
+                    .squares
+                    .iter()
+                    .map(|library| tile_word(floor_of(&tile_index[m][e], *library)))
+                    .collect(),
+            );
+        }
+        map.objects.total = total;
+        for (e, objects) in per_objects.into_iter().enumerate() {
+            map.objects.elevations[e] = objects;
+        }
+        builder.add_map(
+            &map_file,
+            &map,
+            plan.number,
+            plan.entrance_elevation as u8,
+            entry,
+        )?;
+        report.map_file = format!("maps/{map_file}");
+        report.map_number = plan.number;
+        built_maps.push(BuiltMap {
+            file: format!("maps/{map_file}"),
+            number: plan.number,
+            entrance_elevation: plan.entrance_elevation as u8,
+            walkable: plan.elevations.iter().map(|e| e.walkable.clone()).collect(),
+            elevations,
+            links: Vec::new(),
+            critter_elevations,
+            report,
+            furniture,
         });
     }
-    if objects.len() > MAX_OBJECTS {
-        return Err(BuildError::Input(format!(
-            "the map needs {} objects; the format holds {MAX_OBJECTS}",
-            objects.len()
-        )));
-    }
-    report.objects = objects.len();
-    report.components = component_report(&objects, &walkable, entry, &door_exits, &report);
-    if report.components.leaked > 0 {
-        report.notes.push(format!(
-            "{} hexes that are not walkable can be walked onto from walkable ones: the sealing \
-             border leaks",
-            report.components.leaked
-        ));
-    }
-
-    // The exterior map.
-    let map_file = format!("{stem}.map");
-    let mut map = empty_map(&header_name(&stem)?, exterior_number as i32, entry)
-        .map_err(|e| BuildError::emit(map_file.clone(), e))?;
-    map.tiles[0] = Some(
-        input
-            .ground
-            .squares
-            .iter()
-            .map(|library| tile_word(floor_of(&tile_index, *library)))
-            .collect(),
-    );
-    map.objects.total = objects.len();
-    map.objects.elevations[0] = objects;
-    let mut maps: Vec<(String, u32, i32)> = vec![(map_file.clone(), exterior_number, entry)];
-    let bytes = LocalWriters
-        .map(&map)
-        .map_err(|e| BuildError::emit(map_file.clone(), e))?;
-    layer
-        .insert(&format!("maps/{map_file}"), bytes)
-        .map_err(|e| BuildError::emit(map_file.clone(), e))?;
-    report.map_file = format!("maps/{map_file}");
-    report.map_number = exterior_number;
 
     // Stub maps.
-    for (door, doors) in &stubs {
-        let (stub, number) = &stub_numbers[door];
-        let first: &DoorExit = &door_exits[doors[0]];
+    for stub in &stubs {
+        let plan = &plans[stub.owner];
+        let elevation = &plan.elevations[stub.elevation];
+        let first: &DoorExit = &elevation.door_exits[stub.exits[0]];
         let exit_fid =
             exit_fid.ok_or_else(|| BuildError::Input("an exit without exit-grid art".into()))?;
         let floor = Frame::square_of_hex(first.door_hex)
-            .and_then(|square| input.ground.squares.get(square as usize))
-            .map_or(1, |library| floor_of(&tile_index, *library));
+            .and_then(|square| elevation.input.ground.squares.get(square as usize))
+            .map_or(1, |library| {
+                floor_of(&tile_index[stub.owner][stub.elevation], *library)
+            });
         let mut tiles = vec![TilePair::BLANK; 10_000];
-        for hex in exits::hexes_around(STUB_ENTRY, STUB_FLOOR_RADIUS, false) {
+        for hex in crate::exits::hexes_around(STUB_ENTRY, STUB_FLOOR_RADIUS, false) {
             if let Some(square) = Frame::square_of_hex(hex) {
                 tiles[square as usize] = tile_word(floor);
             }
         }
         let mut objects = Vec::new();
-        for (id, hex) in exits::hexes_around(STUB_ENTRY, STUB_EXIT_RADIUS, true)
+        for (id, hex) in crate::exits::hexes_around(STUB_ENTRY, STUB_EXIT_RADIUS, true)
             .into_iter()
             .enumerate()
         {
@@ -1625,34 +1369,31 @@ pub(crate) fn build(input: &BuildInput) -> Result<Built, BuildError> {
                 id as u32 + 1,
                 exit_fid,
                 hex,
+                0,
                 exit_flags,
-                exterior_number,
+                plan.number,
                 first.return_hex,
+                stub.elevation as u8,
                 first.return_orientation,
             ));
         }
-        let file = format!("{stub}.map");
-        let mut map = empty_map(&header_name(stub)?, *number as i32, STUB_ENTRY)
+        let file = format!("{}.map", stub.stem);
+        let mut map = empty_map(&header_name(&stub.stem)?, stub.number as i32, STUB_ENTRY)
             .map_err(|e| BuildError::emit(file.clone(), e))?;
         map.tiles[0] = Some(tiles);
         map.objects.total = objects.len();
         map.objects.elevations[0] = objects;
-        let bytes = LocalWriters
-            .map(&map)
-            .map_err(|e| BuildError::emit(file.clone(), e))?;
-        layer
-            .insert(&format!("maps/{file}"), bytes)
-            .map_err(|e| BuildError::emit(file.clone(), e))?;
-        maps.push((file.clone(), *number, STUB_ENTRY));
-        for index in doors {
-            let exit = &door_exits[*index];
+        builder.add_map(&file, &map, stub.number, 0, STUB_ENTRY)?;
+        let report = &mut built_maps[stub.owner].report;
+        for index in &stub.exits {
+            let exit = &elevation.door_exits[*index];
             report.exits.push(ExitReport {
                 door: exit.door.clone(),
                 door_hex: exit.door_hex,
                 interior: exit.interior.clone(),
                 interior_editor_id: exit.interior_editor_id.clone(),
                 stub_file: file.clone(),
-                stub_number: *number,
+                stub_number: stub.number,
                 grid_hexes: exit.grid_hexes.clone(),
                 grid_steps: exit.grid_steps,
                 return_hex: exit.return_hex,
@@ -1661,53 +1402,63 @@ pub(crate) fn build(input: &BuildInput) -> Result<Built, BuildError> {
             });
         }
     }
-    report
-        .exits
-        .sort_by(|a, b| a.door.cmp(&b.door).then(a.door_hex.cmp(&b.door_hex)));
+    for map in &mut built_maps {
+        map.report
+            .exits
+            .sort_by(|a, b| a.door.cmp(&b.door).then(a.door_hex.cmp(&b.door_hex)));
+    }
+
+    // Links, with whether each has a return.
+    let mut expected_one_way: BTreeSet<String> = BTreeSet::new();
+    for (m, plan) in plans.iter().enumerate() {
+        for (e, elevation) in plan.elevations.iter().enumerate() {
+            for link in &elevation.links {
+                let (dm, de, to, facing) = link.to;
+                let returns = plans[dm].elevations[usize::from(de)]
+                    .links
+                    .iter()
+                    .any(|back| back.to.0 == m && usize::from(back.to.1) == e);
+                if !returns {
+                    expected_one_way.insert(crate::verify::pair_label(
+                        &format!("{}.map", plan.stem),
+                        e as u8,
+                        &format!("{}.map", plans[dm].stem),
+                        de,
+                    ));
+                    built_maps[m].report.notes.push(format!(
+                        "{} {} leads to {} elevation {de}, but nothing there leads back",
+                        match link.kind {
+                            crate::LinkKind::Door => "door",
+                            crate::LinkKind::Stairs => "stairs",
+                        },
+                        link.from,
+                        plans[dm].stem
+                    ));
+                }
+                built_maps[m].links.push(LinkReport {
+                    kind: link.kind,
+                    from: link.from.clone(),
+                    elevation: e as u8,
+                    door_hex: link.door_hex,
+                    grid_hexes: link.grid.clone(),
+                    grid_steps: link.steps,
+                    to_file: format!("maps/{}.map", plans[dm].stem),
+                    to_number: plans[dm].number,
+                    to_elevation: de,
+                    to_hex: to,
+                    to_orientation: facing,
+                    returns,
+                });
+            }
+        }
+    }
 
     // Registration, and the map table Fallout 2 transitions read.
-    for (file, number, _) in &maps {
-        if ship_maps_txt && *number > MAX_MAP {
-            return Err(BuildError::Input(format!(
-                "map {file} would be number {number}; data/maps.txt holds numbers up to {MAX_MAP}"
-            )));
-        }
-        layer
-            .register_map(file, *number)
-            .map_err(|e| BuildError::emit("vault-mod.toml", e))?;
-    }
-    if let (true, Some(base)) = (ship_maps_txt, maps_txt) {
-        let mut text = base.clone();
-        if !text.is_empty() && !text.ends_with(b"\n") {
-            text.push(b'\n');
-        }
-        for (file, number, entry) in &maps {
-            let stem = file.trim_end_matches(".map");
-            text.extend_from_slice(
-                format!(
-                    "\n[Map {number:03}]\nmap_name={stem}\nrandom_start_point_0=elev:0, tile_num:{entry}\n"
-                )
-                .as_bytes(),
-            );
-        }
-        layer
-            .insert(MAPS_TXT, text)
-            .map_err(|e| BuildError::emit(MAPS_TXT, e))?;
-        report.maps_txt = true;
-    } else if maps_txt.is_none() {
-        report.notes.push(
-            "no base data/maps.txt: maps are registered in vault-mod.toml only (under Fallout 2 \
-             the engine resolves exit-grid map numbers through data/maps.txt)"
-                .into(),
-        );
-    }
-    report.maps = maps
-        .iter()
-        .map(|(file, number, _)| (file.clone(), *number))
-        .collect();
-
-    lists.finish(&mut layer)?;
-    for category in &lists.touched_protos {
+    let (maps_txt, maps_note) = builder.register_maps()?;
+    let maps = builder.maps();
+    builder.lists.finish(&mut builder.layer)?;
+    let mut prototype_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for category in &builder.lists.touched_protos {
         let base = input
             .base_files
             .get(&proto::prototype_list_path(*category))
@@ -1715,29 +1466,84 @@ pub(crate) fn build(input: &BuildInput) -> Result<Built, BuildError> {
                 ProtoList::from_base(*category, bytes).map(|l| l.len())
             })
             .map_err(|e| base_error(&proto::prototype_list_path(*category), e))?;
-        report.prototypes.insert(
+        prototype_counts.insert(
             category.directory().into(),
-            lists.protos[category].len() - base,
+            builder.lists.protos[category].len() - base,
         );
     }
 
-    report.verify = crate::verify_layer(&layer, input.base_files)?;
-    if let Some(interior) = interior {
-        let maps = &report.verify.maps;
-        if maps.len() != 1 || maps.iter().any(|map| map.exit_grids > 0) {
+    let verify = crate::verify_layer(&builder.layer, input.base_files)?;
+    if options.isolated {
+        let wanted = input.maps.len();
+        let grids: usize = verify.maps.iter().map(|map| map.exit_grids).sum();
+        if verify.maps.len() != wanted || grids > 0 {
+            let file = built_maps[0].report.map_file.clone();
             return Err(BuildError::verify(
-                &report.map_file,
-                format!(
-                    "an interior demo is one map without exit grids; the layer holds {} maps \
-                     and {} exit grids",
-                    maps.len(),
-                    maps.iter().map(|map| map.exit_grids).sum::<usize>()
-                ),
+                file,
+                if single {
+                    format!(
+                        "an interior demo is one map without exit grids; the layer holds {} \
+                         maps and {grids} exit grids",
+                        verify.maps.len()
+                    )
+                } else {
+                    format!(
+                        "an isolated layer holds its {wanted} maps and no exit grid; it holds {} \
+                         maps and {grids} exit grids",
+                        verify.maps.len()
+                    )
+                },
             ));
         }
-        let (near, given) = entrance_near.unwrap_or((window_centre, false));
+    }
+    let links = crate::verify_links(&builder.layer, input.base_files)?;
+    if let Some(loot) = loot.as_mut() {
+        let check = crate::verify_loot(&builder.layer, input.base_files)?;
+        if let Some(item) = loot
+            .report
+            .items
+            .iter()
+            .find(|item| check.no_inventory_art.contains(&item.pid))
+        {
+            return Err(BuildError::verify(
+                item.file.clone(),
+                format!("item {} has no inventory art", item.key),
+            ));
+        }
+        loot.report.skipped.sort();
+        loot.report.check = check;
+    }
+    let found: BTreeSet<String> = links.one_way.iter().cloned().collect();
+    if found != expected_one_way {
+        return Err(BuildError::verify(
+            "links",
+            format!(
+                "one-way links written {:?}, planned {:?}",
+                found, expected_one_way
+            ),
+        ));
+    }
+
+    // Layer-wide fields, and each interior map's own account.
+    for (m, built) in built_maps.iter_mut().enumerate() {
+        let plan = &plans[m];
+        let report = &mut built.report;
+        report.maps = maps.clone();
+        report.maps_txt = maps_txt;
+        report.notes.extend(maps_note.clone());
+        report.art_entries = art_entries.clone();
+        report.art_lists = art_lists.clone();
+        report.prototypes = prototype_counts.clone();
+        report.critter_sets = critter_sets.clone();
+        report.critter_prototypes = critter_prototypes.clone();
+        report.verify = verify.clone();
+        let Some(interior) = &plan.elevations[plan.entrance_elevation].options.interior else {
+            continue;
+        };
+        let (near, given) = plan.entrance_near.unwrap_or((plan.window_centre, false));
         let mut account = InteriorReport {
-            cells: input
+            cells: plan
+                .input
                 .cells
                 .iter()
                 .filter(|cell| cell.is_interior())
@@ -1747,10 +1553,10 @@ pub(crate) fn build(input: &BuildInput) -> Result<Built, BuildError> {
             band: interior.band(),
             entrance_near: [near[0] as f32, near[1] as f32],
             entrance_near_given: given,
-            doors: interior_doors,
+            doors: plan.listed_doors.clone(),
             ..InteriorReport::default()
         };
-        let other = |index: usize| match levels.get(index) {
+        let other = |index: usize| match plan.levels.get(index) {
             Some(CritterLevel::Other(z)) => Some(*z),
             _ => None,
         };
@@ -1767,10 +1573,11 @@ pub(crate) fn build(input: &BuildInput) -> Result<Built, BuildError> {
             })
             .cloned()
             .collect();
-        account.unknown_level = input
+        account.unknown_level = plan
+            .input
             .critters
             .iter()
-            .zip(&levels)
+            .zip(&plan.levels)
             .filter(|(_, level)| matches!(level, CritterLevel::Unknown))
             .map(|(critter, _)| critter.reference.clone())
             .collect();
@@ -1783,9 +1590,16 @@ pub(crate) fn build(input: &BuildInput) -> Result<Built, BuildError> {
         }
         report.interior = Some(account);
     }
-    Ok(Built {
-        layer,
-        walkable,
-        report,
+    let stub_list = stubs
+        .iter()
+        .map(|s| (format!("{}.map", s.stem), s.number))
+        .collect();
+    Ok(BuiltLayer {
+        layer: builder.layer,
+        maps: built_maps,
+        stubs: stub_list,
+        verify,
+        links,
+        loot: loot.map(|l| l.report),
     })
 }

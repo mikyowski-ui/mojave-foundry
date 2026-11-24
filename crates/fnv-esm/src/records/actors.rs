@@ -93,7 +93,14 @@ impl FactionRank {
     }
 }
 
-/// An NPC's `DATA` (11 bytes).
+/// An NPC's `DATA`: 11 bytes, or 25 in an older form.
+///
+/// The 25-byte form puts the fourteen skill values first, then the same
+/// health and attributes. Measured on the Fallout 3 master: two NPCs have
+/// it, both without a `DNAM`, and their 14 leading bytes sit where a skill
+/// table would (14 equal values, as a template's defaults are). Its skill
+/// values go to [`Npc::skills`] (with zero offsets) when the record has no
+/// `DNAM` of its own; encoding writes the 11-byte `DATA` and a `DNAM`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct NpcStats {
     /// Base health.
@@ -192,6 +199,14 @@ impl Npc {
     }
 
     fn decode_fields(&mut self, subs: &[SubrecordRef<'_>]) {
+        // Skill values of the older 25-byte `DATA`, used when no `DNAM`
+        // follows.
+        // A record with both keeps the 25-byte `DATA` whole in `unknown`,
+        // so that nothing is lost.
+        let mut legacy_skills: Option<[u8; 14]> = None;
+        let has_dnam = subs
+            .iter()
+            .any(|s| &s.sig.0 == b"DNAM" && s.data.len() == 28);
         decode_loop!(self, subs, |s| {
             let d = s.data;
             match &s.sig.0 {
@@ -205,6 +220,24 @@ impl Npc {
                 b"SPLO" => push(&mut self.actor_effects, one_form(d)),
                 b"CNTO" => push(&mut self.inventory, ContainerItem::parse(d)),
                 b"PKID" => push(&mut self.packages, one_form(d)),
+                b"DATA" if d.len() == 25 && !has_dnam && self.stats.is_none() => {
+                    let mut rd = Rd::new(d);
+                    let parsed = rd.arr::<14>().and_then(|skills| {
+                        let stats = NpcStats {
+                            base_health: rd.i32()?,
+                            attributes: rd.arr()?,
+                        };
+                        Some((skills, stats))
+                    });
+                    match parsed {
+                        Some((skills, stats)) => {
+                            legacy_skills = Some(skills);
+                            self.stats = Some(stats);
+                            true
+                        }
+                        None => false,
+                    }
+                }
                 b"DATA" => set(
                     &mut self.stats,
                     Rd::exact(d, 11).and_then(|mut rd| {
@@ -246,6 +279,14 @@ impl Npc {
                 _ => false,
             }
         });
+        if let Some(values) = legacy_skills
+            && self.skills.is_none()
+        {
+            self.skills = Some(NpcSkills {
+                values,
+                offsets: [0; 14],
+            });
+        }
     }
 
     fn emit_fields(&self, out: &mut Out) {

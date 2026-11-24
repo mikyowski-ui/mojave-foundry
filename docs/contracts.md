@@ -5,6 +5,17 @@ Change it first, then the code.
 
 ## 1. Source space
 
+The source game is Fallout 3 or Fallout: New Vegas (`fnv_esm::GameVariant`,
+re-exported as `mir::GameVariant` and `mojave_convert::GameVariant`). Both
+use the space, the cell grid and the plugin layout below. `mojave-convert`
+decides the game once, before extract (`mojave_convert::source::resolve`:
+the command line, then the slice, then the install's master and its `HEDR`
+version; a disagreement is an error), and passes it to
+`mir::extract_for_game`; every later stage reads it from `Inputs::game` or
+`Mir::game()`. A stage whose output depends on the game hashes
+`GameVariant::id` into its cache key from Fallout 3 on and nothing for New
+Vegas, so New Vegas keys made before both games stay valid.
+
 Positions from the source game are kept as they are stored:
 
 - right-handed, **X east, Y north, Z up**, in game units;
@@ -45,7 +56,7 @@ needs a second extract.
   cells/<worldspace>/<x>_<y>.json    exterior cells, editor id lowercase
   interiors/<editor_id>.json         interior cells, editor id lowercase
   report.md
-  manifest.json                  path → hash index and the extract inputs
+  manifest.json                  path → hash index, the extract inputs and the game (`game`)
 ```
 
 Only `crates/mir` reads or writes this directory. Other crates go through
@@ -328,6 +339,25 @@ lists, prototype message files), built from the user's own base files plus
 the new entries. An art list holds 4,096 entries **including** the base
 game's (about 1,670 walls and 1,860 scenery in a stock install). Maps are
 registered in the manifest's `[[maps]]`.
+
+**Per-game slicer profile.** `mojave_convert::map::slicer_defaults(game)`
+is the `SlicerConfig` every map run starts from: New Vegas gets
+`SlicerConfig::default()` unchanged; Fallout 3 replaces the pattern lists
+(`relief_patterns`, `flat_patterns`, `sprite_patterns`, `name_prefixes`)
+with the Capital Wasteland's. Nothing else differs.
+
+**Declutter wiring** (2026-11-23). `SlicerConfig::declutter` is `None`
+unless the run's profile (`Inputs::declutter_profile`: `--declutter`,
+else the slice's `[declutter] profile`, else
+`mojave_convert::declutter::default_profile(game)`, `off` for both games)
+is `readable`. Then it is `mojave_convert::declutter::profile`: the game's
+readable preset, the slice's `[declutter]` and `[tone]` keys over it, and
+`protected_refs` = `Records::referenced_refs()` (all of the plugin list's;
+the slicer matches only those it is handed). `BuildOptions::interactive`
+is filled in the same run only: those references, every window reference
+whose base kind is in `protected_kinds` or the default list (every item kind, so an item `protect_items = false` leaves standing stays interactive), and every teleport door. The
+profile name is in the map stage's key only when it is not `off`; the
+slice tables are in the slice's TOML, which is in the key already.
 
 ### 9.1 `map-terrain`
 

@@ -2,6 +2,7 @@
 //! terrain, the synthetic palette, the CPU renderer.
 
 mod classes;
+mod declutter;
 mod interior;
 mod ladder;
 mod landmarks;

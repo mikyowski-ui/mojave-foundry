@@ -3,6 +3,10 @@
 
 #![allow(dead_code)]
 
+pub mod mart;
+pub mod saloon;
+pub mod scenes;
+
 use std::collections::BTreeMap;
 
 use foundry_render::{Calibration, Projection};

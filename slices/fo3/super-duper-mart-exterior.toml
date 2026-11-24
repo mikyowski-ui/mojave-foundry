@@ -1,0 +1,14 @@
+# The Super-Duper Mart, outside (Fallout 3). Coordinates only: exterior
+# cell ranges and a map centre in source units, on the building in cell
+# (4, -5) (its two front doors face east at x 19,350). The cells hold the
+# window plus one cell all round, wider than the interior slice's three by
+# three, whose cells only reach the room. Run with --standalone; see
+# docs/running.md.
+name = "super-duper-mart-exterior"
+game = "fo3"
+worldspace = "Wasteland"
+plugins = ["Fallout3.esm"]
+x = [1, 6]
+y = [-7, -2]
+interior_depth = 1
+map_center = [17400.0, -16800.0]

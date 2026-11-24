@@ -35,6 +35,7 @@ mod prepare;
 mod projection;
 mod resolve;
 mod texture;
+mod tone;
 
 pub use calibration::Calibration;
 pub use cpu::CpuRenderer;
@@ -43,6 +44,7 @@ pub use gpu::{GPU_TOLERANCE, GpuRenderer, GpuTolerance};
 pub use prepare::{MAX_SAMPLES, MAX_WINDOW_SIDE};
 pub use projection::Projection;
 pub use texture::{MAX_TEXTURE_SIDE, NoTextures, Texture, TextureSource};
+pub use tone::{ClassTones, Tone};
 
 /// How an instance's colours are shaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

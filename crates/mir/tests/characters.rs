@@ -46,15 +46,16 @@ fn skeletons_and_animations_are_stored_and_linked() {
     let mir = Mir::open(&r.out).unwrap();
     let manifest = mir.manifest();
 
-    // Two skeletons (the human one and the dog's), two animations.
+    // Two skeletons (the human one and the dog's), seven animations: the
+    // stand, the walk and five combat slots.
     assert_eq!(r.summary.skeletons.referenced, 2);
     assert_eq!(r.summary.skeletons.converted, 2);
     assert_eq!(r.summary.skeletons.failed, 0);
-    assert_eq!(r.summary.animations.referenced, 2);
-    assert_eq!(r.summary.animations.converted, 2);
+    assert_eq!(r.summary.animations.referenced, 7);
+    assert_eq!(r.summary.animations.converted, 7);
     assert_eq!(r.summary.animations.failed, 0);
     assert_eq!(manifest.skeleton_info.len(), 2);
-    assert_eq!(manifest.animation_info.len(), 2);
+    assert_eq!(manifest.animation_info.len(), 7);
     for hash in manifest.skeleton_info.keys() {
         assert!(
             r.out
@@ -248,7 +249,7 @@ fn a_second_run_reuses_the_stores_and_jobs_do_not_matter() {
     assert_eq!(again.skeletons.converted, 0);
     assert_eq!(again.skeletons.reused, 2);
     assert_eq!(again.animations.converted, 0);
-    assert_eq!(again.animations.reused, 2);
+    assert_eq!(again.animations.reused, 7);
     let other = tempfile::tempdir().unwrap();
     let out = other.path().join("mir");
     extract(&r.town.options(&out, 4)).unwrap();
@@ -288,7 +289,7 @@ fn a_broken_skeleton_or_walk_is_noted_and_the_extract_goes_on() {
     let summary = extract(&town.options(&out, 2)).unwrap();
     assert_eq!(summary.skeletons.failed, 1);
     assert_eq!(summary.animations.failed, 1);
-    assert_eq!(summary.animations.converted, 1);
+    assert_eq!(summary.animations.converted, 6);
     let mir = Mir::open(&out).unwrap();
     let manifest = mir.manifest();
     let skeleton = &manifest.skeletons[mir::HUMAN_SKELETON];
@@ -335,8 +336,8 @@ fn the_report_counts_skeletons_and_animations() {
     let text = fs::read_to_string(r.out.join("report.md")).unwrap();
     for line in [
         "### Skeletons and animations",
-        "Skeletons: 2 paths, 2 converted (2 distinct files), 0 failed. Animations: 2 paths, 2 \
-         converted (2 distinct files), 0 failed. NPCs with a skeleton and both a stand and a \
+        "Skeletons: 2 paths, 2 converted (2 distinct files), 0 failed. Animations: 7 paths, 7 \
+         converted (7 distinct files), 0 failed. NPCs with a skeleton and both a stand and a \
          walk: 2 of 2.",
         "| `meshes\\characters\\_male\\skeleton.nif` | 6 | 5 | 2 |",
         "| `meshes\\characters\\_male\\locomotion\\male\\mtforward.kf` | 1.000 | 4 | yes | 2 |",
@@ -345,4 +346,75 @@ fn the_report_counts_skeletons_and_animations() {
         assert!(text.contains(line), "report lacks {line:?}\n{text}");
     }
     assert!(!text.contains("| Kind | Path | Status | Reason |"));
+}
+
+#[test]
+fn combat_slots_and_the_carried_weapon_resolve() {
+    let r = run(2);
+    let mir = Mir::open(&r.out).unwrap();
+    let sheriff = actor(&mir, &r.town.sheriff);
+    let folder = mir::HUMAN_ANIMATIONS;
+    let expected: Vec<(&str, String)> = [
+        ("1hp.attack", "1hpattackright.kf"),
+        ("1hp.stand", "1hpaim.kf"),
+        ("fall_back", "idleanims\\mt_knockdownfaceup.kf"),
+        ("punch", "h2hattackright_a.kf"),
+        ("run", "locomotion\\male\\mtfastforward.kf"),
+    ]
+    .into_iter()
+    .map(|(slot, file)| (slot, format!("{folder}{file}")))
+    .collect();
+    let paths: Vec<(&str, String)> = sheriff
+        .animation_paths
+        .iter()
+        .map(|(slot, path)| (slot.as_str(), path.clone()))
+        .collect();
+    assert_eq!(paths, expected);
+    let more = &sheriff.animations.as_ref().unwrap().more;
+    assert_eq!(
+        more.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["1hp.attack", "1hp.stand", "fall_back", "punch", "run"]
+    );
+    // The punch keeps its `Hit` text key: the contact the action frame
+    // is taken from.
+    let punch = mir.animation(&more["punch"]).unwrap();
+    assert_eq!(punch.text_key_time("hit"), Some(mir::fixture::PUNCH_HIT));
+    assert!(!punch.looping);
+
+    // The revolver is carried (animation type 3, the pistol family); no
+    // rifle model is in the data, so there is no default one, and the
+    // pistol family needs no default either.
+    assert_eq!(sheriff.weapons.len(), 1, "{:?}", sheriff.weapons);
+    let revolver = &sheriff.weapons[0];
+    assert!(revolver.carried);
+    assert_eq!(revolver.family, "1hp");
+    assert_eq!(revolver.animation_type, 3);
+    assert_eq!(revolver.path, mir::fixture::REVOLVER_MODEL);
+    assert!(revolver.mesh.is_some());
+    assert_eq!(revolver.editor_id.as_deref(), Some("MTRevolver"));
+
+    // The deputy carries nothing, and her sex picks the same files (the
+    // run falls back to the male one): the same animations.
+    let deputy = actor(&mir, &r.town.deputy);
+    assert!(deputy.weapons.is_empty());
+    assert_eq!(deputy.animations, sheriff.animations);
+}
+
+#[test]
+fn the_slot_table_names_the_families_asked_for() {
+    let slots = mir::human_animation_slots(true, &["2ha", "1hp", "1gt", "2ha"]);
+    let names: Vec<&str> = slots.iter().map(|(s, _)| s.as_str()).collect();
+    assert!(names.contains(&"run") && names.contains(&"2ha.loop") && names.contains(&"1hp.stand"));
+    // Thrown weapons have no armed set, and a family is listed once.
+    assert!(!names.iter().any(|n| n.starts_with("1gt.")));
+    assert_eq!(names.iter().filter(|n| **n == "2ha.stand").count(), 1);
+    let run = &slots.iter().find(|(s, _)| s == "run").unwrap().1;
+    assert!(
+        run[0].ends_with("locomotion\\female\\mtfastforward.kf"),
+        "{run:?}"
+    );
+    assert!(run.iter().all(|p| p.starts_with(mir::HUMAN_ANIMATIONS)));
+    assert_eq!(mir::weapon_family(6), Some("2ha"));
+    assert_eq!(mir::weapon_family(4), Some("1hp"));
+    assert_eq!(mir::weapon_family(99), None);
 }

@@ -118,6 +118,20 @@ pub(crate) fn cut(
     projection: &Projection,
     options: &CutOptions<'_>,
 ) -> Result<Cut, String> {
+    cut_with(canvas, indexed, ground, projection, options, &mut |_| {})
+}
+
+/// [`cut`], with `trim` given the final owner of every pixel (`-1` for
+/// none) before the frames are made: it may clear owners (set `-1`) to
+/// crop strips, as the foreground cutaway does.
+pub(crate) fn cut_with(
+    canvas: &Canvas,
+    indexed: &[u8],
+    ground: [i64; 2],
+    projection: &Projection,
+    options: &CutOptions<'_>,
+    trim: &mut dyn FnMut(&mut [i32]),
+) -> Result<Cut, String> {
     let mut owner = owners(canvas, ground, projection);
     let mut result = Cut::default();
     let mut counts: BTreeMap<i32, usize> = BTreeMap::new();
@@ -230,6 +244,7 @@ pub(crate) fn cut(
             *h = target;
         }
     }
+    trim(&mut owner);
     result.strips = frames(canvas, indexed, &owner, ground, &runs)?;
     result.run_hexes.sort_unstable();
     Ok(result)

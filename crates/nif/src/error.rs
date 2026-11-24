@@ -171,3 +171,13 @@ pub enum NifError {
         reason: String,
     },
 }
+
+impl NifError {
+    /// Whether the file is a NIF of another version than the one this
+    /// crate reads: a skip to count, not damage. Fallout 3's few trigger
+    /// and test meshes at Bethesda stream versions 14, 21 and 26, and its
+    /// 20.0.0.4 files, fail this way.
+    pub fn is_unsupported_version(&self) -> bool {
+        matches!(self, Self::UnsupportedVersion { .. })
+    }
+}

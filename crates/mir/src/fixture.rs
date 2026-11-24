@@ -1,7 +1,10 @@
 //! A small synthetic install to run the whole pipeline on.
 //!
 //! [`mini_town`] writes a `Data` directory with one master file and two
-//! archives, built with the parser crates' fixture builders. Everything in
+//! archives, built with the parser crates' fixture builders.
+//! [`fallout3_town`] writes a smaller Fallout 3 one (`HEDR` 0.94): a child
+//! worldspace on its parent's land, the older subrecord sizes, a terminal,
+//! a note, a package and references pointed at in every way. Everything in
 //! it is invented. It is small enough to build and extract in well under a
 //! second, and its bytes depend on nothing but this code.
 
@@ -29,6 +32,12 @@ use nif::{Block, BsShaderPpLighting, BsShaderTextureSet, NiTransformData, QuatTr
 use crate::extract::ExtractOptions;
 use crate::model::{RawStore, Slice};
 use crate::paths::FormKey;
+
+mod fallout3;
+
+pub use fallout3::{
+    CHILD_WORLDSPACE, FALLOUT3_PLUGIN, Fallout3Town, PARENT_WORLDSPACE, fallout3_town,
+};
 
 /// The plugin's file name.
 pub const PLUGIN: &str = "MiniTown.esm";
@@ -360,6 +369,152 @@ pub fn stand_kf() -> Vec<u8> {
     .to_kf()
 }
 
+/// The time of the `Hit` text key of [`punch_kf`] and [`fire_kf`].
+pub const PUNCH_HIT: f32 = 0.3;
+/// Length of [`punch_kf`].
+pub const PUNCH_DURATION: f32 = 0.8;
+/// Length of [`fall_kf`].
+pub const FALL_DURATION: f32 = 1.0;
+/// How far back along −Y the body of [`fall_kf`] ends from where it
+/// stood: the root travel a baked fall draws.
+pub const FALL_TRAVEL: f32 = 40.0;
+/// The run's stride per cycle ([`run_kf`]), units along +Y.
+pub const RUN_STRIDE: f32 = 200.0;
+/// The run's cycle, seconds.
+pub const RUN_DURATION: f32 = 0.8;
+/// The sheriff's revolver (`WEAP`, animation type 3: a one-hand pistol).
+/// Its model is the tin can's, so it converts nothing new.
+pub const REVOLVER_MODEL: &str = "meshes\\minitown\\tincan.nif";
+
+/// The hold of `Bip01 NonAccum` at hip height that every fixture
+/// animation keys.
+fn hips_track() -> KfTrack {
+    KfTrack::Keyed {
+        bone: "Bip01 NonAccum".to_owned(),
+        transform: QuatTransform {
+            translation: [0.0, 0.0, 50.0],
+            ..QuatTransform::default()
+        },
+        data: None,
+    }
+}
+
+/// The accumulation root keyed along `keys`.
+fn root_track(keys: &[(f32, [f32; 3])]) -> KfTrack {
+    KfTrack::Keyed {
+        bone: "Bip01".to_owned(),
+        transform: QuatTransform {
+            translation: [-f32::MAX; 3],
+            ..QuatTransform::default()
+        },
+        data: Some(NiTransformData {
+            translations: linear_translations(keys),
+            ..NiTransformData::default()
+        }),
+    }
+}
+
+/// A one-shot arm swing of the human skeleton: `Bip01 L UpperArm` turns a
+/// quarter about +X and back over `duration`, text keys `start`, `Hit` at
+/// `hit` and `end`; clamped (it does not loop).
+fn swing_kf(name: &str, duration: f32, hit: f32) -> Vec<u8> {
+    let q = FRAC_PI_4 / 2.0;
+    let arm = KfTrack::Keyed {
+        bone: "Bip01 L UpperArm".to_owned(),
+        transform: unset_transform(),
+        data: Some(linear_rotations(&[
+            (0.0, [1.0, 0.0, 0.0, 0.0]),
+            (hit, [q.cos(), q.sin(), 0.0, 0.0]),
+            (duration, [1.0, 0.0, 0.0, 0.0]),
+        ])),
+    };
+    KfDesc {
+        text_keys: vec![
+            (0.0, "start".to_owned()),
+            (hit, "Hit".to_owned()),
+            (duration, "end".to_owned()),
+        ],
+        cycle_type: nif::CYCLE_CLAMP,
+        ..KfDesc::new(name, duration)
+    }
+    .with_track(root_track(&[(0.0, [0.0; 3]), (duration, [0.0; 3])]))
+    .with_track(hips_track())
+    .with_track(arm)
+    .to_kf()
+}
+
+/// A punch: [`swing_kf`] of [`PUNCH_DURATION`] with its `Hit` at
+/// [`PUNCH_HIT`].
+pub fn punch_kf() -> Vec<u8> {
+    swing_kf("Punch", PUNCH_DURATION, PUNCH_HIT)
+}
+
+/// A pistol shot, as [`punch_kf`] under another name.
+pub fn fire_kf() -> Vec<u8> {
+    swing_kf("Fire", PUNCH_DURATION, PUNCH_HIT)
+}
+
+/// A looping pistol aim: the stand's root, the hips held, the arm raised.
+pub fn aim_kf() -> Vec<u8> {
+    let q = FRAC_PI_4 / 2.0;
+    let arm = KfTrack::Keyed {
+        bone: "Bip01 L UpperArm".to_owned(),
+        transform: unset_transform(),
+        data: Some(linear_rotations(&[
+            (0.0, [q.cos(), q.sin(), 0.0, 0.0]),
+            (1.0, [q.cos(), q.sin(), 0.0, 0.0]),
+        ])),
+    };
+    KfDesc::new("Aim", 1.0)
+        .with_track(root_track(&[(0.0, [0.0; 3]), (1.0, [0.0; 3])]))
+        .with_track(hips_track())
+        .with_track(arm)
+        .to_kf()
+}
+
+/// A run: the walk's shape, [`RUN_STRIDE`] units along +Y in
+/// [`RUN_DURATION`] seconds, looping.
+pub fn run_kf() -> Vec<u8> {
+    KfDesc::new("Run", RUN_DURATION)
+        .with_track(root_track(&[
+            (0.0, [0.0; 3]),
+            (RUN_DURATION, [0.0, RUN_STRIDE, 0.0]),
+        ]))
+        .with_track(hips_track())
+        .to_kf()
+}
+
+/// A fall onto the back: over [`FALL_DURATION`] the hips drop from 50 to
+/// 5 units and the spine tips a quarter turn back about +X, while the
+/// root moves [`FALL_TRAVEL`] units back along −Y; clamped.
+pub fn fall_kf() -> Vec<u8> {
+    let half = std::f32::consts::FRAC_PI_2 / 2.0;
+    let hips = KfTrack::Keyed {
+        bone: "Bip01 NonAccum".to_owned(),
+        transform: unset_transform(),
+        data: Some(NiTransformData {
+            translations: linear_translations(&[
+                (0.0, [0.0, 0.0, 50.0]),
+                (FALL_DURATION, [0.0, 0.0, 5.0]),
+            ]),
+            ..linear_rotations(&[
+                (0.0, [1.0, 0.0, 0.0, 0.0]),
+                (FALL_DURATION, [half.cos(), -half.sin(), 0.0, 0.0]),
+            ])
+        }),
+    };
+    KfDesc {
+        cycle_type: nif::CYCLE_CLAMP,
+        ..KfDesc::new("Fall", FALL_DURATION)
+    }
+    .with_track(root_track(&[
+        (0.0, [0.0; 3]),
+        (FALL_DURATION, [0.0, -FALL_TRAVEL, 0.0]),
+    ]))
+    .with_track(hips)
+    .to_kf()
+}
+
 /// Writes the synthetic install under `dir` (`dir/Data/...`) and returns
 /// what it holds.
 ///
@@ -422,6 +577,7 @@ pub fn mini_town(dir: &Path) -> MiniTown {
     const DOG: u32 = 0x888;
     const GOGGLES: u32 = 0x889;
     const TRIGGER: u32 = 0x88A;
+    const REVOLVER: u32 = 0x88B;
     const R_HOUSE: u32 = 0x900;
     const R_FENCE: u32 = 0x901;
     const R_ROCK: u32 = 0x902;
@@ -665,8 +821,17 @@ pub fn mini_town(dir: &Path) -> MiniTown {
         ContainerItem::new(HAT, 1),
         ContainerItem::new(TIN_CAN, 2),
         ContainerItem::new(VEST, 1),
+        ContainerItem::new(REVOLVER, 1),
     ];
     plugin.add(sheriff);
+    let mut dnam = vec![0u8; 136];
+    dnam[0..4].copy_from_slice(&3u32.to_le_bytes());
+    plugin.add_raw(
+        RawRecord::new(b"WEAP", REVOLVER)
+            .with(b"EDID", b"MTRevolver\0".to_vec())
+            .with(b"MODL", b"MiniTown\\TinCan.nif\0".to_vec())
+            .with(b"DNAM", dnam),
+    );
     let mut farmer = Npc::new(FARMER, "MTFarmer", "Farmer");
     farmer.common.model = Some("Characters\\_Male\\Skeleton.NIF".to_owned());
     farmer.base = Some(ActorBase {
@@ -1065,6 +1230,18 @@ pub fn mini_town(dir: &Path) -> MiniTown {
     // to the male one.
     meshes.add(crate::actors::HUMAN_STAND, &stand_kf());
     meshes.add(crate::actors::HUMAN_WALK_MALE, &walk_kf());
+    // A few combat animations under the source's names: a punch and a
+    // pistol shot with `Hit` keys, a run, a pistol aim and a fall back.
+    let folder = crate::actors::HUMAN_ANIMATIONS;
+    for (name, bytes) in [
+        ("h2hattackright_a.kf", punch_kf()),
+        ("locomotion\\male\\mtfastforward.kf", run_kf()),
+        ("idleanims\\mt_knockdownfaceup.kf", fall_kf()),
+        ("1hpaim.kf", aim_kf()),
+        ("1hpattackright.kf", fire_kf()),
+    ] {
+        meshes.add(&format!("{folder}{name}"), &bytes);
+    }
     fs::write(data.join("MiniTown - Meshes.bsa"), meshes.build()).expect("write the mesh archive");
     let sign = NodeDesc::root("Sign")
         .with_shape(quad_shape(

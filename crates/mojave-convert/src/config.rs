@@ -9,8 +9,15 @@ use vault_formats::{Dat2Archive, Palette, Vfs};
 /// Everything that can stop a stage.
 #[derive(Debug, thiserror::Error)]
 pub enum ConvertError {
-    #[error("--fnv {path}: {reason}")]
-    Fnv { path: PathBuf, reason: String },
+    /// The source install (`--game-dir`, `--fo3` or `--fnv`, whichever
+    /// named it); `game` is the game it was taken for, when known.
+    #[error("{flag} {path}: {reason}")]
+    Source {
+        flag: &'static str,
+        game: Option<mir::GameVariant>,
+        path: PathBuf,
+        reason: String,
+    },
     #[error("--f2 {path}: {reason}")]
     F2 { path: PathBuf, reason: String },
     #[error("--slice {name}: {reason}")]
@@ -35,11 +42,17 @@ impl ConvertError {
 }
 
 /// What to convert: a block of exterior cells of one worldspace, and the
-/// window of it that becomes one Fallout 2 map.
+/// window of it that becomes one Fallout 2 map, in either game.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SliceSpec {
     pub name: String,
+    /// The game the slice is for: `"fo3"` or `"fnv"` in a slice file.
+    /// Unset, it is the game whose master `plugins` starts with (see
+    /// [`SliceSpec::stated_game`]); a slice naming neither master leaves it
+    /// to the command line and the install.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "game_key")]
+    pub game: Option<mir::GameVariant>,
     /// Editor id of the worldspace.
     pub worldspace: String,
     /// Plugins in load order.
@@ -97,6 +110,35 @@ pub struct SliceSpec {
     /// Default: the room's first teleport door (lowest form key).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entrance: Option<[f32; 2]>,
+    /// `[declutter]`: the slicer's declutter and readability pass
+    /// (`crate::declutter`). Absent, the game's default profile (off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declutter: Option<crate::declutter::DeclutterSpec>,
+    /// `[tone]`: floor, props and figures tone curves over the profile's.
+    /// Needs the declutter pass on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tone: Option<crate::declutter::ToneSpec>,
+}
+
+/// `game = "fo3" | "fnv"` (the longer ids `fallout3` and `falloutnv` are
+/// read too); written as the short form.
+mod game_key {
+    use mir::GameVariant;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(game: &Option<GameVariant>, s: S) -> Result<S::Ok, S::Error> {
+        match game {
+            Some(game) => s.serialize_str(crate::source::short_id(*game)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<GameVariant>, D::Error> {
+        let text = String::deserialize(d)?;
+        text.parse::<GameVariant>().map(Some).map_err(|_| {
+            serde::de::Error::custom(format!("game {text:?}: expected \"fo3\" or \"fnv\""))
+        })
+    }
 }
 
 fn one() -> u32 {
@@ -114,6 +156,7 @@ impl Default for SliceSpec {
     fn default() -> Self {
         Self {
             name: String::new(),
+            game: None,
             worldspace: String::new(),
             plugins: Vec::new(),
             x: [0, 0],
@@ -129,12 +172,37 @@ impl Default for SliceSpec {
             hang_clearance: None,
             walk_band: None,
             entrance: None,
+            declutter: None,
+            tone: None,
         }
     }
 }
 
+/// The built-in slices: name and game. The first of each game is its
+/// default.
+pub const PRESETS: &[(&str, mir::GameVariant)] = &[
+    ("goodsprings", mir::GameVariant::FalloutNewVegas),
+    ("springvale", mir::GameVariant::Fallout3),
+];
+
+/// Springvale (Fallout 3): the town's cells and its window centre, the
+/// same as `slices/fo3/springvale.toml`.
+const SPRINGVALE_X: [i32; 2] = [-5, 0];
+const SPRINGVALE_Y: [i32; 2] = [-6, -1];
+const SPRINGVALE_CENTER: [f32; 2] = [-7_100.0, -11_200.0];
+
 impl SliceSpec {
-    /// The built-in slices, by name.
+    /// The built-in slice a run of `game` converts when `--slice` is not
+    /// given: `goodsprings` for New Vegas, `springvale` for Fallout 3.
+    pub fn default_name(game: mir::GameVariant) -> &'static str {
+        PRESETS
+            .iter()
+            .find(|(_, g)| *g == game)
+            .map_or("goodsprings", |(name, _)| name)
+    }
+
+    /// The built-in slices, by name. `goodsprings` is New Vegas's,
+    /// `springvale` Fallout 3's (also `slices/fo3/springvale.toml`).
     pub fn preset(name: &str) -> Option<Self> {
         match name {
             "goodsprings" => Some(Self {
@@ -146,6 +214,17 @@ impl SliceSpec {
                 interior_depth: 1,
                 // The centre of exterior cell (-18, 0).
                 map_center: Some([-71_680.0, 2_048.0]),
+                ..Self::default()
+            }),
+            "springvale" => Some(Self {
+                name: "springvale".to_owned(),
+                game: Some(mir::GameVariant::Fallout3),
+                worldspace: "Wasteland".to_owned(),
+                plugins: vec!["Fallout3.esm".to_owned()],
+                x: SPRINGVALE_X,
+                y: SPRINGVALE_Y,
+                interior_depth: 1,
+                map_center: Some(SPRINGVALE_CENTER),
                 ..Self::default()
             }),
             _ => None,
@@ -161,7 +240,14 @@ impl SliceSpec {
         if !path.is_file() {
             return Err(ConvertError::Slice {
                 name: name.to_owned(),
-                reason: "not a built-in slice (known: goodsprings) and not a file".to_owned(),
+                reason: format!(
+                    "not a built-in slice (known: {}) and not a file",
+                    PRESETS
+                        .iter()
+                        .map(|(n, g)| format!("{n} for {}", g.display_name()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
             });
         }
         let text = std::fs::read_to_string(path).map_err(|source| ConvertError::Io {
@@ -199,6 +285,17 @@ impl SliceSpec {
         if self.plugins.is_empty() {
             return Err("plugins is empty".to_owned());
         }
+        if let (Some(game), Some(master)) = (self.game, self.plugins_game())
+            && game != master
+        {
+            return Err(format!(
+                "game = \"{}\" ({}), but plugins start with {}, the master of {}",
+                crate::source::short_id(game),
+                game.display_name(),
+                self.plugins[0],
+                master.display_name()
+            ));
+        }
         for (axis, range) in [("x", self.x), ("y", self.y)] {
             if range[0] > range[1] {
                 return Err(format!("{axis} range is reversed"));
@@ -211,6 +308,9 @@ impl SliceSpec {
             && !center.iter().all(|v| v.is_finite())
         {
             return Err("map_center is not finite".to_owned());
+        }
+        if let Some(declutter) = &self.declutter {
+            declutter.validate(self.tone.as_ref())?;
         }
         self.validate_interior()
     }
@@ -291,6 +391,20 @@ impl SliceSpec {
         Ok(())
     }
 
+    /// The game whose master the plugin list starts with, if it does.
+    pub fn plugins_game(&self) -> Option<mir::GameVariant> {
+        self.plugins
+            .first()
+            .and_then(|p| mir::GameVariant::from_master_name(p))
+    }
+
+    /// The game this slice is for: its `game` key, else the game whose
+    /// master its plugins start with. `None` for a slice that says nothing
+    /// (a synthetic plugin list).
+    pub fn stated_game(&self) -> Option<mir::GameVariant> {
+        self.game.or_else(|| self.plugins_game())
+    }
+
     /// Whether this slice builds an interior room.
     pub fn is_interior(&self) -> bool {
         self.interior.is_some()
@@ -353,7 +467,9 @@ impl SliceSpec {
 #[derive(Debug, Clone)]
 pub struct Inputs {
     /// The source install's `Data` directory.
-    pub fnv_data: PathBuf,
+    pub data_dir: PathBuf,
+    /// The source game (`crate::source::resolve`).
+    pub game: mir::GameVariant,
     /// The Fallout 2 install directory.
     pub f2: PathBuf,
     /// Its main archive. `None` for an install that keeps everything as
@@ -375,20 +491,44 @@ pub struct Inputs {
     /// the map's. Stock maps draw the wrong walls and floors while such a
     /// layer is mounted. Default `false`; only the map stage reads it.
     pub standalone: bool,
+    /// `--declutter off|readable`: overrides the slice's declutter profile.
+    /// `None` leaves it to the slice and the game's default.
+    pub declutter: Option<String>,
 }
 
 impl Inputs {
+    /// The inputs for a source install whose game is decided from the
+    /// slice and the install (`--game-dir` without `--game`).
     pub fn new(
-        fnv: &Path,
+        source: &Path,
         f2: &Path,
         out: &Path,
         slice: SliceSpec,
         jobs: usize,
     ) -> Result<Self, ConvertError> {
-        let fnv_data = find_data_dir(fnv, &slice.plugins)?;
+        Self::for_install(
+            &crate::source::Install::any(source, None),
+            f2,
+            out,
+            slice,
+            jobs,
+        )
+    }
+
+    /// The inputs for `install`; the game is decided by
+    /// [`crate::source::resolve`].
+    pub fn for_install(
+        install: &crate::source::Install,
+        f2: &Path,
+        out: &Path,
+        slice: SliceSpec,
+        jobs: usize,
+    ) -> Result<Self, ConvertError> {
+        let resolved = crate::source::resolve(install, Some(&slice))?;
         let f2_master = find_master(f2)?;
         Ok(Self {
-            fnv_data,
+            data_dir: resolved.data_dir,
+            game: resolved.game,
             f2: f2.to_owned(),
             f2_master,
             out: out.to_owned(),
@@ -398,7 +538,41 @@ impl Inputs {
             backend: foundry_render::Backend::Cpu,
             outline: false,
             standalone: false,
+            declutter: None,
         })
+    }
+
+    /// The declutter profile name this run uses: `--declutter`, else the
+    /// slice's `[declutter] profile`, else the game's default.
+    pub fn declutter_profile(&self) -> String {
+        self.declutter
+            .clone()
+            .or_else(|| {
+                self.slice
+                    .declutter
+                    .as_ref()
+                    .and_then(|d| d.profile_name().map(str::to_owned))
+            })
+            .unwrap_or_else(|| crate::declutter::default_profile(self.game).to_owned())
+    }
+
+    /// The inputs for `install` and a `--slice` argument (a built-in name
+    /// or a TOML file), or the game's default slice when `slice` is `None`.
+    pub fn from_args(
+        install: &crate::source::Install,
+        slice: Option<&str>,
+        f2: &Path,
+        out: &Path,
+        jobs: usize,
+    ) -> Result<Self, ConvertError> {
+        let spec = match slice {
+            Some(name) => SliceSpec::resolve(name)?,
+            None => {
+                let game = crate::source::resolve(install, None)?.game;
+                SliceSpec::resolve(SliceSpec::default_name(game))?
+            }
+        };
+        Self::for_install(install, f2, out, spec, jobs)
     }
 
     /// Replaces the default calibration with the one in a TOML file.
@@ -415,6 +589,21 @@ impl Inputs {
     /// An interior slice builds a standalone demo map only: without
     /// `--standalone` it is refused, before any stage runs.
     pub fn check_mode(&self) -> Result<(), ConvertError> {
+        // Declutter keys with the pass off are refused here too, before
+        // extract, not only by the map stage.
+        if self.declutter_profile() == "off" {
+            crate::declutter::profile(
+                self.game,
+                "off",
+                self.slice.declutter.as_ref(),
+                self.slice.tone.as_ref(),
+                &std::collections::BTreeSet::new(),
+            )
+            .map_err(|reason| ConvertError::Slice {
+                name: self.slice.name.clone(),
+                reason,
+            })?;
+        }
         match &self.slice.interior {
             Some(id) if !self.standalone => Err(ConvertError::Slice {
                 name: self.slice.name.clone(),
@@ -489,28 +678,6 @@ impl Inputs {
         }
         Err(f2_error(last_error))
     }
-}
-
-/// Accepts the install root (with a `Data` directory) or the data directory
-/// itself, and checks that every plugin of the slice is there.
-fn find_data_dir(fnv: &Path, plugins: &[String]) -> Result<PathBuf, ConvertError> {
-    let error = |reason: String| ConvertError::Fnv {
-        path: fnv.to_owned(),
-        reason,
-    };
-    if !fnv.is_dir() {
-        return Err(error("not a directory".to_owned()));
-    }
-    let candidates = [fnv.join("Data"), fnv.join("data"), fnv.to_owned()];
-    for dir in &candidates {
-        if dir.is_dir() && plugins.iter().all(|p| dir.join(p).is_file()) {
-            return Ok(dir.clone());
-        }
-    }
-    Err(error(format!(
-        "no data directory here holds {}",
-        plugins.join(", ")
-    )))
 }
 
 /// The main archive, or `None` when the install is loose files only.
@@ -657,10 +824,49 @@ interior = "TestRoomInterior"
     }
 
     #[test]
+    fn a_slice_states_its_game_or_its_plugins_do() {
+        let base = "name = \"t\"\nworldspace = \"Wasteland\"\nx = [0, 0]\ny = [0, 0]\n";
+        let spec =
+            SliceSpec::from_toml(&format!("{base}plugins = [\"Fallout3.esm\"]\n")).expect("parses");
+        assert_eq!(spec.game, None);
+        assert_eq!(spec.stated_game(), Some(mir::GameVariant::Fallout3));
+        for text in ["fo3", "fallout3", "FO3"] {
+            let spec = SliceSpec::from_toml(&format!(
+                "{base}game = \"{text}\"\nplugins = [\"Fallout3.esm\"]\n"
+            ))
+            .expect("parses");
+            assert_eq!(spec.game, Some(mir::GameVariant::Fallout3));
+            // Written back in the short form, and read again.
+            assert!(
+                spec.to_toml().contains("game = \"fo3\""),
+                "{}",
+                spec.to_toml()
+            );
+            assert_eq!(SliceSpec::from_toml(&spec.to_toml()), Ok(spec));
+        }
+        // A synthetic plugin list says nothing; the key says it.
+        let spec = SliceSpec::from_toml(&format!("{base}game = \"fnv\"\nplugins = [\"T.esm\"]\n"))
+            .expect("parses");
+        assert_eq!(spec.stated_game(), Some(mir::GameVariant::FalloutNewVegas));
+        let spec = SliceSpec::from_toml(&format!("{base}plugins = [\"T.esm\"]\n")).expect("parses");
+        assert_eq!(spec.stated_game(), None);
+        // The key and the master disagree, or the key is no game.
+        let error = SliceSpec::from_toml(&format!(
+            "{base}game = \"fnv\"\nplugins = [\"Fallout3.esm\"]\n"
+        ))
+        .expect_err("a mismatch");
+        assert!(error.contains("master of Fallout 3"), "{error}");
+        let error = SliceSpec::from_toml(&format!("{base}game = \"fo4\"\nplugins = [\"T.esm\"]\n"))
+            .expect_err("no game");
+        assert!(error.contains("fo4"), "{error}");
+    }
+
+    #[test]
     fn an_interior_run_needs_standalone() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut inputs = Inputs {
-            fnv_data: dir.path().to_owned(),
+            data_dir: dir.path().to_owned(),
+            game: mir::GameVariant::FalloutNewVegas,
             f2: dir.path().to_owned(),
             f2_master: None,
             out: dir.path().to_owned(),
@@ -670,6 +876,7 @@ interior = "TestRoomInterior"
             backend: foundry_render::Backend::Cpu,
             outline: false,
             standalone: false,
+            declutter: None,
         };
         let error = inputs.check_mode().expect_err("refused").to_string();
         assert!(error.contains("--standalone"), "{error}");

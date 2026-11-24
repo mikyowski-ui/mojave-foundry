@@ -200,6 +200,20 @@ pub enum SkipReason {
     /// Interior mode: the placed bounds lie wholly below the floor band (a
     /// lower storey, a basement).
     BelowFloor,
+    /// Declutter: micro-clutter, under every size threshold
+    /// ([`crate::ClutterRules`]).
+    Clutter,
+    /// Declutter: the model matches a clutter pattern (named without a
+    /// leading `*`).
+    ClutterPattern(String),
+    /// Declutter: one too many small props in a dense pile
+    /// ([`crate::DensityRule`]).
+    ClutterDensity,
+    /// Declutter: a flat decal, dropped ([`crate::DecalMode::Drop`]).
+    Decal,
+    /// Declutter, interior mode: a beam, duct, plank or fixture hanging
+    /// over walkable hexes ([`crate::OverhangRule`]).
+    Overhang,
 }
 
 impl SkipReason {
@@ -223,7 +237,24 @@ impl SkipReason {
             SkipReason::AboveCut => "above the ceiling cut",
             SkipReason::Hanging => "hanging from the ceiling",
             SkipReason::BelowFloor => "below the floor",
+            SkipReason::Clutter => "clutter",
+            SkipReason::ClutterPattern(_) => "clutter pattern",
+            SkipReason::ClutterDensity => "clutter density",
+            SkipReason::Decal => "decal",
+            SkipReason::Overhang => "overhang",
         }
+    }
+
+    /// Whether the declutter pass gave this reason.
+    pub fn is_declutter(&self) -> bool {
+        matches!(
+            self,
+            SkipReason::Clutter
+                | SkipReason::ClutterPattern(_)
+                | SkipReason::ClutterDensity
+                | SkipReason::Decal
+                | SkipReason::Overhang
+        )
     }
 }
 
@@ -234,6 +265,7 @@ impl fmt::Display for SkipReason {
             SkipReason::Pattern(p) => write!(f, "model matches skip pattern {p:?}"),
             SkipReason::Unreadable(e) => write!(f, "mesh unreadable: {e}"),
             SkipReason::Failed(e) => write!(f, "failed: {e}"),
+            SkipReason::ClutterPattern(p) => write!(f, "model matches clutter pattern {p:?}"),
             other => f.write_str(other.label()),
         }
     }

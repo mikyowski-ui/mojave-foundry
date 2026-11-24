@@ -1,0 +1,18 @@
+# Moriarty's Saloon, Megaton (Fallout 3): an interior demo room.
+# Coordinates only: the cells of the megaton slice, through whose doors
+# extract reaches the room, and the room's cell editor id. Run with
+# --standalone; see docs/running.md.
+# Ceiling cut 120 (default 210), chosen on engine frames at 210 and 120:
+# at 210 the joists and the balcony of the upper floor cover the whole
+# room and half the floor is out of reach; at 120 the bar, its stools and
+# all six people show and every walkable hex is reached.
+name = "megaton-saloon"
+game = "fo3"
+worldspace = "MegatonWorld"
+plugins = ["Fallout3.esm"]
+x = [-2, 0]
+y = [-8, -6]
+interior_depth = 1
+interior = "MegatonMoriartysSaloon"
+place_disabled = true
+cut_height = 120.0

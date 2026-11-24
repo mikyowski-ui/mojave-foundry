@@ -30,7 +30,13 @@ pub(crate) struct CellBuild {
     /// Interior cells, sorted by id.
     pub interiors: Vec<(InteriorEntry, CellDoc)>,
     pub issues: Vec<Issue>,
+    /// Facts worth reporting that are not problems ([`crate::Manifest::notes`]).
+    pub notes: Vec<Issue>,
 }
+
+/// The bit of a worldspace's parent-use flags (`PNAM`) that says its land
+/// comes from the parent worldspace (`WNAM`).
+pub(crate) const USE_PARENT_LAND: u16 = 0x0001;
 
 /// What is known about a cell record.
 #[derive(Debug, Clone)]
@@ -80,6 +86,7 @@ struct Builder<'i, 'a> {
     default_land_texture: String,
     worlds: BTreeMap<Key, String>,
     issues: Vec<Issue>,
+    notes: Vec<Issue>,
 }
 
 fn is_placed(sig: fnv_esm::Sig) -> bool {
@@ -137,7 +144,42 @@ impl<'i, 'a> Builder<'i, 'a> {
             default_land_texture: default_land_texture.to_owned(),
             worlds: BTreeMap::new(),
             issues: Vec::new(),
+            notes: Vec::new(),
         }
+    }
+
+    fn note(&mut self, entry: &Entry<'_>, text: impl Into<String>) {
+        self.notes.push(Issue {
+            subject: self.index.form_key(entry.key).to_string(),
+            sig: Some(entry.sig().to_string()),
+            offset: Some(entry.record.offset as u64),
+            error: text.into(),
+        });
+    }
+
+    /// The first `LAND` entry among a cell's children.
+    fn land_entry(&self, cell: Key) -> Option<Entry<'a>> {
+        let index = self.index;
+        self.children
+            .get(&cell)?
+            .iter()
+            .map(|&position| index.entries()[position])
+            .find(|e| e.sig() == sigs::LAND)
+    }
+
+    /// The parent worldspace whose land a worldspace uses: its `WNAM`, when
+    /// its `PNAM` has [`USE_PARENT_LAND`] set and the parent is in the list.
+    fn land_parent(&mut self, world: Key) -> Option<Key> {
+        let index = self.index;
+        let entry = index.get(world).copied()?;
+        let Some(Record::World(record)) = self.decode(&entry) else {
+            return None;
+        };
+        let parent = record.parent.and_then(|p| index.resolve(entry.plugin, p))?;
+        let uses_land = record
+            .parent_flags
+            .is_some_and(|flags| flags & USE_PARENT_LAND != 0);
+        (uses_land && index.get(parent).is_some()).then_some(parent)
     }
 
     fn issue(&mut self, entry: &Entry<'_>, error: impl Into<String>) {
@@ -672,6 +714,53 @@ pub(crate) fn build(
         docs.insert(position, doc);
     }
 
+    // A child worldspace that uses its parent's land: a cell with no land
+    // record of its own takes the parent's at the same grid position.
+    if let Some(parent) = builder.land_parent(world) {
+        let parent_name = builder.world_name(parent);
+        let mut parent_cells: BTreeMap<(i32, i32), Key> = BTreeMap::new();
+        let keys: Vec<Key> = index
+            .entries()
+            .iter()
+            .filter(|e| e.sig() == sigs::CELL && e.world == Some(parent))
+            .map(|e| e.key)
+            .collect();
+        for key in keys {
+            if let Some(info) = builder.cell_info(key)
+                && !info.persistent
+                && let Some((x, y)) = info.grid
+                && slice.contains(x, y)
+            {
+                parent_cells.entry((x, y)).or_insert(key);
+            }
+        }
+        for (&(x, y), (key, _)) in &grid {
+            if builder.land_entry(*key).is_some() {
+                continue;
+            }
+            let Some(land_entry) = parent_cells
+                .get(&(x, y))
+                .and_then(|&cell| builder.land_entry(cell))
+            else {
+                continue;
+            };
+            if let Some(land) = builder.land(&land_entry)
+                && let Some(doc) = docs.get_mut(&(x, y))
+            {
+                let cell_entry = index.get(*key).copied();
+                let text = format!(
+                    "cell ({x}, {y}) has no land of its own; it takes the land of the parent \
+                     worldspace {parent_name} at the same position ({})",
+                    land.form
+                );
+                doc.land = Some(land);
+                if let Some(cell_entry) = cell_entry {
+                    builder.note(&cell_entry, text);
+                }
+            }
+        }
+    }
+
     // Persistent references stand in the grid cell of their position.
     for cell in persistent_cells {
         let children = builder.children.get(&cell).cloned().unwrap_or_default();
@@ -691,9 +780,12 @@ pub(crate) fn build(
                 continue;
             }
             if !docs.contains_key(&(x, y)) {
-                builder.issue(
+                builder.note(
                     &entry,
-                    format!("persistent reference stands in cell ({x}, {y}), which has no record"),
+                    format!(
+                        "persistent reference stands in cell ({x}, {y}), which has no cell \
+                         record; it is left out"
+                    ),
                 );
                 continue;
             }
@@ -768,11 +860,15 @@ pub(crate) fn build(
     let mut issues = builder.issues;
     issues.sort();
     issues.dedup();
+    let mut notes = builder.notes;
+    notes.sort();
+    notes.dedup();
     Ok(CellBuild {
         worldspace,
         exteriors,
         interiors,
         issues,
+        notes,
     })
 }
 

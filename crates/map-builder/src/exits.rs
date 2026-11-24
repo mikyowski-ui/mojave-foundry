@@ -193,16 +193,47 @@ fn surroundings(door_hex: i32, verdicts: &[Verdict]) -> String {
     }
 }
 
-/// Plan the exits of every teleporting door among `placements`; a door
-/// with no walkable neighbour looks for a doorstep up to `reach` steps
-/// out (module notes; below 2, it is skipped as before).
-pub fn plan(
+/// What a teleport door becomes, decided before its grids are searched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DoorKind {
+    /// Exit grids into a stub map of its own (a destination outside the
+    /// build).
+    Stub,
+    /// Exit grids into a map of the layer (crate notes, "Door links").
+    Link,
+}
+
+/// A teleport door's exit grids, before its destination hex is chosen.
+#[derive(Debug, Clone)]
+pub(crate) struct DoorGrid {
+    /// Index into the placements.
+    pub placement: usize,
+    pub door: String,
+    pub door_hex: i32,
+    pub teleport: mir::TeleportDoc,
+    pub cell: mir::CellRef,
+    pub grid: Vec<i32>,
+    pub steps: i32,
+    /// Where a traveller coming the other way arrives here: the partner
+    /// door's own teleport position, in this map's source coordinates.
+    pub back: Option<[f32; 3]>,
+    pub kind: DoorKind,
+}
+
+/// The exit grids of every teleporting door among `placements` (module
+/// notes): `classify` decides, from the destination cell, what each door
+/// becomes or why it is skipped; `back` finds the partner door's arrival
+/// point here. Skips come in placement order; the count of door
+/// placements whose reference the cells do not hold is returned too.
+pub(crate) fn door_grids(
     frame: &Frame,
     placements: &[Placement],
     cells: &[CellDoc],
     verdicts: &[Verdict],
     reach: i32,
-) -> (Vec<DoorExit>, Vec<SkippedTeleport>, usize) {
+    classify: impl Fn(&Placement, &mir::CellRef) -> Result<DoorKind, String>,
+    back: impl Fn(&mir::TeleportDoc, &mir::CellRef) -> Option<[f32; 3]>,
+) -> (Vec<DoorGrid>, Vec<SkippedTeleport>, usize) {
     let walkable: Vec<bool> = verdicts.iter().map(|v| *v == Verdict::Walkable).collect();
     let mut references: BTreeMap<String, &Reference> = BTreeMap::new();
     for cell in cells {
@@ -233,24 +264,17 @@ pub fn plan(
             });
             continue;
         };
-        if cell.location != CellLocation::Interior {
-            skipped.push(SkippedTeleport {
-                door: placement.reference.clone(),
-                reason: format!(
-                    "a teleport to another exterior position ({}); not converted in this pass",
-                    cell.form
-                ),
-            });
-            continue;
-        }
-        // The interior door's own teleport is where a traveller arrives
-        // outside.
-        let back = cells
-            .iter()
-            .filter(|c| c.is_interior() && c.form == cell.form)
-            .find_map(|c| c.reference(&teleport.door))
-            .and_then(|door| door.teleport.as_ref())
-            .map(|t| t.position);
+        let kind = match classify(placement, cell) {
+            Ok(kind) => kind,
+            Err(reason) => {
+                skipped.push(SkippedTeleport {
+                    door: placement.reference.clone(),
+                    reason,
+                });
+                continue;
+            }
+        };
+        let back = back(teleport, cell);
         let mut grid: Vec<i32> = neighbours(placement.hex)
             .filter(|hex| walkable[*hex as usize])
             .collect();
@@ -286,63 +310,150 @@ pub fn plan(
                 }
             }
         }
-        doors.push((index, reference, teleport, cell, grid, back, steps));
+        doors.push(DoorGrid {
+            placement: index,
+            door: placement.reference.clone(),
+            door_hex: placement.hex,
+            teleport: teleport.clone(),
+            cell: cell.clone(),
+            grid,
+            steps,
+            back,
+            kind,
+        });
     }
-    let all_grids: BTreeSet<i32> = doors.iter().flat_map(|d| d.4.iter().copied()).collect();
-    let mut exits = Vec::new();
-    for (index, _reference, _teleport, cell, grid, back, grid_steps) in doors {
-        let placement = &placements[index];
-        let door_hex = placement.hex;
-        let target = match back {
-            Some(p) if p.iter().all(|v| v.is_finite()) => {
-                Some(frame.tile_of_source(f64::from(p[0]), f64::from(p[1])))
-            }
-            _ => None,
-        };
-        let from_teleport = target.is_some();
-        let target = target.or_else(|| frame.hex_centre_tile(door_hex));
-        let Some(target) = target else {
+    (doors, skipped, unknown)
+}
+
+/// The return hex of a door on `door_hex` (module notes): the walkable hex
+/// nearest `back` (else the door), 2 to [`RETURN_RADIUS`] steps from the
+/// door, holding no grid of `grids`; and whether `back` gave the target.
+/// `None` when no hex qualifies (or the door's hex has no centre, which
+/// never happens on the grid).
+pub(crate) fn return_hex(
+    frame: &Frame,
+    walkable: &[bool],
+    door_hex: i32,
+    back: Option<[f32; 3]>,
+    grids: &BTreeSet<i32>,
+) -> Option<Result<(i32, bool), ()>> {
+    let target = match back {
+        Some(p) if p.iter().all(|v| v.is_finite()) => {
+            Some(frame.tile_of_source(f64::from(p[0]), f64::from(p[1])))
+        }
+        _ => None,
+    };
+    let from_teleport = target.is_some();
+    let target = target.or_else(|| frame.hex_centre_tile(door_hex))?;
+    let mut best: Option<(f64, i32)> = None;
+    for hex in hexes_around(door_hex, RETURN_RADIUS, false) {
+        if hex as usize >= HEXES
+            || !walkable[hex as usize]
+            || grids.contains(&hex)
+            || HexGrid::lattice_distance(door_hex, hex).unwrap_or(0) < 2
+        {
+            continue;
+        }
+        let Some(c) = frame.hex_centre_tile(hex) else {
             continue;
         };
-        let mut best: Option<(f64, i32)> = None;
-        for hex in hexes_around(door_hex, RETURN_RADIUS, false) {
-            if hex as usize >= HEXES
-                || !walkable[hex as usize]
-                || all_grids.contains(&hex)
-                || HexGrid::lattice_distance(door_hex, hex).unwrap_or(0) < 2
-            {
-                continue;
-            }
-            let Some(c) = frame.hex_centre_tile(hex) else {
-                continue;
-            };
-            let d = (c[0] - target[0]).powi(2) + (c[1] - target[1]).powi(2);
-            if best.is_none_or(|(bd, _)| d < bd) {
-                best = Some((d, hex));
-            }
+        let d = (c[0] - target[0]).powi(2) + (c[1] - target[1]).powi(2);
+        if best.is_none_or(|(bd, _)| d < bd) {
+            best = Some((d, hex));
         }
-        let Some((_, return_hex)) = best else {
+    }
+    Some(best.map(|(_, hex)| (hex, from_teleport)).ok_or(()))
+}
+
+/// The reason a door with no return hex is skipped.
+pub(crate) fn no_return_reason() -> String {
+    format!("no walkable hex 2 to {RETURN_RADIUS} steps from the door to return to")
+}
+
+/// The interior door's own teleport (`teleport.door` in the interior cell
+/// `cell` among `cells`): where a traveller arrives outside.
+pub(crate) fn interior_back(
+    cells: &[CellDoc],
+    teleport: &mir::TeleportDoc,
+    cell: &mir::CellRef,
+) -> Option<[f32; 3]> {
+    cells
+        .iter()
+        .filter(|c| c.is_interior() && c.form == cell.form)
+        .find_map(|c| c.reference(&teleport.door))
+        .and_then(|door| door.teleport.as_ref())
+        .map(|t| t.position)
+}
+
+/// Turn door grids of kind [`DoorKind::Stub`] into exits with their return
+/// hexes, `grids` being every grid hex of the elevation; skips (no return
+/// hex) are appended to `skipped` in door order.
+pub(crate) fn stub_exits(
+    frame: &Frame,
+    walkable: &[bool],
+    doors: &[DoorGrid],
+    grids: &BTreeSet<i32>,
+    skipped: &mut Vec<SkippedTeleport>,
+) -> Vec<DoorExit> {
+    let mut exits = Vec::new();
+    for door in doors.iter().filter(|d| d.kind == DoorKind::Stub) {
+        let Some(found) = return_hex(frame, walkable, door.door_hex, door.back, grids) else {
+            continue;
+        };
+        let Ok((return_hex, from_teleport)) = found else {
             skipped.push(SkippedTeleport {
-                door: placement.reference.clone(),
-                reason: format!(
-                    "no walkable hex 2 to {RETURN_RADIUS} steps from the door to return to"
-                ),
+                door: door.door.clone(),
+                reason: no_return_reason(),
             });
             continue;
         };
         exits.push(DoorExit {
-            placement: index,
-            door: placement.reference.clone(),
-            door_hex,
-            interior: cell.form.to_string(),
-            interior_editor_id: cell.editor_id.clone(),
-            grid_hexes: grid,
-            grid_steps,
+            placement: door.placement,
+            door: door.door.clone(),
+            door_hex: door.door_hex,
+            interior: door.cell.form.to_string(),
+            interior_editor_id: door.cell.editor_id.clone(),
+            grid_hexes: door.grid.clone(),
+            grid_steps: door.steps,
             return_hex,
-            return_orientation: orientation_towards(door_hex, return_hex),
+            return_orientation: orientation_towards(door.door_hex, return_hex),
             return_from_teleport: from_teleport,
         });
     }
+    exits
+}
+
+/// Plan the exits of every teleporting door among `placements`; a door
+/// with no walkable neighbour looks for a doorstep up to `reach` steps
+/// out (module notes; below 2, it is skipped as before).
+pub fn plan(
+    frame: &Frame,
+    placements: &[Placement],
+    cells: &[CellDoc],
+    verdicts: &[Verdict],
+    reach: i32,
+) -> (Vec<DoorExit>, Vec<SkippedTeleport>, usize) {
+    let (doors, mut skipped, unknown) = door_grids(
+        frame,
+        placements,
+        cells,
+        verdicts,
+        reach,
+        |_, cell| {
+            if cell.location == CellLocation::Interior {
+                Ok(DoorKind::Stub)
+            } else {
+                Err(format!(
+                    "a teleport to another exterior position ({}); not converted in this pass",
+                    cell.form
+                ))
+            }
+        },
+        |teleport, cell| interior_back(cells, teleport, cell),
+    );
+    let walkable: Vec<bool> = verdicts.iter().map(|v| *v == Verdict::Walkable).collect();
+    let all_grids: BTreeSet<i32> = doors.iter().flat_map(|d| d.grid.iter().copied()).collect();
+    let exits = stub_exits(frame, &walkable, &doors, &all_grids, &mut skipped);
     (exits, skipped, unknown)
 }
 

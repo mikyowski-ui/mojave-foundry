@@ -1,0 +1,14 @@
+# The Super-Duper Mart (Fallout 3): an interior demo room. Coordinates
+# only: the exterior cells through whose doors extract reaches the room
+# (both front doors are in cell (4, -5)), and the room's cell editor id.
+# Run with --standalone; see docs/running.md. Everyone the data places is
+# placed (the raiders start enabled; the setting matches the saloons).
+name = "super-duper-mart"
+game = "fo3"
+worldspace = "Wasteland"
+plugins = ["Fallout3.esm"]
+x = [3, 5]
+y = [-6, -4]
+interior_depth = 1
+interior = "SuperDuperMart"
+place_disabled = true

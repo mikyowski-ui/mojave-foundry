@@ -139,6 +139,21 @@ impl<'a> Plugin<'a> {
         &self.header
     }
 
+    /// The game this plugin was made for, from its `HEDR` version and its
+    /// file name `file_name`; `overridden` wins when given. See
+    /// [`crate::GameVariant::detect`].
+    ///
+    /// # Errors
+    ///
+    /// [`EsmError::UnknownGame`] and [`EsmError::GameMismatch`].
+    pub fn detect_game(
+        &self,
+        file_name: &str,
+        overridden: Option<crate::GameVariant>,
+    ) -> Result<crate::GameVariant, EsmError> {
+        crate::GameVariant::detect(&self.header, file_name, overridden)
+    }
+
     /// The whole file.
     pub fn bytes(&self) -> &'a [u8] {
         self.data

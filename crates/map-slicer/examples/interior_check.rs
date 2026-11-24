@@ -18,6 +18,17 @@
 //!   look closer).
 //! - `SLICER_OUT`: output directory, which must sit under the workspace's
 //!   ignored `out/` (default `out/interiors/scratch-slicer`).
+//! - `SLICER_DECLUTTER`: `readable` compares interior mode without and
+//!   with `DeclutterProfile::readable()` instead of interior and plain
+//!   (`items` adds a third run with carried items unprotected). Both runs
+//!   get the navmesh hexes in the floor band as open hexes, as the map
+//!   stage gives them, within `SLICER_WALK=low,high` of the floor (default
+//!   `-40,100`). `SLICER_KERB`, `SLICER_SHELL_CUT` override the preset's
+//!   kerb and shell cut; `SLICER_BAND=low,high` the floor band.
+//! - `SLICER_ZOOM`: draw every pixel n x n (1 to 8), to look closer.
+//! - `SLICER_MARKS`: also write `<cell>-<run>-marks.png`, the picture with
+//!   every walkable hex marked: green when open, red when hidden behind
+//!   upright art, yellow when an object stands on it.
 //!
 //! Writes `<cell>-interior.png` (interior mode) and `<cell>-plain.png` (the
 //! same references sliced as an exterior with no land, as before interior
@@ -29,8 +40,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use foundry_render::{Calibration, CpuRenderer, Projection};
+use std::collections::BTreeSet;
+
 use map_slicer::{
-    ArtImage, Budget, InteriorSlice, MirAssets, Placement, SkipReason, Sliced, SlicerConfig,
+    ArtImage, Budget, DeclutterProfile, InteriorSlice, MirAssets, Placement, SkipReason, Sliced,
+    SlicerConfig,
 };
 use mir::{GroundSampler, MapWindow, Mir};
 use quantize::PaletteMap;
@@ -102,6 +116,22 @@ fn run() -> Result<(), String> {
     if let Ok(v) = std::env::var("SLICER_CUT") {
         interior.cut_height = v.trim().parse().map_err(|e| format!("SLICER_CUT: {e}"))?;
     }
+    let pair = |name: &str| -> Result<Option<[f32; 2]>, String> {
+        let Ok(text) = std::env::var(name) else {
+            return Ok(None);
+        };
+        let v: Vec<f32> = text
+            .split(',')
+            .map(|v| v.trim().parse::<f32>().map_err(|e| format!("{name}: {e}")))
+            .collect::<Result<_, _>>()?;
+        <[f32; 2]>::try_from(v)
+            .map(Some)
+            .map_err(|_| format!("{name}: two numbers"))
+    };
+    if let Some(band) = pair("SLICER_BAND")? {
+        interior.floor_band = band;
+    }
+    let walk = pair("SLICER_WALK")?.unwrap_or([-40.0, 100.0]);
     // The window centred on the navmesh (or the references without one).
     let points: Vec<[f32; 2]> = if vertices.is_empty() {
         doc.references
@@ -149,16 +179,67 @@ fn run() -> Result<(), String> {
         ),
         Err(_) => None,
     };
-    for (name, config) in [
-        (
-            "interior",
-            SlicerConfig {
-                interior: Some(interior.clone()),
-                ..SlicerConfig::default()
-            },
-        ),
-        ("plain", SlicerConfig::default()),
-    ] {
+    let mode = std::env::var("SLICER_DECLUTTER").unwrap_or_default();
+    let marks = std::env::var_os("SLICER_MARKS").is_some();
+    let runs: Vec<(&str, SlicerConfig)> = if mode.is_empty() || mode == "off" {
+        vec![
+            (
+                "interior",
+                SlicerConfig {
+                    interior: Some(interior.clone()),
+                    ..SlicerConfig::default()
+                },
+            ),
+            ("plain", SlicerConfig::default()),
+        ]
+    } else {
+        let open = navmesh_hexes(&doc, &projection, &window, floor_z, walk);
+        println!("{} navmesh hexes in the floor band", open.len());
+        let base = SlicerConfig {
+            interior: Some(interior.clone()),
+            open_hexes: open,
+            ..SlicerConfig::default()
+        };
+        let mut profile = DeclutterProfile::readable();
+        if let Ok(v) = std::env::var("SLICER_KERB")
+            && let Some(c) = &mut profile.cutaway
+        {
+            c.kerb_height = v.trim().parse().map_err(|e| format!("SLICER_KERB: {e}"))?;
+        }
+        if let Ok(v) = std::env::var("SLICER_SHELL_CUT")
+            && let Some(c) = &mut profile.shell_cut
+        {
+            c.cut_height = v
+                .trim()
+                .parse()
+                .map_err(|e| format!("SLICER_SHELL_CUT: {e}"))?;
+        }
+        let mut runs = vec![
+            ("before", base.clone()),
+            (
+                "readable",
+                SlicerConfig {
+                    declutter: Some(profile.clone()),
+                    ..base.clone()
+                },
+            ),
+        ];
+        if mode == "items" {
+            let mut items = profile;
+            items
+                .protected_kinds
+                .retain(|k| !matches!(k.as_str(), "MISC" | "ALCH"));
+            runs.push((
+                "readable-items",
+                SlicerConfig {
+                    declutter: Some(items),
+                    ..base
+                },
+            ));
+        }
+        runs
+    };
+    for (name, config) in runs {
         let sliced = map_slicer::slice_with(
             &assets,
             &doc.references,
@@ -178,7 +259,8 @@ fn run() -> Result<(), String> {
             if matches!(
                 s.reason,
                 SkipReason::AboveCut | SkipReason::Hanging | SkipReason::BelowFloor
-            ) {
+            ) || s.reason.is_declutter()
+            {
                 let key = (s.reason.label(), s.model.clone().unwrap_or_default());
                 *by.entry(key).or_default() += 1;
             }
@@ -187,10 +269,145 @@ fn run() -> Result<(), String> {
             println!("  {n:>3}  {reason:<24}  {model}");
         }
         let path = out.join(format!("{stem}-{name}.png"));
-        picture(&sliced, &palette, &path, crop.as_deref())?;
+        picture(&sliced, &palette, &path, crop.as_deref(), None)?;
         println!("picture in {}", path.display());
+        if marks && !config.open_hexes.is_empty() {
+            let cover = map_slicer::walker_cover(&sliced, &config.open_hexes, [48, 80], 960);
+            let occupied: BTreeSet<i32> = sliced
+                .placements
+                .iter()
+                .filter(|p| {
+                    !matches!(
+                        p.role,
+                        map_slicer::Role::WallStrip | map_slicer::Role::FloorPiece
+                    )
+                })
+                .map(|p| p.hex)
+                .collect();
+            let dots: Vec<(i32, [u8; 4])> = cover
+                .walkable
+                .iter()
+                .map(|&h| {
+                    let colour = if cover.hidden.contains(&h) {
+                        [230, 40, 40, 255]
+                    } else if occupied.contains(&h) {
+                        [230, 210, 40, 255]
+                    } else {
+                        [40, 220, 80, 255]
+                    };
+                    (h, colour)
+                })
+                .collect();
+            // Who hides the hidden walkers: the placement with the most
+            // pixels in each one's box, by model.
+            let models: BTreeMap<String, String> = doc
+                .references
+                .iter()
+                .map(|r| (r.form.to_string(), r.model.clone().unwrap_or_default()))
+                .collect();
+            let mut hiders: BTreeMap<String, usize> = BTreeMap::new();
+            for &h in &cover.hidden {
+                let Ok(c) = HexGrid::default().hex_center(h) else {
+                    continue;
+                };
+                let b = [c[0] - 24, c[1] - 79, c[0] + 23, c[1]];
+                let mut best: Option<(usize, &str)> = None;
+                for p in sliced.placements.iter().filter(|p| p.hex > h) {
+                    let a = &sliced.art[p.art];
+                    let o = origin(a, p);
+                    let mut n = 0;
+                    for y in b[1].max(o[1])..=b[3].min(o[1] + i64::from(a.height) - 1) {
+                        for x in b[0].max(o[0])..=b[2].min(o[0] + i64::from(a.width) - 1) {
+                            if a.pixels[((y - o[1]) * i64::from(a.width) + x - o[0]) as usize] != 0
+                            {
+                                n += 1;
+                            }
+                        }
+                    }
+                    if n > 0 && best.is_none_or(|(m, _)| n > m) {
+                        best = Some((n, &p.reference));
+                    }
+                }
+                if let Some((_, r)) = best {
+                    let model = models.get(r).cloned().unwrap_or_default();
+                    *hiders.entry(model).or_default() += 1;
+                }
+            }
+            let mut hiders: Vec<(usize, String)> =
+                hiders.into_iter().map(|(m, n)| (n, m)).collect();
+            hiders.sort_by(|a, b| b.cmp(a));
+            println!("hidden walkers by the model hiding them most:");
+            for (n, m) in hiders.iter().take(12) {
+                println!("  {n:>4}  {m}");
+            }
+            let path = out.join(format!("{stem}-{name}-marks.png"));
+            picture(&sliced, &palette, &path, crop.as_deref(), Some(&dots))?;
+            println!("marks in {}", path.display());
+        }
     }
     Ok(())
+}
+
+/// Hexes whose centre lies on a navmesh triangle within the walk band
+/// (`[low, high]` above the floor).
+fn navmesh_hexes(
+    doc: &mir::CellDoc,
+    projection: &Projection,
+    window: &MapWindow,
+    floor_z: f32,
+    walk: [f32; 2],
+) -> BTreeSet<i32> {
+    let grid = HexGrid::default();
+    let centres: Vec<(i32, [f64; 2])> = (0..40_000)
+        .filter_map(|h| {
+            let c = grid.hex_center(h).ok()?;
+            Some((h, [c[0] as f64, c[1] as f64]))
+        })
+        .collect();
+    let mut out = BTreeSet::new();
+    for n in &doc.navmeshes {
+        for t in 0..n.triangles.len() {
+            let Some(corners) = n.corners(t) else {
+                continue;
+            };
+            if corners
+                .iter()
+                .any(|c| c[2] < floor_z + walk[0] || c[2] > floor_z + walk[1])
+            {
+                continue;
+            }
+            let s = corners.map(|c| {
+                let anchor = [window.x_west, window.y_north, c[2]];
+                let p = projection.screen(projection.tile_from_source(anchor, c));
+                [f64::from(p[0]), f64::from(p[1])]
+            });
+            let lo = [
+                s[0][0].min(s[1][0]).min(s[2][0]),
+                s[0][1].min(s[1][1]).min(s[2][1]),
+            ];
+            let hi = [
+                s[0][0].max(s[1][0]).max(s[2][0]),
+                s[0][1].max(s[1][1]).max(s[2][1]),
+            ];
+            let side = |a: [f64; 2], b: [f64; 2], p: [f64; 2]| {
+                (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
+            };
+            for &(h, p) in &centres {
+                if p[0] < lo[0] || p[0] > hi[0] || p[1] < lo[1] || p[1] > hi[1] {
+                    continue;
+                }
+                let d = [
+                    side(s[0], s[1], p),
+                    side(s[1], s[2], p),
+                    side(s[2], s[0], p),
+                ];
+                if d.iter().all(|v| *v >= 0.0) || d.iter().all(|v| *v <= 0.0) {
+                    out.insert(h);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Engine placement of a frame's pixel (0, 0).
@@ -209,6 +426,7 @@ fn picture(
     palette: &Palette,
     path: &Path,
     crop: Option<&[f64]>,
+    dots: Option<&[(i32, [u8; 4])]>,
 ) -> Result<(), String> {
     let mut b = [i64::MAX, i64::MAX, i64::MIN, i64::MIN];
     let mut grow = |x0: i64, y0: i64, w: i64, h: i64| {
@@ -234,6 +452,39 @@ fn picture(
     }
     if b[0] >= b[2] {
         return Err("nothing drawn".into());
+    }
+    // `SLICER_PROBE=fx,fy`: list what is drawn at that point (fractions of
+    // the whole picture, as for the crop).
+    if let Ok(text) = std::env::var("SLICER_PROBE") {
+        let f: Vec<f64> = text
+            .split(',')
+            .filter_map(|v| v.trim().parse().ok())
+            .collect();
+        if let [fx, fy] = f[..] {
+            let (w, h) = ((b[2] - b[0]) as f64, (b[3] - b[1]) as f64);
+            let (px, py) = (b[0] + (w * fx) as i64, b[1] + (h * fy) as i64);
+            println!("probe ({px}, {py}):");
+            for p in &sliced.placements {
+                let a = &sliced.art[p.art];
+                let o = origin(a, p);
+                let (x, y) = (px - o[0], py - o[1]);
+                if x >= 0
+                    && y >= 0
+                    && x < i64::from(a.width)
+                    && y < i64::from(a.height)
+                    && a.pixels[(y * i64::from(a.width) + x) as usize] != 0
+                {
+                    println!(
+                        "  {:?} hex {} {} {} ({})",
+                        p.role,
+                        p.hex,
+                        p.reference,
+                        a.source,
+                        if p.blocking { "blocks" } else { "open" }
+                    );
+                }
+            }
+        }
     }
     if let Some([fx0, fy0, fx1, fy1]) = crop.and_then(|c| <[f64; 4]>::try_from(c).ok()) {
         let (w, h) = ((b[2] - b[0]) as f64, (b[3] - b[1]) as f64);
@@ -281,6 +532,34 @@ fn picture(
             }
         }
     }
+    for &(hex, colour) in dots.unwrap_or(&[]) {
+        let Ok(c) = HexGrid::default().hex_center(hex) else {
+            continue;
+        };
+        for dy in -2..=2 {
+            for dx in -3..=3 {
+                put(c[0] + dx, c[1] + dy, colour);
+            }
+        }
+    }
+    // `SLICER_ZOOM=n`: every pixel n x n, to look closer.
+    let zoom: usize = std::env::var("SLICER_ZOOM")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|z| (1..=8).contains(z))
+        .unwrap_or(1);
+    let (rgba, w, h) = if zoom == 1 {
+        (rgba, w, h)
+    } else {
+        let mut big = vec![0u8; w * h * zoom * zoom * 4];
+        for y in 0..h * zoom {
+            for x in 0..w * zoom {
+                let (k, j) = ((y / zoom * w + x / zoom) * 4, (y * w * zoom + x) * 4);
+                big[j..j + 4].copy_from_slice(&rgba[k..k + 4]);
+            }
+        }
+        (big, w * zoom, h * zoom)
+    };
     let png = foundry_gallery::encode_png(&rgba, w as u32, h as u32).map_err(|e| e.to_string())?;
     std::fs::write(path, png).map_err(|e| format!("{}: {e}", path.display()))
 }

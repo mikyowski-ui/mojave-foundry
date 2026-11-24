@@ -19,6 +19,23 @@ use crate::paths::FormKey;
 /// skeleton's folder.
 pub const SCHEMA_VERSION: u32 = 2;
 
+/// Version of the tables in `records.sqlite`, within one
+/// [`SCHEMA_VERSION`]. Additions that leave every JSON document as it was
+/// raise this number instead: `extract` rebuilds a `records.sqlite` whose
+/// manifest records an older revision, and the reader methods of a table
+/// an older file lacks return [`crate::MirError::MissingTable`].
+///
+/// 1: the game (`meta.game`), terminals, notes, packages, actor packages,
+/// script and quest-target references, and the weapon combat columns.
+/// A manifest without the field is revision 0.
+pub const RECORDS_REVISION: u32 = 1;
+
+/// The game a directory written before [`Manifest::game`] existed came
+/// from: every such directory was extracted from New Vegas.
+pub(crate) fn legacy_game() -> fnv_esm::GameVariant {
+    fnv_esm::GameVariant::FalloutNewVegas
+}
+
 /// Side of an exterior cell, in game units.
 pub const CELL_UNITS: f32 = 4096.0;
 
@@ -785,6 +802,41 @@ pub struct ActorAnimations {
     pub stand: String,
     /// The forward walk.
     pub walk: String,
+    /// Every further animation that converted, by slot name
+    /// ([`crate::actors::human_animation_slots`]: `run`, `hit_front`,
+    /// `1hp.attack`, ...). Empty in a document written before slots
+    /// existed; a renderer then has only the stand and the walk.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub more: BTreeMap<String, String>,
+}
+
+/// A weapon an actor holds or can be shown holding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActorWeapon {
+    /// The weapon record; `None` for a default model chosen by class.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form: Option<FormKey>,
+    /// Its editor id, as stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_id: Option<String>,
+    /// The model path, normalised.
+    pub path: String,
+    /// Content hash of the model (`meshes/<hash>.glb`); `None` when it is
+    /// missing or does not convert.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh: Option<String>,
+    /// The weapon's animation type as stored in its `DNAM` (0 hand to
+    /// hand, 1 one-hand melee, 2 two-hand melee, 3 and 4 pistols, 5 rifle,
+    /// 6 automatic rifle, 7 energy rifle, 8 heavy, 9 launcher, 10 to 13
+    /// thrown and mines); for a default, the type its family stands for.
+    pub animation_type: u32,
+    /// The source's animation family the type selects
+    /// ([`crate::actors::weapon_family`]): the file prefix of its
+    /// animations (`1hp`, `2hr`, ...).
+    pub family: String,
+    /// Whether the actor carries it (its first weapon in inventory
+    /// order); `false` for a default model of a family.
+    pub carried: bool,
 }
 
 /// `actors/<form>.json`: one placed actor base after its templates and
@@ -830,6 +882,16 @@ pub struct ActorDoc {
     /// The forward walk's path for the actor's sex, normalised; humans only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub walk_path: Option<String>,
+    /// The further animations found in the data, by slot: the path the
+    /// slot table chose for the actor's game and sex, normalised; humans
+    /// only. The converted ones are in [`ActorAnimations::more`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub animation_paths: BTreeMap<String, String>,
+    /// The weapon the actor carries, if any, then a default model for each
+    /// default family ([`crate::actors::DEFAULT_WEAPONS`]) found in the
+    /// data; humans only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub weapons: Vec<ActorWeapon>,
     /// Colours.
     pub tint: ActorTint,
     /// Equal for two actors exactly when their parts (meshes by content,
@@ -930,6 +992,21 @@ pub struct Manifest {
     /// written before it was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_land_texture: Option<String>,
+    /// The game the plugin list belongs to, detected from its first
+    /// plugin or given to [`crate::extract_for_game`]. A manifest written
+    /// before it was recorded reads as New Vegas.
+    #[serde(default = "legacy_game")]
+    pub game: fnv_esm::GameVariant,
+    /// [`RECORDS_REVISION`] of the `records.sqlite` beside it; 0 in a
+    /// manifest written before it was recorded.
+    #[serde(default)]
+    pub records_revision: u32,
+    /// Things worth knowing that are not problems, sorted: a persistent
+    /// reference standing in a grid cell that has no cell record (it is
+    /// left out), a cell whose land comes from the parent worldspace.
+    /// Unlike [`Manifest::issues`] they do not count as issues.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<Issue>,
 }
 
 impl Manifest {

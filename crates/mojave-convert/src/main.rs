@@ -6,16 +6,20 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand};
 use foundry_render::Backend;
 use mojave_convert::{
-    ConvertError, Inputs, SliceSpec, critters, gallery, map, pipeline, probe, shots, sprites,
+    ConvertError, GameVariant, Inputs, Install, critters, gallery, map, pipeline, probe, sequence,
+    shots, sprites,
 };
 
 #[derive(Parser)]
 #[command(
     name = "mojave-convert",
-    about = "Converts your own Fallout: New Vegas install into a Fallout 2 format mod layer.",
-    long_about = "Converts your own Fallout: New Vegas install into a Fallout 2 format mod layer.\n\n\
-                  Both installs are required. Nothing is downloaded, and output must stay on\n\
-                  the machine that owns the games."
+    about = "Converts your own Fallout 3 or Fallout: New Vegas install into a Fallout 2 format mod layer.",
+    long_about = "Converts your own Fallout 3 or Fallout: New Vegas install into a Fallout 2 format\n\
+                  mod layer.\n\n\
+                  The source install (--game-dir, or --fo3 / --fnv) and a Fallout 2 install (--f2)\n\
+                  are both required. The game is read from the install's master plugin unless\n\
+                  --game names it. Nothing is downloaded, and output must stay on the machine\n\
+                  that owns the games."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -23,19 +27,32 @@ struct Cli {
 }
 
 #[derive(Args)]
+#[command(group(clap::ArgGroup::new("source").required(true).args(["game_dir", "fnv", "fo3"])))]
 struct Common {
-    /// The Fallout: New Vegas install directory (or its Data directory).
-    #[arg(long)]
-    fnv: PathBuf,
+    /// The source install directory (or its Data directory): Fallout 3 or
+    /// Fallout: New Vegas, told apart by the master plugin it holds.
+    #[arg(long, value_name = "DIR")]
+    game_dir: Option<PathBuf>,
+    /// The source game, when the install should not decide it: fo3 or fnv.
+    /// A slice, an install or an alias flag for the other game is an error.
+    #[arg(long, value_name = "GAME")]
+    game: Option<String>,
+    /// A Fallout: New Vegas install: --game-dir with --game fnv.
+    #[arg(long, value_name = "DIR")]
+    fnv: Option<PathBuf>,
+    /// A Fallout 3 install: --game-dir with --game fo3.
+    #[arg(long, value_name = "DIR")]
+    fo3: Option<PathBuf>,
     /// The Fallout 2 install directory (holding master.dat).
     #[arg(long)]
     f2: PathBuf,
     /// Output directory. Keep it outside git.
     #[arg(long)]
     out: PathBuf,
-    /// A built-in slice name, or a slice TOML file.
-    #[arg(long, default_value = "goodsprings")]
-    slice: String,
+    /// A built-in slice name (goodsprings for New Vegas, springvale for
+    /// Fallout 3), or a slice TOML file. Default: the game's built-in one.
+    #[arg(long)]
+    slice: Option<String>,
     /// Worker threads. Output never depends on this.
     #[arg(long)]
     jobs: Option<usize>,
@@ -59,21 +76,74 @@ struct Mode {
     /// draw the wrong walls and floors while such a layer is mounted.
     #[arg(long)]
     standalone: bool,
+    /// The declutter and readability pass: off or readable. Default: the
+    /// slice's `[declutter] profile`, else off.
+    #[arg(long, value_name = "PROFILE")]
+    declutter: Option<String>,
 }
 
 impl Common {
     fn inputs_in(&self, mode: &Mode) -> Result<Inputs, ConvertError> {
         let mut inputs = self.inputs()?;
         inputs.standalone = mode.standalone;
+        if let Some(name) = &mode.declutter {
+            if !mojave_convert::declutter::PROFILES.contains(&name.as_str()) {
+                return Err(ConvertError::stage(
+                    "arguments",
+                    format!(
+                        "--declutter {name}: expected one of {}",
+                        mojave_convert::declutter::PROFILES.join(", ")
+                    ),
+                ));
+            }
+            inputs.declutter = Some(name.clone());
+        }
         Ok(inputs)
     }
 
+    /// The source install, from whichever of --game-dir, --fnv and --fo3
+    /// was given, and --game.
+    fn install(&self) -> Result<Install, ConvertError> {
+        let asked = match &self.game {
+            Some(text) => Some(text.parse::<GameVariant>().map_err(|_| {
+                ConvertError::stage("arguments", format!("--game {text}: expected fo3 or fnv"))
+            })?),
+            None => None,
+        };
+        let install = match (&self.game_dir, &self.fnv, &self.fo3) {
+            (Some(dir), None, None) => Install::any(dir, asked),
+            (None, Some(dir), None) => Install::new_vegas(dir),
+            (None, None, Some(dir)) => Install::fallout3(dir),
+            _ => {
+                return Err(ConvertError::stage(
+                    "arguments",
+                    "give exactly one of --game-dir, --fnv and --fo3",
+                ));
+            }
+        };
+        if let (Some(asked), Some(fixed)) = (asked, install.game)
+            && asked != fixed
+        {
+            return Err(ConvertError::stage(
+                "arguments",
+                format!(
+                    "{} is a {} install, but --game asks for {}",
+                    install.flag,
+                    fixed.display_name(),
+                    asked.display_name()
+                ),
+            ));
+        }
+        Ok(install)
+    }
+
     fn inputs(&self) -> Result<Inputs, ConvertError> {
-        let slice = SliceSpec::resolve(&self.slice)?;
         let jobs = self
             .jobs
             .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get().min(8)));
-        let mut inputs = Inputs::new(&self.fnv, &self.f2, &self.out, slice, jobs)?;
+        let install = self.install()?;
+        let mut inputs =
+            Inputs::from_args(&install, self.slice.as_deref(), &self.f2, &self.out, jobs)?;
         if let Some(config) = &self.config {
             inputs = inputs.with_calibration_file(config)?;
         }
@@ -132,6 +202,8 @@ enum Command {
     },
     /// Screenshots of a converted map, taken by the engine itself, headless.
     Shots(ShotsArgs),
+    /// A frame sequence and animated GIF of one walk, taken by the engine.
+    Walkthrough(sequence::WalkthroughArgs),
     /// A contact page of PNG files, each under its label, scaled to fit.
     Contact {
         /// The page to write.
@@ -204,6 +276,8 @@ struct ShotsArgs {
     /// Seconds an engine run may take before it is stopped.
     #[arg(long, default_value_t = 600)]
     timeout: u64,
+    #[command(flatten)]
+    views: shots::ViewArgs,
 }
 
 #[derive(Subcommand)]
@@ -225,12 +299,16 @@ enum Probe {
         #[arg(long, default_value = "")]
         prefix: String,
     },
-    /// Walk a plugin and decode every record.
+    /// Walk a plugin (either game), show its game, and decode every record.
     Esm {
         plugin: PathBuf,
         /// Cell editor id substring to look at more closely.
         #[arg(long, default_value = "")]
         cell: String,
+        /// Cell editor id substring: break the matching cells' placed
+        /// references down by the record type of their base.
+        #[arg(long, default_value = "")]
+        cells: String,
     },
     /// Open a Fallout 2 install and read its palette.
     F2 { dir: PathBuf },
@@ -327,17 +405,19 @@ fn run(cli: Cli) -> Result<(), String> {
                 wide_zoom: args.wide_zoom,
                 jobs: args.jobs,
                 timeout: std::time::Duration::from_secs(args.timeout),
+                framing: args.views.framing()?,
+                dest: args.views.dest,
             };
             let summary = shots::shots(&options).map_err(|e| e.to_string())?;
             for shot in &summary.shots {
                 println!(
-                    "{:02} {:<4} hex {:>5} ({:>3} steps) arrived {:<3} camera {:<4} {} {}",
+                    "{:02} {:<7} hex {:>5} ({:>3} steps) arrived {:<3} camera {:<21} {} {}",
                     shot.viewpoint,
                     shot.view,
                     shot.hex,
                     shot.steps,
                     if shot.arrived { "yes" } else { "no" },
-                    if shot.camera_followed { "on" } else { "held" },
+                    shot.camera,
                     if shot.file.is_empty() {
                         "-"
                     } else {
@@ -354,6 +434,7 @@ fn run(cli: Cli) -> Result<(), String> {
             );
             Ok(())
         }
+        Command::Walkthrough(args) => sequence::walkthrough_cli(&args),
         Command::Contact {
             out,
             title,
@@ -397,7 +478,11 @@ fn run(cli: Cli) -> Result<(), String> {
             step,
             prefix,
         }) => probe::nif(&archive, step, &prefix),
-        Command::Probe(Probe::Esm { plugin, cell }) => probe::esm(&plugin, &cell),
+        Command::Probe(Probe::Esm {
+            plugin,
+            cell,
+            cells,
+        }) => probe::esm(&plugin, &cell, &cells),
         Command::Probe(Probe::F2 { dir }) => probe::f2(&dir),
         Command::Probe(Probe::Walk {
             layer,

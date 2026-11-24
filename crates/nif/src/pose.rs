@@ -61,6 +61,23 @@ fn local_time(animation: &Animation, time: f32) -> (f32, f32) {
 /// does not key are the identity rather than the skeleton's values, and
 /// its horizontal motion is taken out and returned as [`Pose::travel`].
 pub fn pose(skeleton: &Skeleton, animation: &Animation, time: f32) -> Pose {
+    compose(skeleton, &local_pose(skeleton, animation, time))
+}
+
+/// A skeleton posed at one time, as each bone's local transform (its
+/// parent's space), before the bones are chained: what [`blend`] mixes.
+/// [`compose`] turns it into the [`Pose`] that [`pose()`] gives.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct LocalPose {
+    /// One transform per skeleton bone, same order.
+    pub locals: Vec<Transform>,
+    /// As [`Pose::travel`].
+    pub travel: [f32; 2],
+}
+
+/// The local transforms [`pose()`] chains: the same rules, the
+/// accumulation root already held in place.
+pub fn local_pose(skeleton: &Skeleton, animation: &Animation, time: f32) -> LocalPose {
     let (t, loops) = local_time(animation, time);
     let accum = (!animation.accum_root.is_empty())
         .then(|| skeleton.find(&animation.accum_root))
@@ -125,5 +142,102 @@ pub fn pose(skeleton: &Skeleton, animation: &Animation, time: f32) -> Pose {
             None => local,
         });
     }
-    Pose { world, travel }
+    LocalPose { locals, travel }
+}
+
+/// Chains local transforms into a [`Pose`]: each bone's matrix is its
+/// parent's times its own. A pose with fewer transforms than bones keeps
+/// the skeleton's own for the rest.
+pub fn compose(skeleton: &Skeleton, local: &LocalPose) -> Pose {
+    let mut world: Vec<Matrix34> = Vec::with_capacity(skeleton.bones.len());
+    for (i, bone) in skeleton.bones.iter().enumerate() {
+        let parent = bone.parent.and_then(|p| world.get(p as usize)).copied();
+        let matrix = match local.locals.get(i) {
+            Some(t) => transform_matrix(t),
+            None => transform_matrix(&bone.local.into()),
+        };
+        world.push(match parent {
+            Some(p) => crate::math::mul(&p, &matrix),
+            None => matrix,
+        });
+    }
+    Pose {
+        world,
+        travel: local.travel,
+    }
+}
+
+/// `a` mixed towards `b` by `weight` (0 is `a`, 1 is `b`), bone by bone:
+/// rotations on the shorter arc, translations, scales and travel
+/// linearly. Bones past the shorter pose keep `a`'s transform.
+pub fn blend(a: &LocalPose, b: &LocalPose, weight: f32) -> LocalPose {
+    let w = if weight.is_finite() {
+        weight.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let locals = a
+        .locals
+        .iter()
+        .enumerate()
+        .map(|(i, x)| match b.locals.get(i) {
+            Some(y) => blend_transform(x, y, w),
+            None => *x,
+        })
+        .collect();
+    LocalPose {
+        locals,
+        travel: [
+            a.travel[0] + (b.travel[0] - a.travel[0]) * w,
+            a.travel[1] + (b.travel[1] - a.travel[1]) * w,
+        ],
+    }
+}
+
+/// `base` with the bones `mask` marks taken from `overlay`: an upper body
+/// from one animation over the legs of another. The travel is `base`'s.
+pub fn layer(base: &LocalPose, overlay: &LocalPose, mask: &[bool]) -> LocalPose {
+    let locals = base
+        .locals
+        .iter()
+        .enumerate()
+        .map(|(i, x)| {
+            if mask.get(i).copied().unwrap_or(false) {
+                overlay.locals.get(i).copied().unwrap_or(*x)
+            } else {
+                *x
+            }
+        })
+        .collect();
+    LocalPose {
+        locals,
+        travel: base.travel,
+    }
+}
+
+/// Every bone at or below the bone named `name`, as a mask for [`layer`];
+/// all `false` when the skeleton has no such bone. A parent precedes its
+/// children, so one pass suffices.
+pub fn subtree_mask(skeleton: &Skeleton, name: &str) -> Vec<bool> {
+    let top = skeleton.find(name).map(|i| i as usize);
+    let mut mask = vec![false; skeleton.bones.len()];
+    for (i, bone) in skeleton.bones.iter().enumerate() {
+        mask[i] = Some(i) == top
+            || bone
+                .parent
+                .is_some_and(|p| mask.get(p as usize).copied().unwrap_or(false));
+    }
+    mask
+}
+
+fn blend_transform(a: &Transform, b: &Transform, w: f32) -> Transform {
+    let qa = crate::math::rotation_to_quat(&a.rotation);
+    let qb = crate::math::rotation_to_quat(&b.rotation);
+    Transform {
+        rotation: quat_to_rotation(crate::math::slerp(qa, qb, w)),
+        translation: std::array::from_fn(|k| {
+            a.translation[k] + (b.translation[k] - a.translation[k]) * w
+        }),
+        scale: a.scale + (b.scale - a.scale) * w,
+    }
 }

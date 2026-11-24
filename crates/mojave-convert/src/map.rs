@@ -187,6 +187,19 @@ fn cache_key(
     if inputs.standalone {
         hasher.update(b"standalone");
     }
+    // Likewise the game: hashed from Fallout 3 on, never for New Vegas (the
+    // manifest names it too).
+    if inputs.game != mir::GameVariant::FalloutNewVegas {
+        hasher.update(inputs.game.id().as_bytes());
+    }
+    // And the declutter profile, only when on: the slice's own tables are
+    // in its TOML above; `--declutter` is not.
+    let declutter = inputs.declutter_profile();
+    if declutter != "off" {
+        hasher.update(format!("declutter={declutter}").as_bytes());
+        // The preset itself, so that tuning it rebuilds.
+        hasher.update(format!("{:?}", crate::declutter::readable_for(inputs.game)).as_bytes());
+    }
     // The critter stage's index names every sprite set by content key.
     let critters = inputs.critters_dir().join("index.json");
     if let Ok(index) = std::fs::read(&critters) {
@@ -427,6 +440,55 @@ fn base_files(inputs: &Inputs) -> BTreeMap<String, Vec<u8>> {
     base
 }
 
+/// The slicer's starting configuration for a game: its pattern profile.
+///
+/// New Vegas keeps `SlicerConfig::default()` exactly (the patterns were
+/// tuned on the Mojave: `nv` and `scol` name prefixes, desert flora, rock
+/// and canyon relief), so its maps keep their bytes. Fallout 3's
+/// profile is tuned on the Capital Wasteland: no `nv` prefix; rubble and
+/// litter piles flat or in relief instead of upright; dead trees and
+/// stumps as single sprites; elevated highways and overpasses kept upright
+/// (the `road` pattern would flatten them).
+pub fn slicer_defaults(game: mir::GameVariant) -> map_slicer::SlicerConfig {
+    let base = map_slicer::SlicerConfig::default();
+    match game {
+        mir::GameVariant::FalloutNewVegas => base,
+        mir::GameVariant::Fallout3 => {
+            let strings =
+                |items: &[&str]| -> Vec<String> { items.iter().map(|s| (*s).to_owned()).collect() };
+            map_slicer::SlicerConfig {
+                relief_patterns: strings(&[
+                    "rock",
+                    "cliff",
+                    "canyon",
+                    "boulder",
+                    "rubble",
+                    "*rubblepile",
+                    "rubchunk",
+                    "!rocket",
+                ]),
+                flat_patterns: strings(&[
+                    "road",
+                    "*decal",
+                    "*litter",
+                    "tracks",
+                    "parkinglot",
+                    "*puddle",
+                    "!roadsign",
+                    "!roadblock",
+                    "!overpass",
+                    "!highway",
+                ]),
+                sprite_patterns: strings(&[
+                    "trees\\", "plants\\", "*shrub", "*bush", "*stump", "treedead", "!ambush",
+                ]),
+                name_prefixes: strings(&["scol"]),
+                ..base
+            }
+        }
+    }
+}
+
 /// The map window and everything the slicer needs about it.
 struct Scene {
     projection: Projection,
@@ -550,7 +612,7 @@ fn scene(inputs: &Inputs, mir: &Mir) -> Result<Scene, ConvertError> {
     let slicer_config = map_slicer::SlicerConfig {
         open_hexes,
         landmark_walkers: Some(landmark_walkers),
-        ..map_slicer::SlicerConfig::default()
+        ..slicer_defaults(inputs.game)
     };
     Ok(Scene {
         projection,
@@ -660,7 +722,7 @@ fn interior_scene(inputs: &Inputs, mir: &Mir, id: &str) -> Result<Scene, Convert
         open_hexes,
         landmark_walkers: Some(landmark_walkers),
         interior: Some(slice.interior_slice(floor_z)),
-        ..map_slicer::SlicerConfig::default()
+        ..slicer_defaults(inputs.game)
     };
     let interior = InteriorScene {
         cell: cells[0].editor_id.clone().unwrap_or_else(|| id.to_owned()),
@@ -685,6 +747,113 @@ fn interior_scene(inputs: &Inputs, mir: &Mir, id: &str) -> Result<Scene, Convert
         open,
         interior: Some(interior),
     })
+}
+
+/// What the declutter wiring chose for a run, for the report.
+#[derive(Debug, Clone, Default)]
+struct DeclutterChoice {
+    /// The profile name (`off`, `readable`) and where it came from.
+    profile: String,
+    from: &'static str,
+    /// References the quests and scripts point at, in the whole plugin
+    /// list, and how many of them lie in the window.
+    referenced: usize,
+    referenced_here: usize,
+    /// Keys handed to the builder as interactive.
+    interactive: usize,
+}
+
+/// Sets the scene's declutter profile (`crate::declutter::profile`) and,
+/// with it on, the builder's interactive set: the protected references
+/// (quest and script targets) and every reference of the window whose
+/// base kind is protected (by the profile, or by the default list, which
+/// names every item kind) or that teleports. Off, nothing changes.
+fn apply_declutter(
+    inputs: &Inputs,
+    mir: &Mir,
+    scene: &mut Scene,
+) -> Result<DeclutterChoice, ConvertError> {
+    let profile = inputs.declutter_profile();
+    let from = if inputs.declutter.is_some() {
+        "--declutter"
+    } else if inputs
+        .slice
+        .declutter
+        .as_ref()
+        .is_some_and(|d| d.profile.is_some())
+    {
+        "the slice's [declutter] profile"
+    } else {
+        "the game's default"
+    };
+    let mut choice = DeclutterChoice {
+        profile: profile.clone(),
+        from,
+        ..DeclutterChoice::default()
+    };
+    if profile == "off" {
+        // Validated all the same: tables without the pass are an error.
+        crate::declutter::profile(
+            inputs.game,
+            &profile,
+            inputs.slice.declutter.as_ref(),
+            inputs.slice.tone.as_ref(),
+            &BTreeSet::new(),
+        )
+        .map_err(|e| ConvertError::Slice {
+            name: inputs.slice.name.clone(),
+            reason: e,
+        })?;
+        return Ok(choice);
+    }
+    let referenced: BTreeSet<String> = mir
+        .records()
+        .map_err(stage)?
+        .referenced_refs()
+        .map_err(stage)?
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let Some(declutter) = crate::declutter::profile(
+        inputs.game,
+        &profile,
+        inputs.slice.declutter.as_ref(),
+        inputs.slice.tone.as_ref(),
+        &referenced,
+    )
+    .map_err(|e| ConvertError::Slice {
+        name: inputs.slice.name.clone(),
+        reason: e,
+    })?
+    else {
+        return Ok(choice);
+    };
+    // Interactive whatever the slice protects: a bottle the clutter rule
+    // may drop is still a thing to pick up when it stays.
+    let interactive_kinds: BTreeSet<String> = declutter
+        .protected_kinds
+        .iter()
+        .cloned()
+        .chain(map_slicer::DeclutterProfile::default().protected_kinds)
+        .collect();
+    let mut interactive: BTreeSet<String> = BTreeSet::new();
+    for r in &scene.references {
+        let key = r.form.to_string();
+        let kind_protected = r
+            .base_kind
+            .as_deref()
+            .is_some_and(|k| interactive_kinds.contains(k));
+        let referred = declutter.protected_refs.contains(&key);
+        choice.referenced_here += usize::from(referenced.contains(&key));
+        if kind_protected || referred || r.teleport.is_some() {
+            interactive.insert(key);
+        }
+    }
+    choice.referenced = referenced.len();
+    choice.interactive = interactive.len();
+    scene.build_options.interactive = interactive;
+    scene.slicer_config.declutter = Some(declutter);
+    Ok(choice)
 }
 
 /// The teleport door of `references` with the lowest form key: the door a
@@ -804,7 +973,8 @@ pub fn estimate(inputs: &Inputs) -> Result<EstimateSummary, ConvertError> {
     let mir = Mir::open(&inputs.mir_dir()).map_err(stage)?;
     let base = base_files(inputs);
     let budgets = budgets(&base, inputs.standalone)?;
-    let scene = scene(inputs, &mir)?;
+    let mut scene = scene(inputs, &mir)?;
+    apply_declutter(inputs, &mir, &mut scene)?;
     let report = map_slicer::estimate(
         &mir,
         &scene.references,
@@ -941,6 +1111,10 @@ pub struct MapFeatures {
     /// exterior map.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub people: Vec<Person>,
+    /// The source game (`mir::GameVariant::id`); absent in a file written
+    /// before both games were converted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub game: Option<String>,
 }
 
 /// A person placed on the map.
@@ -1159,6 +1333,8 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
     }
 
     let budgets = budgets(&base, inputs.standalone)?;
+    let mut scene = scene(inputs, &mir)?;
+    let declutter_choice = apply_declutter(inputs, &mir, &mut scene)?;
     let Scene {
         projection,
         window,
@@ -1170,7 +1346,7 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
         slicer_config,
         open,
         interior,
-    } = scene(inputs, &mir)?;
+    } = scene;
 
     // Interiors the window's doors open on, for the exits. An interior
     // demo has no exits.
@@ -1377,6 +1553,13 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
     let _ = writeln!(text, "# Map report: {}\n", inputs.slice.name);
     let _ = writeln!(
         text,
+        "Game: {} (`{}`); slicer pattern profile `{}`.\n",
+        inputs.game.display_name(),
+        inputs.game.id(),
+        crate::source::short_id(inputs.game)
+    );
+    let _ = writeln!(
+        text,
         "Window: {} units square, north-west corner at ({}, {}).\n",
         window.size, window.x_west, window.y_north
     );
@@ -1398,6 +1581,12 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
     write_open_section(&mut text, &open, protected);
     let _ = writeln!(text, "## Walkability\n\n```\n{:#?}\n```\n", report.walk);
     write_reach_sections(&mut text, report);
+    write_declutter_section(&mut text, &declutter_choice, &sliced);
+    let _ = writeln!(text, "## Readability\n");
+    for line in report.readability_summary() {
+        let _ = writeln!(text, "- {line}");
+    }
+    let _ = writeln!(text);
     let _ = writeln!(
         text,
         "## Map\n\n- file: `{}`, number {}\n- entry hex: {}\n- objects: {}, of which blockers: {}\n- maps in the layer: {:?}\n",
@@ -1488,6 +1677,7 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
         features: features(&sliced),
         interior: interior.as_ref().map(|s| s.cell.clone()),
         people,
+        game: Some(inputs.game.id().to_owned()),
     };
     let json = serde_json::to_string_pretty(&map_features).map_err(stage)?;
     std::fs::write(&features_path, json + "\n").map_err(io(&features_path))?;
@@ -1497,6 +1687,75 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
     std::fs::write(&summary_path, summary.to_cache()).map_err(io(&summary_path))?;
     std::fs::write(&key_path, key).map_err(io(&key_path))?;
     Ok(summary)
+}
+
+/// `## Declutter`: the profile and where it came from, then what the pass
+/// did: pruned by rule, kept and pruned by kind, protected by reason, the
+/// cutaway, and the open floor before and after.
+fn write_declutter_section(
+    text: &mut String,
+    choice: &DeclutterChoice,
+    sliced: &map_slicer::Sliced,
+) {
+    let _ = writeln!(text, "## Declutter\n");
+    let _ = writeln!(
+        text,
+        "- profile: `{}`, from {}",
+        choice.profile, choice.from
+    );
+    let Some(stats) = &sliced.report.declutter else {
+        let _ = writeln!(
+            text,
+            "- the pass is off: nothing pruned, cut, toned or outlined\n"
+        );
+        return;
+    };
+    let _ = writeln!(
+        text,
+        "- quest and script references: {} in the plugin list, {} in the window; {} references handed to the builder as interactive",
+        choice.referenced, choice.referenced_here, choice.interactive
+    );
+    let _ = writeln!(
+        text,
+        "- pruned: {} references; protected: {}; decals faded: {}; shells cut lower: {} ({} kept their cut for wall art); outlined sprites: {}",
+        stats.pruned_total(),
+        stats.protected_references,
+        stats.decals_faded,
+        stats.shell_cut_references,
+        stats.shells_kept_for_art,
+        stats.outlined
+    );
+    for (rule, count) in &stats.pruned {
+        let _ = writeln!(text, "  - {rule}: {count}");
+    }
+    let protected: Vec<String> = stats
+        .protected
+        .iter()
+        .map(|(reason, n)| format!("{reason} {n}"))
+        .collect();
+    let _ = writeln!(text, "- protected by reason: {}", protected.join(", "));
+    let c = &stats.cutaway;
+    let _ = writeln!(
+        text,
+        "- cutaway: {} of {} strips cut to the kerb ({} emptied, {} pixels removed); walkers hidden {} before, {} after",
+        c.strips_cut,
+        c.strips_considered,
+        c.strips_emptied,
+        c.pixels_removed,
+        c.walkers_covered_before,
+        c.walkers_covered_after
+    );
+    if let Some(before) = &stats.floor_before {
+        let _ = writeln!(text, "- floor before the pass: {before}");
+    }
+    if let Some(after) = &stats.floor_after {
+        let _ = writeln!(text, "- floor after the pass: {after}");
+    }
+    let _ = writeln!(text, "\n| kind | kept | pruned |\n|---|---:|---:|");
+    for (kind, tally) in &stats.by_kind {
+        let _ = writeln!(text, "| {kind} | {} | {} |", tally.kept, tally.pruned);
+    }
+    let _ = writeln!(text);
 }
 
 /// `## Interior`: the room, its floor and storeys, the cut, what the slicer
@@ -1794,7 +2053,19 @@ fn write_ground_section(text: &mut String, stats: &map_terrain::GroundStats) {
         stats.borrowed_base_layers,
         stats.fallback_pixels
     );
-    let _ = writeln!(text, "```\n{stats:#?}\n```\n");
+    // The stage timings would make the report differ run to run.
+    let stats: Vec<String> = format!("{stats:#?}")
+        .lines()
+        .filter(|line| {
+            !line
+                .trim_start()
+                .split(':')
+                .next()
+                .is_some_and(|k| k.ends_with("_time"))
+        })
+        .map(str::to_owned)
+        .collect();
+    let _ = writeln!(text, "```\n{}\n```\n", stats.join("\n"));
 }
 
 /// `## Open hexes`: which standable hexes a bounding footprint left open,

@@ -191,13 +191,26 @@ pub(crate) fn reconnect(
 }
 
 /// The targets of a build: exits (any grid hex), return hexes, and
-/// critters where they would stand.
-pub(crate) fn targets(exits: &[crate::exits::DoorExit], critters: &[(String, i32)]) -> Vec<Target> {
+/// critters where they would stand; with links, after the stub exits' grids, each link's grids
+/// (`(what, hexes)`); after the return hexes, every arrival hex other
+/// links lead to here (`(hex, what)`), each hex once.
+pub(crate) fn targets_with(
+    exits: &[crate::exits::DoorExit],
+    links: &[(String, Vec<i32>)],
+    arrivals: &[(i32, String)],
+    critters: &[(String, i32)],
+) -> Vec<Target> {
     let mut out = Vec::new();
     for exit in exits {
         out.push(Target {
             hexes: exit.grid_hexes.clone(),
             what: format!("exit {}", exit.door),
+        });
+    }
+    for (what, hexes) in links {
+        out.push(Target {
+            hexes: hexes.clone(),
+            what: what.clone(),
         });
     }
     let mut returns = BTreeSet::new();
@@ -206,6 +219,14 @@ pub(crate) fn targets(exits: &[crate::exits::DoorExit], critters: &[(String, i32
             out.push(Target {
                 hexes: vec![exit.return_hex],
                 what: format!("return of {}", exit.door),
+            });
+        }
+    }
+    for (hex, what) in arrivals {
+        if returns.insert(*hex) {
+            out.push(Target {
+                hexes: vec![*hex],
+                what: what.clone(),
             });
         }
     }

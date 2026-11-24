@@ -42,10 +42,13 @@ mod dialogue;
 mod land;
 mod leveled;
 mod navmesh;
+mod note;
 mod objects;
+mod package;
 mod placed;
 mod quest;
 mod script;
+mod terminal;
 mod world;
 
 pub use actors::{ActorBase, Creature, CreatureData, FactionRank, Npc, NpcSkills, NpcStats, Rgb};
@@ -58,14 +61,20 @@ pub use land::{
 };
 pub use leveled::{FormList, LeveledEntry, LeveledExtra, LeveledKind, LeveledList};
 pub use navmesh::{NavDoorLink, NavEdge, NavExternalLink, NavTriangle, Navmesh};
+pub use note::Note;
 pub use objects::{
     Ammo, AmmoData, AmmoData2, Armor, ArmorAddon, ArmorData, ArmorStats, BipedData, Container,
     ContainerData, ContainerItem, Door, Effect, EffectData, Ingestible, IngestibleData, ItemData,
-    MiscItem, Static, Weapon, WeaponCritical, WeaponData,
+    MiscItem, Static, Weapon, WeaponCombat, WeaponCritical, WeaponData,
+};
+pub use package::{
+    Package, PackageData, PackageDialogue, PackageEvent, PackageLocation, PackageSchedule,
+    PackageTarget,
 };
 pub use placed::{EnableParent, Lock, PlacedKind, PlacedRef, Placement, Primitive, Teleport};
 pub use quest::{Quest, QuestData, QuestLogEntry, QuestObjective, QuestStage, QuestTarget};
 pub use script::{LocalVariable, Script, ScriptBody, ScriptHeader, ScriptReference};
+pub use terminal::{Terminal, TerminalData, TerminalMenuItem};
 pub use world::{
     Cell, CellGrid, CellLighting, LandDefaults, MapData, MapOffset, World, WorldBounds,
 };
@@ -284,9 +293,23 @@ pub struct DecoderEntry {
 }
 
 macro_rules! record_table {
-    ($( $(#[$doc:meta])* $variant:ident($ty:ident) : $($sig:ident)|+ ; )*) => {
+    (
+        core { $( $(#[$doc:meta])* $variant:ident($ty:ident) : $($sig:ident)|+ ; )* }
+        logic { $( $(#[$ldoc:meta])* $lvariant:ident($lty:ident) : $($lsig:ident)|+ ; )* }
+    ) => {
+        record_table!(@inner
+            [ $( $(#[$doc])* $variant($ty) : $($sig)|+ ; )* ]
+            [ $( $(#[$ldoc])* $lvariant($lty) : $($lsig)|+ ; )* ]
+            [ $( $(#[$doc])* $variant($ty) : $($sig)|+ ; )* $( $(#[$ldoc])* $lvariant($lty) : $($lsig)|+ ; )* ]
+        );
+    };
+    (@inner
+        [ $( $(#[$cdoc:meta])* $cvariant:ident($cty:ident) : $($csig:ident)|+ ; )* ]
+        [ $( $(#[$gdoc:meta])* $gvariant:ident($gty:ident) : $($gsig:ident)|+ ; )* ]
+        [ $( $(#[$doc:meta])* $variant:ident($ty:ident) : $($sig:ident)|+ ; )* ]
+    ) => {
         /// A decoded record: one variant per typed record, and
-        /// [`Record::Unknown`] for every signature the table does not list.
+        /// [`Record::Unknown`] for every signature the tables do not list.
         #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
         pub enum Record {
             $( $(#[$doc])* $variant($ty), )*
@@ -308,15 +331,33 @@ macro_rules! record_table {
             }
         }
 
-        /// The decoder table: one row per record signature with a typed
-        /// decoder.
+        /// The decoder table of the world, object, actor and dialogue
+        /// records: one row per record signature with a typed decoder.
+        /// [`LOGIC_DECODERS`] has the rest; [`decoder_for`] and
+        /// [`all_decoders`] look in both.
         pub static DECODERS: &[DecoderEntry] = &[
             $( $(
                 DecoderEntry {
-                    sig: sigs::$sig,
-                    type_name: stringify!($ty),
+                    sig: sigs::$csig,
+                    type_name: stringify!($cty),
                     decode: |sig, meta, subs| {
-                        Record::$variant(<$ty as TypedRecord>::decode(sig, meta, subs))
+                        Record::$cvariant(<$cty as TypedRecord>::decode(sig, meta, subs))
+                    },
+                },
+            )+ )*
+        ];
+
+        /// The second decoder table: terminals, notes and AI packages,
+        /// added for the logic a converter follows (what scripts, quests
+        /// and packages point at). Kept apart from [`DECODERS`], whose
+        /// rows the earlier decoders' tests enumerate.
+        pub static LOGIC_DECODERS: &[DecoderEntry] = &[
+            $( $(
+                DecoderEntry {
+                    sig: sigs::$gsig,
+                    type_name: stringify!($gty),
+                    decode: |sig, meta, subs| {
+                        Record::$gvariant(<$gty as TypedRecord>::decode(sig, meta, subs))
                     },
                 },
             )+ )*
@@ -368,6 +409,7 @@ macro_rules! record_table {
 }
 
 record_table! {
+    core {
     /// `WRLD`: a worldspace.
     World(World): WRLD;
     /// `CELL`: an interior or exterior cell.
@@ -424,6 +466,15 @@ record_table! {
     FormList(FormList): FLST;
     /// `LVLN`, `LVLC`, `LVLI`: a leveled NPC, creature or item list.
     Leveled(LeveledList): LVLN | LVLC | LVLI;
+    }
+    logic {
+    /// `TERM`: a terminal.
+    Terminal(Terminal): TERM;
+    /// `NOTE`: a note or holotape.
+    Note(Note): NOTE;
+    /// `PACK`: an AI package.
+    Package(Package): PACK;
+    }
 }
 
 impl Record {
@@ -438,9 +489,16 @@ impl Record {
     }
 }
 
-/// The table row for a record signature, if it has a typed decoder.
+/// The table row for a record signature, if it has a typed decoder, from
+/// [`DECODERS`] or [`LOGIC_DECODERS`].
 pub fn decoder_for(sig: Sig) -> Option<&'static DecoderEntry> {
-    DECODERS.iter().find(|entry| entry.sig == sig)
+    all_decoders().find(|entry| entry.sig == sig)
+}
+
+/// Every row of both decoder tables: [`DECODERS`], then
+/// [`LOGIC_DECODERS`].
+pub fn all_decoders() -> impl Iterator<Item = &'static DecoderEntry> {
+    DECODERS.iter().chain(LOGIC_DECODERS)
 }
 
 /// Decodes a record from its header fields and subrecords through the

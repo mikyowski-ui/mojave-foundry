@@ -1,0 +1,13 @@
+# Megaton (Fallout 3): the town in its crater. Coordinates only: the
+# cells of the town's own worldspace MegatonWorld (it has cells x -2..0,
+# y -8..-6 only; the window reaches a little beyond them) and a map centre
+# in source units, on the plaza cell (-1, -7). Run with --standalone; see
+# docs/running.md.
+name = "megaton"
+game = "fo3"
+worldspace = "MegatonWorld"
+plugins = ["Fallout3.esm"]
+x = [-2, 0]
+y = [-8, -6]
+interior_depth = 1
+map_center = [-2048.0, -26624.0]

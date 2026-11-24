@@ -126,5 +126,8 @@ pub mod sigs {
         LVLN = b"LVLN";
         LVLC = b"LVLC";
         LVLI = b"LVLI";
+        TERM = b"TERM";
+        NOTE = b"NOTE";
+        PACK = b"PACK";
     }
 }

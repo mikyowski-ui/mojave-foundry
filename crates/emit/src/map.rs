@@ -71,6 +71,90 @@ pub fn empty_map(name: &str, map_number: i32, entry_hex: i32) -> Result<MapFile,
     })
 }
 
+/// Where the player enters a map: the header's entry hex, elevation and
+/// orientation (SPEC-003 §2.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MapEntry {
+    /// 0 to 39,999.
+    pub hex: i32,
+    /// 0 to 2; must be an elevation the map has.
+    pub elevation: u8,
+    /// 0 (north-east) to 5.
+    pub orientation: u8,
+}
+
+/// 10,000 blank tile pairs (floor and roof index 1, SPEC-003 §2.8): one
+/// elevation's tile block before any floor is laid.
+pub fn blank_tiles() -> Vec<vault_formats::map::TilePair> {
+    vec![vault_formats::map::TilePair::BLANK; 10_000]
+}
+
+/// An empty Fallout 2 (version 20) map with one to three elevations: no
+/// variables, scripts or objects, darkness 1. `tiles[e]` is elevation
+/// `e`'s 10,000 tile pairs (row-major squares, [`blank_tiles`] for a bare
+/// floor), or `None` for an elevation the map does not have, whose
+/// omission bit (`OMIT_ELEVATION_0` to `_2`) is then set.
+///
+/// [`empty_map`] is this with `[Some(blank), None, None]` and entry
+/// elevation and orientation 0.
+///
+/// `MapFile::write` recomputes the omission bits: it omits **every**
+/// elevation whose tiles are all blank (floor and roof 1) and that holds
+/// no saved object, present here or not (SPEC-003 §3.2). Such an
+/// elevation reads back as `None`. Give each elevation that must survive
+/// a non-blank tile or an object.
+///
+/// Refused: a name `empty_map` refuses, an entry hex outside 0 to 39,999,
+/// orientation above 5, an entry elevation above 2 or without tiles, and a
+/// tile block that is not 10,000 pairs.
+pub fn map_with_elevations(
+    name: &str,
+    map_number: i32,
+    entry: MapEntry,
+    tiles: [Option<Vec<vault_formats::map::TilePair>>; 3],
+) -> Result<MapFile, EmitError> {
+    let mut map = empty_map(name, map_number, entry.hex)?;
+    let bad = |message: String| {
+        Err(EmitError::Path {
+            path: name.into(),
+            message,
+        })
+    };
+    if entry.orientation > 5 {
+        return bad(format!(
+            "entry orientation {} is outside 0 to 5",
+            entry.orientation
+        ));
+    }
+    if tiles
+        .get(usize::from(entry.elevation))
+        .is_none_or(Option::is_none)
+    {
+        return bad(format!(
+            "entry elevation {} is not one of the map's elevations",
+            entry.elevation
+        ));
+    }
+    let mut flags = 0;
+    for (elevation, block) in tiles.iter().enumerate() {
+        match block {
+            None => flags |= MapFlags::OMIT_ELEVATION_0.0 << elevation,
+            Some(block) if block.len() != 10_000 => {
+                return bad(format!(
+                    "elevation {elevation} has {} tile pairs, not 10000",
+                    block.len()
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    map.header.entry_elevation = entry.elevation;
+    map.header.entry_orientation = entry.orientation;
+    map.header.flags = MapFlags(flags);
+    map.tiles = tiles;
+    Ok(map)
+}
+
 /// What a placed critter record needs (SPEC-003 §2.10 and §2.11).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CritterPlacement {

@@ -102,6 +102,12 @@ impl Mir {
         &self.manifest
     }
 
+    /// The game the directory was extracted from ([`Manifest::game`]); a
+    /// directory written before the game was recorded is New Vegas's.
+    pub fn game(&self) -> fnv_esm::GameVariant {
+        self.manifest.game
+    }
+
     /// The exterior cells of the directory, sorted.
     pub fn cells(&self) -> impl Iterator<Item = CellKey> + '_ {
         self.manifest.cells.iter().cloned()

@@ -9,14 +9,17 @@ pub fn extract(inputs: &Inputs) -> Result<mir::ExtractSummary, ConvertError> {
     // Fallout 2 install should stop before minutes of extraction.
     inputs.palette()?;
     let options = mir::ExtractOptions {
-        data_dir: inputs.fnv_data.clone(),
+        data_dir: inputs.data_dir.clone(),
         plugins: inputs.slice.plugins.clone(),
         out: inputs.mir_dir(),
         slice: inputs.slice.mir_slice(),
         jobs: inputs.jobs,
         raw_store: mir::RawStore::All,
     };
-    mir::extract(&options).map_err(|e| ConvertError::stage("extract", e))
+    // The game was decided (and checked against the first plugin's header)
+    // when the inputs were made; the extract records it.
+    mir::extract_for_game(&options, Some(inputs.game))
+        .map_err(|e| ConvertError::stage("extract", e))
 }
 
 /// What [`all`] did, stage by stage.

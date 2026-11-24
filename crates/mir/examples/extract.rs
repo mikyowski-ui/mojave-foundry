@@ -11,6 +11,8 @@
 //! MIR_DEPTH=1                      teleport hops into interiors (default 1)
 //! MIR_JOBS=4                       threads (default 4)
 //! MIR_RAW=all|typed_only|none      raw store (default all)
+//! MIR_GAME=fallout3|falloutnv       the game (default: detected from the first plugin)
+//! MIR_REFERENCED=1                  also time and count `Records::referenced_refs`
 //! ```
 //!
 //! `cargo run --release -p mir --example extract`
@@ -21,7 +23,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use mir::{ExtractOptions, RawStore, Slice, extract};
+use mir::{ExtractOptions, GameVariant, Mir, RawStore, Slice, extract_for_game};
 
 fn var(name: &str) -> Result<String, String> {
     env::var(name).map_err(|_| format!("{name} is not set"))
@@ -76,6 +78,34 @@ fn options() -> Result<ExtractOptions, String> {
     })
 }
 
+/// Times the referenced-reference queries and prints their counts.
+fn referenced(out: &std::path::Path) {
+    let records = match Mir::open(out).and_then(|m| m.records()) {
+        Ok(records) => records,
+        Err(error) => {
+            eprintln!("referenced: {error}");
+            return;
+        }
+    };
+    let start = Instant::now();
+    match records.referenced_ref_reasons() {
+        Ok(reasons) => {
+            let elapsed = start.elapsed().as_secs_f64();
+            let mut by_reason = std::collections::BTreeMap::new();
+            for set in reasons.values() {
+                for reason in set {
+                    *by_reason.entry(format!("{reason:?}")).or_insert(0usize) += 1;
+                }
+            }
+            println!(
+                "referenced refs: {} in {elapsed:.2} s; by reason: {by_reason:?}",
+                reasons.len()
+            );
+        }
+        Err(error) => eprintln!("referenced: {error}"),
+    }
+}
+
 fn main() -> ExitCode {
     let options = match options() {
         Ok(options) => options,
@@ -84,8 +114,18 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let game = match env::var("MIR_GAME").ok().filter(|g| !g.is_empty()) {
+        Some(text) => match text.parse::<GameVariant>() {
+            Ok(game) => Some(game),
+            Err(error) => {
+                eprintln!("MIR_GAME: {error}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
     let start = Instant::now();
-    match extract(&options) {
+    match extract_for_game(&options, game) {
         Ok(summary) => {
             for (step, time) in &summary.timings {
                 println!("{step:>22}: {:>8.2} s", time.as_secs_f64());
@@ -107,6 +147,14 @@ fn main() -> ExitCode {
             println!("actors: {}", summary.actors);
             println!("skeletons: {:?}", summary.skeletons);
             println!("animations: {:?}", summary.animations);
+            println!(
+                "game: {}; notes: {}",
+                summary.game.map_or("?", GameVariant::id),
+                summary.notes
+            );
+            if env::var("MIR_REFERENCED").is_ok_and(|v| v == "1") {
+                referenced(&options.out);
+            }
             ExitCode::SUCCESS
         }
         Err(error) => {

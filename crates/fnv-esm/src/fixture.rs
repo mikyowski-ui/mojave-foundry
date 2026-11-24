@@ -50,6 +50,10 @@ use crate::subrecord::RawSubrecord;
 /// The file format version this game's plugins declare in `HEDR`.
 pub const PLUGIN_VERSION: f32 = 1.34;
 
+/// The `HEDR` version Fallout 3 plugins declare; pass it to
+/// [`PluginBuilder::version`] for a Fallout 3 fixture.
+pub const FALLOUT3_PLUGIN_VERSION: f32 = 0.94;
+
 /// A 33 × 33 height grid with every vertex at `height`.
 pub fn flat_heights(height: f32) -> Vec<f32> {
     vec![height; LAND_VERTICES]

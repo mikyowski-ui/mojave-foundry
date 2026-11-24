@@ -1,0 +1,14 @@
+# Springvale (Fallout 3): the town by Vault 101, the default slice of a
+# Fallout 3 run (the built-in `springvale` is the same). Coordinates only:
+# exterior cell ranges and a map centre in source units. The centre lies
+# among the ruined ranch houses (cells -2,-2 to -2,-4); the cells hold the
+# window plus one cell all round. Vault 101's door is just west of it.
+# Run with --standalone; see docs/running.md.
+name = "springvale"
+game = "fo3"
+worldspace = "Wasteland"
+plugins = ["Fallout3.esm"]
+x = [-5, 0]
+y = [-6, -1]
+interior_depth = 1
+map_center = [-7100.0, -11200.0]

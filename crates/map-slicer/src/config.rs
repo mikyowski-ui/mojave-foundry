@@ -219,6 +219,12 @@ pub struct SlicerConfig {
     /// see [`crate::InteriorSlice`]. Off (`None`, the default), nothing
     /// changes.
     pub interior: Option<crate::InteriorSlice>,
+    /// The declutter and readability pass ([`crate::DeclutterProfile`],
+    /// the `declutter` module): protection, clutter, overhang and shell
+    /// pruning, the foreground cutaway, tones, outlines, floor metrics.
+    /// Off (`None`, the default), nothing changes;
+    /// [`crate::DeclutterProfile::readable`] is the preset.
+    pub declutter: Option<crate::DeclutterProfile>,
 }
 
 fn strings(items: &[&str]) -> Vec<String> {
@@ -311,6 +317,7 @@ impl Default for SlicerConfig {
             floor_min_up: 0.9,
             floor_reach: 2,
             interior: None,
+            declutter: None,
         }
     }
 }
@@ -375,6 +382,15 @@ impl SlicerConfig {
             interior
                 .validate()
                 .map_err(|e| crate::SliceError::Config(e.to_owned()))?;
+        }
+        if let Some(profile) = &self.declutter {
+            profile.validate().map_err(crate::SliceError::Config)?;
+            if let (Some(shell), Some(interior)) = (&profile.shell_cut, &self.interior)
+                && shell.cut_height < interior.cut_height
+                && shell.cut_height <= interior.floor_band[1]
+            {
+                return bad("declutter shell cut_height must stay above the floor band");
+            }
         }
         Ok(())
     }

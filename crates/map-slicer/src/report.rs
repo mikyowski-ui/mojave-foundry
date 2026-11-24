@@ -198,6 +198,127 @@ impl InteriorStats {
     }
 }
 
+/// References of one base kind the declutter pass kept and pruned.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KindTally {
+    /// Placed (not skipped by classification or by the pass).
+    pub kept: usize,
+    /// Skipped by a declutter rule.
+    pub pruned: usize,
+}
+
+/// What the foreground cutaway did ([`crate::Cutaway`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CutawayStats {
+    /// Strips checked against the walkers.
+    pub strips_considered: usize,
+    /// Strips cropped to the kerb.
+    pub strips_cut: usize,
+    /// Opaque pixels they lost.
+    pub pixels_removed: u64,
+    /// Cut strips left with no pixel (their hexes block without art).
+    pub strips_emptied: usize,
+    /// Walkers some strip hid, before and after the cut.
+    pub walkers_covered_before: usize,
+    pub walkers_covered_after: usize,
+}
+
+/// How a run's floor reads ([`crate::floor_stats`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FloorStats {
+    /// Floor hexes: the walkers and, indoors, the baked floor's hexes.
+    pub floor_hexes: usize,
+    /// Walker hexes given.
+    pub walkers: usize,
+    /// Of those, not blocked by anything placed.
+    pub walkable: usize,
+    /// Of those, hidden behind upright art drawn after them.
+    pub covered: usize,
+    /// Floor hexes holding a scenery, door, container or item placement.
+    pub occupied: usize,
+    /// Walkable hexes neither covered nor occupied.
+    pub open: usize,
+}
+
+impl FloorStats {
+    /// Open walkable hexes per floor hex (0 without floor).
+    pub fn open_ratio(&self) -> f64 {
+        if self.floor_hexes == 0 {
+            0.0
+        } else {
+            self.open as f64 / self.floor_hexes as f64
+        }
+    }
+
+    /// Floor hexes holding an object, per floor hex (0 without floor).
+    pub fn occupied_share(&self) -> f64 {
+        if self.floor_hexes == 0 {
+            0.0
+        } else {
+            self.occupied as f64 / self.floor_hexes as f64
+        }
+    }
+
+    /// Walkable hexes hidden behind upright art, per walkable hex.
+    pub fn covered_share(&self) -> f64 {
+        if self.walkable == 0 {
+            0.0
+        } else {
+            self.covered as f64 / self.walkable as f64
+        }
+    }
+}
+
+impl fmt::Display for FloorStats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "open floor {:.1} % ({} of {} floor hexes), {} of {} walkable hexes hidden \
+             ({:.1} %), objects on {:.1} % of the floor",
+            100.0 * self.open_ratio(),
+            self.open,
+            self.floor_hexes,
+            self.covered,
+            self.walkable,
+            100.0 * self.covered_share(),
+            100.0 * self.occupied_share()
+        )
+    }
+}
+
+/// What the declutter pass did ([`crate::DeclutterProfile`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DeclutterStats {
+    /// References pruned, by rule (skip reason label).
+    pub pruned: BTreeMap<String, usize>,
+    /// References kept and pruned, by base kind (`?` without one).
+    pub by_kind: BTreeMap<String, KindTally>,
+    /// Protected references, by the first reason that applies.
+    pub protected: BTreeMap<String, usize>,
+    pub protected_references: usize,
+    /// Decals baked at reduced opacity.
+    pub decals_faded: usize,
+    /// References given the lower shell cut.
+    pub shell_cut_references: usize,
+    /// Shells that kept the interior's cut for the wall art on them.
+    pub shells_kept_for_art: usize,
+    /// Sprite placements drawn with the outline.
+    pub outlined: usize,
+    pub cutaway: CutawayStats,
+    /// The floor of the same window without the pass
+    /// (`measure_baseline`).
+    pub floor_before: Option<FloorStats>,
+    /// The floor of this run.
+    pub floor_after: Option<FloorStats>,
+}
+
+impl DeclutterStats {
+    /// References pruned by every rule together.
+    pub fn pruned_total(&self) -> usize {
+        self.pruned.values().sum()
+    }
+}
+
 /// A landmark baked into the ground instead, and why.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LandmarkFallback {
@@ -275,6 +396,8 @@ pub struct BudgetReport {
     /// Interior mode's tallies; `None` when it is off. An estimate fills
     /// the settings and skips only.
     pub interior: Option<InteriorStats>,
+    /// The declutter pass's tallies; `None` when it is off.
+    pub declutter: Option<DeclutterStats>,
 }
 
 impl BudgetReport {
@@ -303,6 +426,7 @@ impl BudgetReport {
             landmarks: LandmarkStats::default(),
             ladder: Vec::new(),
             interior: None,
+            declutter: None,
         }
     }
 
@@ -491,6 +615,60 @@ impl fmt::Display for BudgetReport {
                 i.hanging,
                 i.below_floor
             );
+        }
+        if let Some(d) = &self.declutter {
+            let list = |m: &BTreeMap<String, usize>| {
+                m.iter()
+                    .map(|(k, n)| format!("{n} {k}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let _ = writeln!(
+                out,
+                "Declutter: {} references pruned ({}); {} protected ({})",
+                d.pruned_total(),
+                if d.pruned.is_empty() {
+                    "none".to_owned()
+                } else {
+                    list(&d.pruned)
+                },
+                d.protected_references,
+                if d.protected.is_empty() {
+                    "none".to_owned()
+                } else {
+                    list(&d.protected)
+                }
+            );
+            let kinds: Vec<String> = d
+                .by_kind
+                .iter()
+                .map(|(k, t)| format!("{k} {}/{}", t.kept, t.kept + t.pruned))
+                .collect();
+            let _ = writeln!(out, "  kept by kind: {}", kinds.join(", "));
+            let _ = writeln!(
+                out,
+                "  {} decals faded, {} shells cut lower ({} kept their cut for wall art), {} \
+                 sprites outlined",
+                d.decals_faded, d.shell_cut_references, d.shells_kept_for_art, d.outlined
+            );
+            let c = &d.cutaway;
+            let _ = writeln!(
+                out,
+                "  cutaway: {} of {} strips cut to the kerb ({} emptied), {} pixels removed; \
+                 walkers hidden by strips {} -> {}",
+                c.strips_cut,
+                c.strips_considered,
+                c.strips_emptied,
+                c.pixels_removed,
+                c.walkers_covered_before,
+                c.walkers_covered_after
+            );
+            if let Some(before) = &d.floor_before {
+                let _ = writeln!(out, "  floor before: {before}");
+            }
+            if let Some(after) = &d.floor_after {
+                let _ = writeln!(out, "  floor after: {after}");
+            }
         }
         let l = &self.landmarks;
         if l.references > 0 || !l.fallbacks.is_empty() {

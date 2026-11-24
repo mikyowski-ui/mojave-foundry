@@ -5,6 +5,8 @@
 //! `compare` image is drawn beside it on a common baseline, so scale and
 //! palette differences against original art show at a glance;
 //! [`frm_frame_rgba`] turns an original FRM frame into such an image.
+//! [`film_strips`] lays out one row of frames per animation, each frame
+//! placed by its anchor, the action frame marked.
 //! Labels use the crate's own 5 x 7 bitmap font ([`font`]). Output is
 //! deterministic: one input always gives the same pixels and PNG bytes.
 
@@ -15,6 +17,7 @@ mod metrics;
 mod png_io;
 mod reference;
 mod sheet;
+mod strip;
 
 pub use canvas::Canvas;
 pub use font::{draw_text, text_width, truncate_to_width};
@@ -26,6 +29,7 @@ pub use sheet::{
     Anchor, Background, CellLayout, Columns, MAX_SCALE, MAX_TEXT_SCALE, NEW_CAPTION, REF_CAPTION,
     SHOWN_KEY, Sheet, SheetOptions, Tile, Zoom, contact_sheet, contact_sheets,
 };
+pub use strip::{Strip, StripFrame, StripOptions, film_strips, film_strips_png};
 
 /// Every failure of this crate.
 #[derive(Debug, thiserror::Error)]

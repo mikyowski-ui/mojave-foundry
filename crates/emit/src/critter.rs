@@ -237,6 +237,150 @@ fn place_direction(
 /// match its size, non-finite or backward travel, and anything whose
 /// size, shift or offsets the format cannot store.
 pub fn critter_frm(frames: &CritterFrames, action_frame: u16) -> Result<FrmSpec, EmitError> {
+    critter_frm_with(
+        frames,
+        &FrmOptions {
+            action_frame,
+            motion: Motion::Cycle,
+        },
+    )
+}
+
+/// How a critter animation's `travel` becomes per-frame offsets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Motion {
+    /// A walk or run cycle, or a stand ([`travel_offsets`]): travel along
+    /// the facing's hex step only, the cycle's total rounded to whole hex
+    /// units so repeated cycles land on hexes.
+    #[default]
+    Cycle,
+    /// A non-looping animation (a fall, a knockback, a death) whose figure
+    /// ends away from where it started: the offsets follow `travel` in
+    /// both axes exactly, each frame rounded with the remainder carried
+    /// ([`free_offsets`]), so after frame `k` the engine's accumulated
+    /// displacement is the rounded total travel through `k` (SPEC-001
+    /// §3.5). The critter keeps that displacement while it shows the
+    /// animation's last frame; the format has no way to say where it
+    /// should return, so the next animation (a get-up) must carry
+    /// offsets that take it back, or use [`Motion::Baked`].
+    Free,
+    /// A non-looping animation drawn with zero offsets: each frame's
+    /// pixels are moved by its rounded total travel instead, so the figure
+    /// is drawn in the same place as with [`Motion::Free`] but the
+    /// object's displacement never changes. This is the robust choice for
+    /// falls and get-ups: it depends on no displacement left by an
+    /// earlier animation. It costs a larger frame rectangle.
+    Baked,
+}
+
+/// What [`critter_frm_with`] takes beyond the frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FrmOptions {
+    /// The FRM header's action-frame value (SPEC-001 §3.4): a delay in
+    /// frame steps, below the frame count. [`action_frame_for_contact`]
+    /// gives it for the frame on which a hit lands.
+    pub action_frame: u16,
+    pub motion: Motion,
+}
+
+/// The action-frame value for an attack, reach or dodge whose contact is
+/// shown on zero-based frame `contact` of `count`.
+///
+/// The value is a start delay: an entry delayed by `A` starts on the
+/// frame step that shows frame `A - 1` (SPEC-007 §3.10.1), so a contact on
+/// frame `f` is `A = f + 1`, and 0 means at once. [`critter_frm`] keeps
+/// the value below the frame count, so a contact on the last frame is
+/// moved one frame earlier. Corpus examples have `A` from 1 to 7 on 5 to
+/// 17 frames (SPEC-007 §3.10.2).
+pub fn action_frame_for_contact(contact: usize, count: usize) -> Result<u16, EmitError> {
+    if count == 0 || contact >= count {
+        return Err(EmitError::Frm(format!(
+            "contact frame {contact} is not one of {count} frames"
+        )));
+    }
+    let value = (contact + 1).min(count - 1);
+    u16::try_from(value)
+        .ok()
+        .filter(|value| *value <= FRM_MAX_FIELD)
+        .ok_or_else(|| EmitError::Frm(format!("action frame {value} exceeds {FRM_MAX_FIELD}")))
+}
+
+/// The action-frame value for a contact at `seconds` into an animation
+/// played at `fps` (stored 0 means 10): frame `round(seconds × fps)`,
+/// then [`action_frame_for_contact`].
+pub fn action_frame_at(seconds: f32, fps: u16, count: usize) -> Result<u16, EmitError> {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return Err(EmitError::Frm(format!(
+            "contact time {seconds} is not a time"
+        )));
+    }
+    let fps = if fps == 0 { 10 } else { fps };
+    let frame = (f64::from(seconds) * f64::from(fps)).round();
+    let frame = if frame >= count as f64 {
+        count.saturating_sub(1)
+    } else {
+        frame as usize
+    };
+    action_frame_for_contact(frame, count)
+}
+
+/// Per-frame offsets that follow `travel` exactly ([`Motion::Free`]): the
+/// running total of each axis rounded half away from zero at every frame,
+/// each offset the difference from the previous frame's. Refused:
+/// non-finite travel, and an offset outside the signed 16-bit field.
+pub fn free_offsets(travel: &[[f32; 2]]) -> Result<Vec<[i16; 2]>, EmitError> {
+    let totals = running_totals(travel)?;
+    let mut previous = [0_i64; 2];
+    let mut offsets = Vec::with_capacity(travel.len());
+    for (frame, total) in totals.iter().enumerate() {
+        let mut offset = [0_i16; 2];
+        for axis in 0..2 {
+            let delta = total[axis] - previous[axis];
+            offset[axis] = i16::try_from(delta).map_err(|_| {
+                EmitError::Frm(format!(
+                    "frame {frame}: offset {delta} does not fit the format's signed 16-bit field"
+                ))
+            })?;
+        }
+        previous = *total;
+        offsets.push(offset);
+    }
+    Ok(offsets)
+}
+
+/// Each frame's rounded total travel through it.
+fn running_totals(travel: &[[f32; 2]]) -> Result<Vec<[i64; 2]>, EmitError> {
+    let mut sum = [0.0_f64; 2];
+    travel
+        .iter()
+        .enumerate()
+        .map(|(frame, moved)| {
+            if !moved.iter().all(|value| value.is_finite()) {
+                return Err(EmitError::Frm(format!(
+                    "frame {frame}: travel {moved:?} is not finite"
+                )));
+            }
+            sum[0] += f64::from(moved[0]);
+            sum[1] += f64::from(moved[1]);
+            let rounded = sum.map(|value| value.round() as i64);
+            if rounded
+                .iter()
+                .any(|value| value.abs() > i64::from(i32::MAX) / 2)
+            {
+                return Err(EmitError::Frm(format!("frame {frame}: travel overflows")));
+            }
+            Ok(rounded)
+        })
+        .collect()
+}
+
+/// [`critter_frm`] with a choice of [`Motion`]. Refused as
+/// [`critter_frm`].
+pub fn critter_frm_with(
+    frames: &CritterFrames,
+    options: &FrmOptions,
+) -> Result<FrmSpec, EmitError> {
+    let action_frame = options.action_frame;
     let count = frames.directions[0].len();
     if count == 0 {
         return Err(EmitError::Frm(
@@ -266,8 +410,45 @@ pub fn critter_frm(frames: &CritterFrames, action_frame: u16) -> Result<FrmSpec,
     let mut directions = Vec::with_capacity(6);
     for (direction, list) in frames.directions.iter().enumerate() {
         let travel: Vec<[f32; 2]> = list.iter().map(|frame| frame.travel).collect();
-        let offsets = travel_offsets(direction, &travel)?;
-        directions.push(place_direction(direction, list, &offsets)?);
+        let placed = match options.motion {
+            Motion::Cycle => {
+                let offsets = travel_offsets(direction, &travel)?;
+                place_direction(direction, list, &offsets)?
+            }
+            Motion::Free => {
+                let offsets = free_offsets(&travel).map_err(|error| match error {
+                    EmitError::Frm(message) => {
+                        EmitError::Frm(format!("direction {direction}: {message}"))
+                    }
+                    other => other,
+                })?;
+                place_direction(direction, list, &offsets)?
+            }
+            Motion::Baked => {
+                let totals = running_totals(&travel)?;
+                let moved = list
+                    .iter()
+                    .zip(&totals)
+                    .map(|(frame, total)| {
+                        let shift = |origin: i32, by: i64| {
+                            i32::try_from(i64::from(origin) + by).map_err(|_| {
+                                EmitError::Frm(format!("direction {direction}: origin overflows"))
+                            })
+                        };
+                        Ok(RenderedFrame {
+                            origin: [
+                                shift(frame.origin[0], total[0])?,
+                                shift(frame.origin[1], total[1])?,
+                            ],
+                            travel: [0.0, 0.0],
+                            ..frame.clone()
+                        })
+                    })
+                    .collect::<Result<Vec<_>, EmitError>>()?;
+                place_direction(direction, &moved, &vec![[0, 0]; moved.len()])?
+            }
+        };
+        directions.push(placed);
     }
     Ok(FrmSpec {
         fps: frames.fps,

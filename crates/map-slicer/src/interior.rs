@@ -257,17 +257,20 @@ fn mesh_of(primitives: Vec<Primitive>, like: &StaticMesh) -> Option<StaticMesh> 
 /// translation) with its origin `lift` above the floor, into walls under
 /// the cut and floor (module documentation). `min_up` is the floor test's
 /// least upward normal component.
-pub(crate) fn split(
+/// The cut is `cut` above the floor: the interior's own
+/// ([`InteriorSlice::cut_height`]) or, for a room shell, the declutter
+/// pass's lower one.
+pub(crate) fn split_at(
     mesh: &StaticMesh,
     matrix: &[[f32; 4]; 3],
     lift: f32,
     interior: &InteriorSlice,
     min_up: f32,
+    cut: f32,
 ) -> Split {
     let mut out = Split::default();
     let mut walls = Vec::new();
     let mut floors = Vec::new();
-    let cut = interior.cut_height;
     for primitive in mesh.primitives.iter().filter(|p| p.is_well_formed()) {
         let placed: Vec<[f32; 3]> = primitive
             .positions

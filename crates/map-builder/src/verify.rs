@@ -18,6 +18,7 @@ use vault_formats::{
 
 use crate::BuildError;
 use crate::assemble::{EXIT_GRID_PID, MAPS_TXT};
+use crate::islands;
 
 /// One map that parsed back.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -510,6 +511,438 @@ pub fn verify_layer(
         report.maps.push(verified);
     }
     Ok(report)
+}
+
+/// What [`verify_links`] checked.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LinkCheck {
+    /// Exit grids checked, over every map and elevation.
+    pub grids: usize,
+    /// Distinct (map, elevation) to (map, elevation) links.
+    pub links: usize,
+    /// Of those, the ones with no exit grid leading back, as
+    /// `"<file> elevation <e> -> <file> elevation <f>"`.
+    pub one_way: Vec<String>,
+}
+
+/// One elevation's exit grids: hex -> (map, hex, elevation).
+type GridsByHex = BTreeMap<i32, (i32, i32, i32)>;
+
+/// The label of a link between two map elevations.
+pub(crate) fn pair_label(from: &str, from_elevation: u8, to: &str, to_elevation: u8) -> String {
+    format!("{from} elevation {from_elevation} -> {to} elevation {to_elevation}")
+}
+
+/// Every exit grid of every map of `layer` (mounted over `base_files`,
+/// parsed through `vault-formats`) followed to its destination:
+///
+/// - the destination map is a map of the layer (a real map or a stub);
+/// - the destination elevation exists there (it has tiles or objects);
+/// - the destination hex is 1 to 39999 (0 would keep the map's entrance),
+///   holds no exit grid of that elevation (arriving never leaves again)
+///   and no object that stops movement (the engine's rule, critters
+///   included): the hex is walkable there;
+/// - every link (map and elevation to map and elevation) is counted, and
+///   one with no grid leading back is listed in [`LinkCheck::one_way`].
+///
+/// A failed check is [`BuildError::Verify`] naming the map and grid.
+pub fn verify_links(
+    layer: &emit::ModLayer,
+    base_files: &BTreeMap<String, Vec<u8>>,
+) -> Result<LinkCheck, BuildError> {
+    let text = layer
+        .manifest_text()
+        .map_err(|e| BuildError::verify(MANIFEST, e))?;
+    let base = tree(base_files.clone(), "base files")?;
+    let mut layer_files: Vec<(String, Vec<u8>)> = layer
+        .files()
+        .iter()
+        .map(|(path, bytes)| (path.clone(), bytes.clone()))
+        .collect();
+    layer_files.push((MANIFEST.to_owned(), text.into_bytes()));
+    let mounted = tree(layer_files, "layer files")?;
+    let vfs = LayeredVfs::new(
+        Arc::new(base),
+        vec![vault_formats::ModLayer::from_tree("map-builder", mounted)],
+    );
+    let catalog = LocalPrototypeCatalog::for_game(&vfs, GameProfile::Fallout2);
+    let mut by_number: BTreeMap<u32, String> = BTreeMap::new();
+    for map in &layer.manifest().maps {
+        by_number.insert(map.number, map.file.clone());
+    }
+    let mut maps: BTreeMap<String, MapFile> = BTreeMap::new();
+    for file in by_number.values() {
+        let path = format!("maps/{file}");
+        let bytes = layer
+            .files()
+            .get(&path)
+            .ok_or_else(|| BuildError::verify(&path, "is registered but missing"))?;
+        let map = MapFile::parse_for(bytes, &catalog, GameProfile::Fallout2)
+            .map_err(|e| BuildError::verify(&path, e))?;
+        maps.insert(file.clone(), map);
+    }
+    let number_of: BTreeMap<&str, u32> = by_number
+        .iter()
+        .map(|(number, file)| (file.as_str(), *number))
+        .collect();
+    // Per (file, elevation): exit grids by hex, and blocked hexes.
+    let mut grids: BTreeMap<(String, u8), GridsByHex> = BTreeMap::new();
+    let mut blocked: BTreeMap<(String, u8), Vec<bool>> = BTreeMap::new();
+    for (file, map) in &maps {
+        for (e, objects) in map.objects.elevations.iter().enumerate() {
+            let key = (file.clone(), e as u8);
+            blocked.insert(key.clone(), islands::engine_blocked(objects));
+            let mut here = BTreeMap::new();
+            for object in objects {
+                if let ObjectState::Other {
+                    detail:
+                        ObjectDetail::ExitGrid {
+                            map: to,
+                            hex,
+                            elevation,
+                            ..
+                        },
+                    ..
+                } = &object.state
+                    && let Some(at) = object.hex
+                {
+                    here.insert(at, (*to, *hex, *elevation));
+                }
+            }
+            grids.insert(key, here);
+        }
+    }
+    let mut check = LinkCheck::default();
+    let mut pairs: BTreeSet<(String, u8, String, u8)> = BTreeSet::new();
+    for ((file, e), here) in &grids {
+        for (at, (to, hex, elevation)) in here {
+            let place = format!("maps/{file}");
+            let what = format!("the exit grid on hex {at}, elevation {e}");
+            let to_file = u32::try_from(*to)
+                .ok()
+                .and_then(|n| by_number.get(&n))
+                .ok_or_else(|| {
+                    BuildError::verify(
+                        &place,
+                        format!("{what} leads to map {to}, not in the layer"),
+                    )
+                })?;
+            let to_elevation = u8::try_from(*elevation)
+                .ok()
+                .filter(|e| *e <= 2)
+                .ok_or_else(|| {
+                    BuildError::verify(&place, format!("{what} leads to elevation {elevation}"))
+                })?;
+            let target = &maps[to_file];
+            let level = usize::from(to_elevation);
+            if target.tiles[level].is_none() && target.objects.elevations[level].is_empty() {
+                return Err(BuildError::verify(
+                    &place,
+                    format!("{what} leads to {to_file} elevation {to_elevation}, which is omitted"),
+                ));
+            }
+            if !(1..40_000).contains(hex) {
+                return Err(BuildError::verify(
+                    &place,
+                    format!("{what} leads to hex {hex}; 0 would keep the entrance"),
+                ));
+            }
+            let key = (to_file.clone(), to_elevation);
+            if grids[&key].contains_key(hex) {
+                return Err(BuildError::verify(
+                    &place,
+                    format!("{what} arrives on an exit grid of {to_file} (hex {hex})"),
+                ));
+            }
+            if blocked[&key][*hex as usize] {
+                return Err(BuildError::verify(
+                    &place,
+                    format!("{what} arrives on hex {hex} of {to_file}, which an object blocks"),
+                ));
+            }
+            check.grids += 1;
+            pairs.insert((file.clone(), *e, to_file.clone(), to_elevation));
+        }
+    }
+    check.links = pairs.len();
+    for (file, e, to, f) in &pairs {
+        let from_number = number_of[file.as_str()] as i32;
+        let back = grids[&(to.clone(), *f)]
+            .values()
+            .any(|(map, _, elevation)| *map == from_number && *elevation == i32::from(*e));
+        if !back {
+            check.one_way.push(pair_label(file, *e, to, *f));
+        }
+    }
+    Ok(check)
+}
+
+/// What [`verify_loot`] checked.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LootCheck {
+    /// Item prototypes of the layer checked.
+    pub item_prototypes: usize,
+    /// Weapons with a default ammunition PID: it resolves to ammunition of
+    /// the weapon's calibre.
+    pub weapons_with_ammo: usize,
+    /// Miscellaneous items with a power source that resolves to
+    /// ammunition of its calibre.
+    pub powered: usize,
+    /// Item prototypes (containers excepted) whose inventory art resolves
+    /// to an `art/inven` FRM.
+    pub inventory_art: usize,
+    /// Item prototypes (containers excepted) without inventory art, by
+    /// PID: generic converted items have none.
+    pub no_inventory_art: Vec<u32>,
+    /// Prototypes whose name and description records are in their mounted
+    /// message file.
+    pub messages: usize,
+    /// Inventory records on the maps (every depth) whose PID resolves to
+    /// an item and whose art resolves.
+    pub inventory_records: usize,
+    /// Maps that parse and write back to the same bytes.
+    pub maps: usize,
+}
+
+/// Mount `layer` (and its manifest text) over `base_files`.
+fn mount(
+    layer: &emit::ModLayer,
+    base_files: &BTreeMap<String, Vec<u8>>,
+) -> Result<LayeredVfs, BuildError> {
+    let text = layer
+        .manifest_text()
+        .map_err(|e| BuildError::verify(MANIFEST, e))?;
+    let base = tree(base_files.clone(), "base files")?;
+    let mut layer_files: Vec<(String, Vec<u8>)> = layer
+        .files()
+        .iter()
+        .map(|(path, bytes)| (path.clone(), bytes.clone()))
+        .collect();
+    layer_files.push((MANIFEST.to_owned(), text.into_bytes()));
+    let mounted = tree(layer_files, "layer files")?;
+    Ok(LayeredVfs::new(
+        Arc::new(base),
+        vec![vault_formats::ModLayer::from_tree("map-builder", mounted)],
+    ))
+}
+
+/// The items, inventories and names of `layer` (mounted over
+/// `base_files`), parsed back through `vault-formats`:
+///
+/// - every `.pro` of the layer with a message base has its name and
+///   description records (base and base + 1) in its category's mounted
+///   message file;
+/// - every item prototype of the layer but a container either has
+///   inventory art that resolves (`ArtCatalog`, category 7) to an FRM that
+///   parses, or is listed in [`LootCheck::no_inventory_art`];
+/// - a weapon's default ammunition PID, and a miscellaneous item's power
+///   source, resolves to ammunition of the same calibre (a layer
+///   prototype; a base PID must resolve as ammunition);
+/// - every map parses (`MapFile::parse_for`, Fallout 2) and writes back to
+///   the same bytes; every inventory record, at every depth, has an item
+///   PID that resolves, a quantity of 1 or more, and art that resolves.
+///
+/// [`crate::build_layer`] runs it on a layer built with a catalogue and
+/// refuses one whose catalogue items lack inventory art.
+pub fn verify_loot(
+    layer: &emit::ModLayer,
+    base_files: &BTreeMap<String, Vec<u8>>,
+) -> Result<LootCheck, BuildError> {
+    use vault_formats::pro::{ItemData, ItemSubtype};
+    let vfs = mount(layer, base_files)?;
+    let catalog = LocalPrototypeCatalog::for_game(&vfs, GameProfile::Fallout2);
+    let art = ArtCatalog::load(&vfs).map_err(|e| BuildError::verify("art lists", e))?;
+    let mut check = LootCheck::default();
+    let mut messages: BTreeMap<Category, MsgCatalog> = BTreeMap::new();
+    let mut items: BTreeMap<u32, Prototype> = BTreeMap::new();
+    let mut frm_checked: BTreeSet<String> = BTreeSet::new();
+    let mut frm_at = |fid: Fid, at: &str| -> Result<(), BuildError> {
+        let target = art
+            .path(fid)
+            .map_err(|e| BuildError::verify(at, format!("FID {:#010x}: {e}", fid.0)))?;
+        if frm_checked.insert(target.clone()) {
+            let bytes = vfs.read(&target).map_err(|e| {
+                BuildError::verify(at, format!("FID {:#010x} names {target}: {e}", fid.0))
+            })?;
+            FrmArchive::parse(&bytes).map_err(|e| BuildError::verify(&target, e))?;
+        }
+        Ok(())
+    };
+    for (path, bytes) in layer.files() {
+        if !path.ends_with(".pro") {
+            continue;
+        }
+        let prototype = Prototype::parse_for(bytes, GameProfile::Fallout2)
+            .map_err(|e| BuildError::verify(path, e))?;
+        if prototype.message_base >= 0 {
+            let category = prototype.category;
+            if let std::collections::btree_map::Entry::Vacant(slot) = messages.entry(category) {
+                let file = emit::proto::message_file_path(category, crate::LANGUAGE);
+                let bytes = vfs
+                    .read(&file)
+                    .map_err(|e| BuildError::verify(path, format!("{file}: {e}")))?;
+                slot.insert(
+                    MsgCatalog::parse_strict(&bytes).map_err(|e| BuildError::verify(&file, e))?,
+                );
+            }
+            let file = &messages[&category];
+            for id in [prototype.message_base, prototype.message_base + 1] {
+                if file.get(id).is_none() {
+                    return Err(BuildError::verify(
+                        path,
+                        format!(
+                            "message {id} is not in {}",
+                            emit::proto::message_file_path(category, crate::LANGUAGE)
+                        ),
+                    ));
+                }
+            }
+            check.messages += 1;
+        }
+        if let PrototypeData::Item(item) = &prototype.data {
+            check.item_prototypes += 1;
+            if !matches!(item.data, ItemData::Container { .. }) {
+                if item.inventory_art == u32::MAX {
+                    check.no_inventory_art.push(prototype.pid);
+                } else {
+                    let fid = Fid(item.inventory_art);
+                    if fid.category() != emit::icon::INVENTORY_CATEGORY {
+                        return Err(BuildError::verify(
+                            path,
+                            format!("inventory art {:#010x} is not art/inven art", fid.0),
+                        ));
+                    }
+                    frm_at(fid, path)?;
+                    check.inventory_art += 1;
+                }
+            }
+            items.insert(prototype.pid, prototype);
+        }
+    }
+    // Ammunition links, once every layer item is known.
+    let caliber_of = |pid: i32, at: &str| -> Result<Option<i32>, BuildError> {
+        let pid = pid as u32;
+        if let Some(prototype) = items.get(&pid) {
+            return match &prototype.data {
+                PrototypeData::Item(item) => match item.data {
+                    ItemData::Ammunition { caliber, .. } => Ok(Some(caliber)),
+                    _ => Err(BuildError::verify(
+                        at,
+                        format!("{pid:#010x} is not ammunition"),
+                    )),
+                },
+                _ => Err(BuildError::verify(
+                    at,
+                    format!("{pid:#010x} is not an item"),
+                )),
+            };
+        }
+        let info = catalog
+            .lookup(pid)
+            .map_err(|e| BuildError::verify(at, format!("ammunition {pid:#010x}: {e}")))?;
+        if info.kind != PrototypeKind::Item(ItemSubtype::Ammunition) {
+            return Err(BuildError::verify(
+                at,
+                format!("{pid:#010x} is not ammunition"),
+            ));
+        }
+        Ok(None)
+    };
+    for (pid, prototype) in &items {
+        let at = format!("item prototype {pid:#010x}");
+        let PrototypeData::Item(item) = &prototype.data else {
+            continue;
+        };
+        match &item.data {
+            ItemData::Weapon(weapon) if weapon.ammo_pid != -1 => {
+                if let Some(caliber) = caliber_of(weapon.ammo_pid, &at)?
+                    && caliber != weapon.caliber
+                {
+                    return Err(BuildError::verify(
+                        &at,
+                        format!(
+                            "weapon of calibre {} loads ammunition {:#010x} of calibre {caliber}",
+                            weapon.caliber, weapon.ammo_pid
+                        ),
+                    ));
+                }
+                check.weapons_with_ammo += 1;
+            }
+            ItemData::Misc {
+                power_pid,
+                power_type,
+                ..
+            } if *power_pid != -1 => {
+                if let Some(caliber) = caliber_of(*power_pid, &at)?
+                    && caliber != *power_type
+                {
+                    return Err(BuildError::verify(
+                        &at,
+                        format!(
+                            "power source {power_pid:#010x} is of calibre {caliber}, not \
+                             {power_type}"
+                        ),
+                    ));
+                }
+                check.powered += 1;
+            }
+            _ => {}
+        }
+    }
+    // Maps: inventories at every depth, and the round trip.
+    fn walk(
+        object: &vault_formats::map::MapObject,
+        catalog: &LocalPrototypeCatalog<'_>,
+        path: &str,
+        frm_at: &mut dyn FnMut(Fid, &str) -> Result<(), BuildError>,
+        records: &mut usize,
+    ) -> Result<(), BuildError> {
+        for entry in &object.inventory {
+            let child = &entry.object;
+            let at = format!("object {} holds object {}", object.id, child.id);
+            if entry.quantity == 0 {
+                return Err(BuildError::verify(path, format!("{at}: quantity 0")));
+            }
+            let info = catalog
+                .lookup(child.pid)
+                .map_err(|e| BuildError::verify(path, format!("{at}: {e}")))?;
+            if !matches!(info.kind, PrototypeKind::Item(_)) {
+                return Err(BuildError::verify(
+                    path,
+                    format!("{at}: PID {:#010x} is not an item", child.pid),
+                ));
+            }
+            frm_at(Fid(child.art_id), path)?;
+            *records += 1;
+            walk(child, catalog, path, frm_at, records)?;
+        }
+        Ok(())
+    }
+    for (path, bytes) in layer.files() {
+        if !path.ends_with(".map") {
+            continue;
+        }
+        let map = MapFile::parse_for(bytes, &catalog, GameProfile::Fallout2)
+            .map_err(|e| BuildError::verify(path, e))?;
+        for object in map.objects.elevations.iter().flatten() {
+            walk(
+                object,
+                &catalog,
+                path,
+                &mut frm_at,
+                &mut check.inventory_records,
+            )?;
+        }
+        let written = map.write().map_err(|e| BuildError::verify(path, e))?;
+        if written != *bytes {
+            return Err(BuildError::verify(
+                path,
+                "does not write back to the same bytes",
+            ));
+        }
+        check.maps += 1;
+    }
+    Ok(check)
 }
 
 /// A layer's critter prototype: Fallout 2 critter data, resolving as a

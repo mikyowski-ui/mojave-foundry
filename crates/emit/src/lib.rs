@@ -17,38 +17,67 @@
 //!   [`proto::critter_prototype`] and [`map::critter_object`] for the
 //!   prototype and the placed record (`docs/contracts.md` section 10).
 //! - [`proto`]: prototype constructors, lists, PIDs and messages.
+//! - [`items`]: weapons, armour, ammunition, drugs, keys and powered
+//!   items; [`transit`]: stairs, ladders, elevators; [`fighter`]:
+//!   critters that fight.
+//! - [`objects`]: map objects with state (containers with contents,
+//!   locked doors, loaded weapons, armed critters).
+//! - [`text`]: names and descriptions for the prototype message files.
+//! - [`icon`]: inventory icons and the item art pair.
+//! - [`animation`]: critter animation and weapon codes, suffixes, and the
+//!   files a fighting critter needs.
+//! - [`rebalance`]: source-game figures to Fallout 2 prototype values.
 //! - [`ModLayer`]: the mod folder and its manifest.
 
 /// The pinned Fallout 2 format crate every adapter here targets.
 pub use vault_formats;
 
+pub mod animation;
 pub mod art;
 pub mod critter;
 mod error;
+pub mod fighter;
 pub mod frm;
 pub mod gam;
+pub mod icon;
+pub mod items;
 pub mod layer;
 pub mod lst;
 pub mod map;
 pub mod msg;
+pub mod objects;
+mod overlay;
 pub mod proto;
+pub mod rebalance;
+pub mod text;
+pub mod transit;
 mod writers;
 
+pub use animation::{Anim, AnimationSet, AttackMode, Need, Requirement, WeaponCode};
 pub use art::{
     ArtList, CRITTER_LIST_PATH, CritterArt, CritterList, FID_INDEX_CAP, RESERVED_TILE_ENTRIES,
     TILE_CATEGORY, WALL_CATEGORY, critter_fid, standalone_reserved,
 };
-pub use critter::{CritterFrames, HEX_STEPS, RenderedFrame, critter_frm, still_frm};
+pub use critter::{
+    CritterFrames, FrmOptions, HEX_STEPS, Motion, RenderedFrame, critter_frm, critter_frm_with,
+    still_frm,
+};
 pub use error::EmitError;
+pub use fighter::{FighterSpec, fighter_prototype};
 pub use frm::{
     CroppedImage, FrmDirection, FrmFrameSpec, FrmSpec, PlacedFrame, crop_to_content, placed_frame,
     sprite_shift,
 };
 pub use gam::GamVar;
+pub use icon::ItemArt;
+pub use items::{AmmoSpec, ArmorSpec, DamageType, DrugSpec, KeySpec, MiscSpec, Skill, WeaponSpec};
 pub use layer::ModLayer;
 pub use lst::LstLine;
-pub use map::{CritterPlacement, critter_object};
+pub use map::{CritterPlacement, MapEntry, critter_object, map_with_elevations};
 pub use msg::{MsgEntry, MsgFile};
+pub use objects::{Loadout, LockState, ProtoSet, Stack};
 pub use proto::{CritterSpec, ProtoList, critter_prototype};
+pub use rebalance::Rebalance;
+pub use text::{Described, ProtoText, describe};
 pub use vault_formats::GamSection;
 pub use writers::{FormatWriters, LocalWriters};

@@ -300,6 +300,11 @@ pub fn sprites(inputs: &Inputs) -> Result<SpritesSummary, ConvertError> {
     prefix.update(Sha256::digest(&palette_bytes));
     prefix.update(backend_name(backend).as_bytes());
     prefix.update([u8::from(inputs.outline)]);
+    // The game is in the key from Fallout 3 on; a New Vegas run hashes
+    // nothing new, so its existing sprites stay valid.
+    if inputs.game != mir::GameVariant::FalloutNewVegas {
+        prefix.update(inputs.game.id().as_bytes());
+    }
     let shared = Shared {
         mir: &mir,
         inputs,

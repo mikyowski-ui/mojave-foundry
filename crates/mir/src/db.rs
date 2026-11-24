@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::MirError;
 use crate::index::{BadRecord, Entry, Index, PluginFile, scan_common};
-use crate::model::{RawStore, SCHEMA_VERSION};
+use crate::model::{RECORDS_REVISION, RawStore, SCHEMA_VERSION};
 use crate::paths::{creature_model_path, normalize_mesh_path, normalize_texture_path};
 
 macro_rules! tables {
@@ -90,7 +90,9 @@ tables! {
     Weapons => "weapons" [
         "form TEXT PRIMARY KEY", "editor_id TEXT", "name TEXT", "model TEXT", "script TEXT",
         "value INTEGER", "health INTEGER", "weight REAL", "damage INTEGER", "clip_size INTEGER",
-        "ammo TEXT",
+        "ammo TEXT", "animation_type INTEGER", "skill INTEGER", "action_points REAL",
+        "min_spread REAL", "spread REAL", "fire_rate REAL", "min_range REAL", "max_range REAL",
+        "reload_time REAL", "vats_to_hit INTEGER", "projectiles INTEGER", "reach REAL",
     ];
     Armors => "armors" [
         "form TEXT PRIMARY KEY", "editor_id TEXT", "name TEXT", "model TEXT", "script TEXT",
@@ -168,6 +170,44 @@ tables! {
         "global TEXT", "param1 INTEGER NOT NULL", "param2 INTEGER NOT NULL",
         "run_on INTEGER NOT NULL", "reference TEXT", "is_or INTEGER NOT NULL",
     ];
+    Terminals => "terminals" [
+        "form TEXT PRIMARY KEY", "editor_id TEXT", "name TEXT", "model TEXT", "script TEXT",
+        "header_text TEXT", "difficulty INTEGER", "flags INTEGER", "server_type INTEGER",
+        "password_note TEXT", "sound TEXT", "items INTEGER NOT NULL",
+    ];
+    TerminalItems => "terminal_items" [
+        "terminal TEXT NOT NULL", "seq INTEGER NOT NULL", "text TEXT", "result_text TEXT",
+        "flags INTEGER", "display_note TEXT", "sub_terminal TEXT", "script_source TEXT",
+        "conditions INTEGER NOT NULL",
+    ];
+    Notes => "notes" [
+        "form TEXT PRIMARY KEY", "editor_id TEXT", "name TEXT", "model TEXT", "note_type INTEGER",
+        "text TEXT", "topic TEXT", "sound TEXT", "texture TEXT", "quests INTEGER NOT NULL",
+    ];
+    NoteQuests => "note_quests" [
+        "note TEXT NOT NULL", "seq INTEGER NOT NULL", "quest TEXT",
+    ];
+    Packages => "packages" [
+        "form TEXT PRIMARY KEY", "editor_id TEXT", "package_type INTEGER", "type_name TEXT",
+        "flags INTEGER", "month INTEGER", "day_of_week INTEGER", "date INTEGER", "hour INTEGER",
+        "duration INTEGER", "location_type INTEGER", "location TEXT", "location_value INTEGER",
+        "location_radius INTEGER", "location2_type INTEGER", "location2 TEXT",
+        "location2_value INTEGER", "location2_radius INTEGER", "target_type INTEGER",
+        "target TEXT", "target_value INTEGER", "target_count INTEGER", "target2_type INTEGER",
+        "target2 TEXT", "target2_value INTEGER", "target2_count INTEGER", "dialogue_topic TEXT",
+        "combat_style TEXT", "conditions INTEGER NOT NULL",
+    ];
+    ActorPackages => "actor_packages" [
+        "actor TEXT NOT NULL", "seq INTEGER NOT NULL", "package TEXT",
+    ];
+    ScriptRefs => "script_refs" [
+        "owner TEXT NOT NULL", "context TEXT NOT NULL", "seq INTEGER NOT NULL",
+        "form TEXT NOT NULL",
+    ];
+    QuestTargets => "quest_targets" [
+        "quest TEXT NOT NULL", "objective INTEGER NOT NULL", "seq INTEGER NOT NULL",
+        "target TEXT", "flags INTEGER NOT NULL",
+    ];
     BadRecords => "bad_records" [
         "seq INTEGER PRIMARY KEY", "plugin TEXT NOT NULL", "offset INTEGER NOT NULL",
         "sig TEXT NOT NULL", "form TEXT", "error TEXT NOT NULL",
@@ -197,6 +237,12 @@ const INDEXES: &[&str] = &[
     "CREATE INDEX info_responses_info ON info_responses(info, seq)",
     "CREATE INDEX conditions_owner ON conditions(owner, seq)",
     "CREATE INDEX conditions_function ON conditions(function)",
+    "CREATE INDEX terminal_items_terminal ON terminal_items(terminal, seq)",
+    "CREATE INDEX note_quests_note ON note_quests(note, seq)",
+    "CREATE INDEX actor_packages_actor ON actor_packages(actor, seq)",
+    "CREATE INDEX actor_packages_package ON actor_packages(package)",
+    "CREATE INDEX script_refs_owner ON script_refs(owner)",
+    "CREATE INDEX quest_targets_quest ON quest_targets(quest, objective, seq)",
 ];
 
 /// Records decoded per thread and wave.
@@ -371,6 +417,57 @@ impl Rows<'_, '_, '_> {
             let row = vec![text(self.owner.clone()), text(context), text(source)];
             self.push(T::EmbeddedScripts, row);
         }
+        self.script_refs(context, body);
+    }
+
+    /// The forms a script's reference list names (`SCRO`), resolved; a
+    /// form outside the plugin list is left out.
+    fn script_refs(&mut self, context: &str, body: &fnv_esm::ScriptBody) {
+        let forms = body.references.iter().filter_map(|r| match r {
+            fnv_esm::ScriptReference::Form(form) => Some(*form),
+            fnv_esm::ScriptReference::Local(_) => None,
+        });
+        for (seq, form) in forms.enumerate() {
+            let form = self.forms.get(form);
+            if form != Value::Null {
+                let row = vec![text(self.owner.clone()), text(context), len(seq), form];
+                self.push(T::ScriptRefs, row);
+            }
+        }
+    }
+
+    fn packages(&mut self, packages: &[FormId]) {
+        for (seq, package) in packages.iter().enumerate() {
+            let row = vec![text(self.owner.clone()), len(seq), self.forms.get(*package)];
+            self.push(T::ActorPackages, row);
+        }
+    }
+}
+
+/// The columns of a package location: type, form (for the types whose
+/// value is one), raw value, radius.
+fn location_values(f: &Forms<'_, '_>, location: Option<fnv_esm::PackageLocation>) -> [Value; 4] {
+    match location {
+        Some(l) => [
+            int(l.location_type),
+            f.opt(l.form()),
+            int(l.value),
+            int(l.radius),
+        ],
+        None => [Value::Null, Value::Null, Value::Null, Value::Null],
+    }
+}
+
+/// The columns of a package target: type, form, raw value, count.
+fn target_values(f: &Forms<'_, '_>, target: Option<fnv_esm::PackageTarget>) -> [Value; 4] {
+    match target {
+        Some(t) => [
+            int(t.target_type),
+            f.opt(t.form()),
+            int(t.value),
+            int(t.count),
+        ],
+        None => [Value::Null, Value::Null, Value::Null, Value::Null],
     }
 }
 
@@ -594,6 +691,7 @@ fn typed_rows(index: &Index<'_>, entry: &Entry<'_>, record: &Record) -> Vec<(T, 
         }
         Record::Weapon(w) => {
             let d = w.data;
+            let c = w.combat();
             rows.push(
                 T::Weapons,
                 vec![
@@ -608,6 +706,18 @@ fn typed_rows(index: &Index<'_>, entry: &Entry<'_>, record: &Record) -> Vec<(T, 
                     opt_int(d.map(|d| d.damage)),
                     opt_int(d.map(|d| d.clip_size)),
                     f.opt(w.ammo),
+                    opt_int(c.map(|c| c.animation_type)),
+                    opt_int(c.map(|c| c.skill)),
+                    opt_real(c.map(|c| c.action_points)),
+                    opt_real(c.map(|c| c.min_spread)),
+                    opt_real(c.map(|c| c.spread)),
+                    opt_real(c.map(|c| c.fire_rate)),
+                    opt_real(c.map(|c| c.min_range)),
+                    opt_real(c.map(|c| c.max_range)),
+                    opt_real(c.map(|c| c.reload_time)),
+                    opt_int(c.map(|c| c.vats_to_hit)),
+                    opt_int(c.map(|c| c.projectile_count)),
+                    opt_real(c.map(|c| c.reach)),
                 ],
             );
         }
@@ -716,6 +826,7 @@ fn typed_rows(index: &Index<'_>, entry: &Entry<'_>, record: &Record) -> Vec<(T, 
                 ],
             );
             rows.inventory(&n.inventory);
+            rows.packages(&n.packages);
         }
         Record::Creature(c) => {
             // The body model names are relative to the skeleton's folder.
@@ -746,6 +857,7 @@ fn typed_rows(index: &Index<'_>, entry: &Entry<'_>, record: &Record) -> Vec<(T, 
                 ],
             );
             rows.inventory(&c.inventory);
+            rows.packages(&c.packages);
         }
         Record::LandTexture(l) => {
             rows.push(
@@ -788,6 +900,7 @@ fn typed_rows(index: &Index<'_>, entry: &Entry<'_>, record: &Record) -> Vec<(T, 
                     opt_text(s.body.source.as_deref()),
                 ],
             );
+            rows.script_refs("script", &s.body);
             for local in &s.body.locals {
                 let row = vec![
                     key(),
@@ -843,6 +956,14 @@ fn typed_rows(index: &Index<'_>, entry: &Entry<'_>, record: &Record) -> Vec<(T, 
                 rows.push(T::QuestObjectives, row);
                 for (number, target) in objective.targets.iter().enumerate() {
                     let context = format!("objective {} target {number}", objective.index);
+                    let row = vec![
+                        key(),
+                        int(objective.index),
+                        len(number),
+                        f.get(target.target),
+                        int(target.flags),
+                    ];
+                    rows.push(T::QuestTargets, row);
                     for c in &target.conditions {
                         rows.condition(&context, c);
                     }
@@ -908,6 +1029,106 @@ fn typed_rows(index: &Index<'_>, entry: &Entry<'_>, record: &Record) -> Vec<(T, 
             }
             rows.embedded("result begin", &i.result_begin);
             rows.embedded("result end", &i.result_end);
+        }
+        Record::Terminal(t) => {
+            let d = t.data;
+            rows.push(
+                T::Terminals,
+                vec![
+                    key(),
+                    editor_id(),
+                    name(),
+                    model(),
+                    script(),
+                    opt_text(t.header_text.as_deref()),
+                    opt_int(d.map(|d| d.difficulty)),
+                    opt_int(d.map(|d| d.flags)),
+                    opt_int(d.map(|d| d.server_type)),
+                    f.opt(t.password_note),
+                    f.opt(t.sound),
+                    len(t.items.len()),
+                ],
+            );
+            for (seq, item) in t.items.iter().enumerate() {
+                let context = format!("item {seq}");
+                let source = item
+                    .script
+                    .source
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty());
+                let row = vec![
+                    key(),
+                    len(seq),
+                    opt_text(item.text.as_deref()),
+                    opt_text(item.result_text.as_deref()),
+                    opt_int(item.flags),
+                    f.opt(item.display_note),
+                    f.opt(item.sub_terminal),
+                    opt_text(source),
+                    len(item.conditions.len()),
+                ];
+                rows.push(T::TerminalItems, row);
+                for c in &item.conditions {
+                    rows.condition(&context, c);
+                }
+                rows.embedded(&context, &item.script);
+            }
+        }
+        Record::Note(n) => {
+            rows.push(
+                T::Notes,
+                vec![
+                    key(),
+                    editor_id(),
+                    name(),
+                    model(),
+                    opt_int(n.note_type),
+                    opt_text(n.text.as_deref()),
+                    f.opt(n.topic),
+                    f.opt(n.sound),
+                    opt_text(
+                        n.texture
+                            .as_deref()
+                            .map(normalize_texture_path)
+                            .filter(|p| !p.is_empty())
+                            .as_deref(),
+                    ),
+                    len(n.quests.len()),
+                ],
+            );
+            for (seq, quest) in n.quests.iter().enumerate() {
+                rows.push(T::NoteQuests, vec![key(), len(seq), f.get(*quest)]);
+            }
+        }
+        Record::Package(p) => {
+            let d = p.data.as_ref();
+            let s = p.schedule;
+            let mut row = vec![
+                key(),
+                editor_id(),
+                opt_int(d.map(|d| d.package_type)),
+                opt_text(d.and_then(|d| d.type_name())),
+                opt_int(d.map(|d| d.flags)),
+                opt_int(s.map(|s| s.month)),
+                opt_int(s.map(|s| s.day_of_week)),
+                opt_int(s.map(|s| s.date)),
+                opt_int(s.map(|s| s.hour)),
+                opt_int(s.map(|s| s.duration)),
+            ];
+            row.extend(location_values(f, p.location));
+            row.extend(location_values(f, p.location2));
+            row.extend(target_values(f, p.target));
+            row.extend(target_values(f, p.target2));
+            row.push(f.opt(p.dialogue.as_ref().map(|d| d.topic)));
+            row.push(f.opt(p.combat_style));
+            row.push(len(p.conditions.len()));
+            rows.push(T::Packages, row);
+            for c in &p.conditions {
+                rows.condition("package", c);
+            }
+            for (name, event) in p.events() {
+                rows.embedded(name, &event.script);
+            }
         }
         Record::Race(_)
         | Record::HeadPart(_)
@@ -1052,6 +1273,7 @@ pub(crate) fn build(
     plugins: &[PluginFile],
     raw: RawStore,
     jobs: usize,
+    game: fnv_esm::GameVariant,
 ) -> Result<BuildStats, MirError> {
     let tmp = path.with_extension("sqlite.tmp");
     if tmp.exists() {
@@ -1084,6 +1306,8 @@ pub(crate) fn build(
             meta.execute(("schema_version", SCHEMA_VERSION.to_string()))?;
             meta.execute(("raw_store", raw.as_str()))?;
             meta.execute(("records", index.entries().len().to_string()))?;
+            meta.execute(("game", game.id()))?;
+            meta.execute(("records_revision", RECORDS_REVISION.to_string()))?;
             let mut plugin_row = tx.prepare("INSERT INTO plugins VALUES (?1, ?2, ?3, ?4)")?;
             for (order, file) in plugins.iter().enumerate() {
                 plugin_row.execute((

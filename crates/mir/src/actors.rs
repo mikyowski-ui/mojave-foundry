@@ -22,6 +22,18 @@
 //! actor has the group's bit and a template, move to the template. The
 //! actor reached supplies the group.
 //!
+//! # Skeletons
+//!
+//! An NPC's skeleton is the model of the actor that supplies its model
+//! group, but only when that file is a character skeleton: in the data,
+//! decodable, with the humanoid root, a hip bone and the head bone. An
+//! editor marker, a missing file or a skeleton without those bones gives
+//! way to the race's skeleton (`skeleton.nif` beside the race's upper body
+//! model for the actor's sex), then to [`HUMAN_SKELETON`], and a note says
+//! so. The retail masters store the creature marker as the model of NPCs
+//! whose template chain reaches a leveled NPC list, with or without the
+//! model flag.
+//!
 //! # Leveled lists
 //!
 //! A leveled list (a template, a placed base or an inventory item)
@@ -40,7 +52,8 @@ use fnv_esm::{BipedData, Record};
 
 use crate::index::{Index, Key, content_hash};
 use crate::model::{
-    ActorDoc, ActorKind, ActorPart, ActorTint, PartRole, RefKind, Reference, SCHEMA_VERSION,
+    ActorDoc, ActorKind, ActorPart, ActorTint, ActorWeapon, PartRole, RefKind, Reference,
+    SCHEMA_VERSION,
 };
 use crate::paths::{FormKey, creature_model_path, normalize_mesh_path, normalize_texture_path};
 use crate::source::DataSource;
@@ -64,14 +77,192 @@ const FLAG_PC_LEVEL_MULT: u32 = 0x0000_0080;
 /// The longest template or leveled-list chain followed.
 pub const MAX_CHAIN: usize = 32;
 
-/// The human skeleton.
+/// The human skeleton, shared by both sexes: the last resort of every NPC.
 pub const HUMAN_SKELETON: &str = "meshes\\characters\\_male\\skeleton.nif";
+
+/// The file name every race's skeleton has, in the folder of the race's
+/// upper body model.
+const RACE_SKELETON_NAME: &str = "skeleton.nif";
+
+/// The start of the file name of the editor's marker meshes (such as
+/// `marker_creature.nif`), which are never a skeleton.
+const MARKER_PREFIX: &str = "marker";
+
+/// The humanoid root bone every character skeleton has.
+const SKELETON_ROOT: &str = "Bip01";
+/// The hip bones, one of which every character skeleton has.
+const SKELETON_HIPS: [&str; 2] = ["Bip01 Pelvis", "Bip01 Spine"];
+/// The head bone every character skeleton has; hats and hair hang on it.
+const SKELETON_HEAD: &str = "Bip01 Head";
 /// The human standing idle.
 pub const HUMAN_STAND: &str = "meshes\\characters\\_male\\locomotion\\mtidle.kf";
 /// The male forward walk.
 pub const HUMAN_WALK_MALE: &str = "meshes\\characters\\_male\\locomotion\\male\\mtforward.kf";
 /// The female forward walk.
 pub const HUMAN_WALK_FEMALE: &str = "meshes\\characters\\_male\\locomotion\\female\\mtforward.kf";
+
+/// The folder of every human animation.
+pub const HUMAN_ANIMATIONS: &str = "meshes\\characters\\_male\\";
+
+/// The weapon families that get armed animation slots for every human
+/// whatever it carries: a pistol and a rifle, the default armed sets.
+pub const DEFAULT_FAMILIES: [&str; 2] = ["1hp", "2hr"];
+
+/// Default weapon models per family, tried in order; the first found in
+/// the data is shown when an actor carries no weapon of the family. The
+/// paths exist in both games (checked on the owner's installs).
+pub const DEFAULT_WEAPONS: [(&str, u32, &[&str]); 2] = [
+    ("1hp", 3, &["meshes\\weapons\\1handpistol\\10mmpistol.nif"]),
+    (
+        "2hr",
+        5,
+        &[
+            "meshes\\weapons\\2handrifle\\huntingrifle.nif",
+            "meshes\\weapons\\2handrifle\\varmintrifle.nif",
+        ],
+    ),
+];
+
+/// The source's animation family of a weapon animation type (the first
+/// word of a weapon's `DNAM`): the prefix of its animation files. Public
+/// documentation of the record and the file names agree on the codes: 0
+/// hand to hand, 1 one-hand melee, 2 two-hand melee, 3 one-hand pistol,
+/// 4 one-hand energy pistol, 5 two-hand rifle, 6 two-hand automatic, 7
+/// two-hand energy rifle, 8 two-hand heavy ("handle"), 9 two-hand
+/// launcher, 10 grenade throw, 11 land mine, 12 mine drop, 13 thrown.
+pub fn weapon_family(animation_type: u32) -> Option<&'static str> {
+    Some(match animation_type {
+        0 => "h2h",
+        1 => "1hm",
+        2 => "2hm",
+        3 | 4 => "1hp",
+        5 | 7 => "2hr",
+        6 => "2ha",
+        8 => "2hh",
+        9 => "2hl",
+        10 | 13 => "1gt",
+        11 => "1lm",
+        12 => "1md",
+        _ => return None,
+    })
+}
+
+/// Families with aim, attack and equip animations: the ones a critter
+/// can be drawn holding. Thrown weapons and mines are left out.
+pub const ARMED_FAMILIES: [&str; 7] = ["1hm", "2hm", "1hp", "2ha", "2hr", "2hh", "2hl"];
+
+/// The animation slots a human document resolves beyond the stand and the
+/// walk, with the files tried for each, in order, relative to
+/// [`HUMAN_ANIMATIONS`]; the first one in the data wins.
+///
+/// Both games name these files alike, so one table serves both; what
+/// differs is which files exist (surveyed on the owner's installs with
+/// `cargo run -p nif --example animations`):
+///
+/// | Slot | First choice | Fallout 3 | New Vegas |
+/// |---|---|---|---|
+/// | `run` | `locomotion\<sex>\mtfastforward.kf` | yes | yes |
+/// | `dodge` | `mtblockhit.kf` (a block: neither game has a dodge) | yes | yes |
+/// | `hit_front` | `idleanims\mt_hittorso.kf` | yes | yes |
+/// | `punch` | `h2hattackright_a.kf` | yes | yes |
+/// | `kick` | `h2hattackpower.kf` (a power blow: neither game has a kick) | yes | yes |
+/// | `fall_back`, `fall_front` | `idleanims\mt_knockdownfaceup.kf`, `...facedown.kf` | yes | yes |
+/// | `reach_ground`, `reach_middle` | `idleanims\pickupgroundobject_0.3.kf`, `pickuptableobject_0.6.kf` | yes | yes |
+/// | `<f>.stand` | `<f>aim.kf` | every family | every family |
+/// | `<f>.walk` | `locomotion\<f>forward.kf` | `1hm`, `1hp` only | every family but `2hm` |
+/// | `<f>.equip`, `<f>.unequip` | `<f>equip.kf`, `<f>unequip.kf` | yes | yes |
+/// | `<f>.attack` | `<f>attackright.kf` | yes | yes |
+/// | `<f>.loop` | `<f>attackloop.kf` (automatic fire) | `1hp`, `2ha`, `2hh` | the same |
+/// | `<f>.block` | `<f>blockhit.kf` | melee families | melee families |
+///
+/// Neither game has a hit from behind, a human get-up, or a third-person
+/// death animation of its own (deaths are physics there; `deathpose1.kf`
+/// and `deathpose2.kf` are 0.17 s poses, and the per-class `<f>death.kf`
+/// files 0.07 s ones): those are left to the renderer (ragdoll falls,
+/// reversed falls for the get-ups).
+pub fn human_animation_slots(female: bool, families: &[&str]) -> Vec<(String, Vec<String>)> {
+    let sex = if female { "female" } else { "male" };
+    let mut slots: Vec<(String, Vec<String>)> = vec![
+        (
+            "run".into(),
+            vec![
+                format!("locomotion\\{sex}\\mtfastforward.kf"),
+                "locomotion\\male\\mtfastforward.kf".into(),
+            ],
+        ),
+        (
+            "dodge".into(),
+            vec!["mtblockhit.kf".into(), "h2hblockhit.kf".into()],
+        ),
+        (
+            "hit_front".into(),
+            vec![
+                "idleanims\\mt_hittorso.kf".into(),
+                "idleanims\\mt_hithead.kf".into(),
+                "h2hrecoil.kf".into(),
+            ],
+        ),
+        (
+            "punch".into(),
+            vec![
+                "h2hattackright_a.kf".into(),
+                "h2hattackleft_a.kf".into(),
+                "h2hattackpower.kf".into(),
+            ],
+        ),
+        ("kick".into(), vec!["h2hattackpower.kf".into()]),
+        (
+            "fall_back".into(),
+            vec!["idleanims\\mt_knockdownfaceup.kf".into()],
+        ),
+        (
+            "fall_front".into(),
+            vec!["idleanims\\mt_knockdownfacedown.kf".into()],
+        ),
+        (
+            "reach_ground".into(),
+            vec!["idleanims\\pickupgroundobject_0.3.kf".into()],
+        ),
+        (
+            "reach_middle".into(),
+            vec!["idleanims\\pickuptableobject_0.6.kf".into()],
+        ),
+    ];
+    let mut seen = BTreeSet::new();
+    for family in families {
+        if !ARMED_FAMILIES.contains(family) || !seen.insert(*family) {
+            continue;
+        }
+        let f = family;
+        slots.extend([
+            (format!("{f}.stand"), vec![format!("{f}aim.kf")]),
+            (
+                format!("{f}.walk"),
+                vec![format!("locomotion\\{f}forward.kf")],
+            ),
+            (format!("{f}.equip"), vec![format!("{f}equip.kf")]),
+            (format!("{f}.unequip"), vec![format!("{f}unequip.kf")]),
+            (
+                format!("{f}.attack"),
+                vec![
+                    format!("{f}attackright.kf"),
+                    format!("{f}attackleft.kf"),
+                    format!("{f}attack3.kf"),
+                    format!("{f}attackright_a.kf"),
+                    format!("{f}attackpower.kf"),
+                ],
+            ),
+            (format!("{f}.loop"), vec![format!("{f}attackloop.kf")]),
+            (format!("{f}.block"), vec![format!("{f}blockhit.kf")]),
+        ]);
+    }
+    for (_, candidates) in &mut slots {
+        for path in candidates.iter_mut() {
+            *path = format!("{HUMAN_ANIMATIONS}{path}");
+        }
+    }
+    slots
+}
 
 /// Race body part indexes and the biped slot each one fills.
 const BODY_SLOTS: [(u32, u32, &str); 3] = [
@@ -97,6 +288,9 @@ type Found = (u16, Record);
 struct Resolver<'i, 'a> {
     index: &'i Index<'a>,
     cache: BTreeMap<Key, Result<Found, String>>,
+    /// Skeleton paths checked: why each is not a character skeleton, or
+    /// `None` when it is one.
+    skeletons: BTreeMap<String, Option<String>>,
 }
 
 /// The notes of one actor.
@@ -122,7 +316,79 @@ impl<'i, 'a> Resolver<'i, 'a> {
         Self {
             index,
             cache: BTreeMap::new(),
+            skeletons: BTreeMap::new(),
         }
+    }
+
+    /// Why `path` is not a character skeleton, if it is not
+    /// ([`skeleton_problem`]); each path is read once.
+    fn skeleton_problem(&mut self, path: &str, source: &DataSource) -> Option<String> {
+        if let Some(problem) = self.skeletons.get(path) {
+            return problem.clone();
+        }
+        let problem = skeleton_problem(path, source);
+        self.skeletons.insert(path.to_owned(), problem.clone());
+        problem
+    }
+
+    /// The skeleton of an NPC: the model of its model supplier `model`
+    /// (`own`, normalised) when that is a character skeleton, otherwise
+    /// the race's skeleton (`race`), otherwise [`HUMAN_SKELETON`]. The
+    /// first of them that is a character skeleton is taken, and
+    /// [`HUMAN_SKELETON`] when none is (a broken data set; the extract
+    /// reports the file). A note says when the own model was passed over.
+    ///
+    /// The retail masters of both games give the editor's creature marker
+    /// as the model of most NPCs whose template chain (followed whatever
+    /// the template flags) reaches a leveled NPC list, 326 of 380 in one
+    /// and 638 of 719 in the other, and of no other NPC: the body comes
+    /// from whichever actor the list gives. An NPC without the model flag
+    /// keeps that marker as its own model, so it must not be taken for a
+    /// skeleton.
+    fn npc_skeleton(
+        &mut self,
+        model: Key,
+        own: Option<String>,
+        race: Option<String>,
+        source: &DataSource,
+        notes: &mut Notes,
+    ) -> String {
+        let mut candidates: Vec<(String, &str)> = Vec::new();
+        for (path, what) in [
+            (own.clone(), "its own model"),
+            (race, "the race's skeleton"),
+            (Some(HUMAN_SKELETON.to_owned()), "the human skeleton"),
+        ] {
+            if let Some(path) = path
+                && candidates.iter().all(|(p, _)| *p != path)
+            {
+                candidates.push((path, what));
+            }
+        }
+        let mut own_problem = None;
+        let mut chosen = None;
+        for (path, what) in candidates {
+            match self.skeleton_problem(&path, source) {
+                None => {
+                    chosen = Some((path, what));
+                    break;
+                }
+                Some(problem) if Some(&path) == own.as_ref() => own_problem = Some(problem),
+                Some(_) => {}
+            }
+        }
+        let (path, what) = chosen.unwrap_or((HUMAN_SKELETON.to_owned(), "the human skeleton"));
+        if Some(&path) != own.as_ref() {
+            let label = self.label(model);
+            notes.add(match (&own, own_problem) {
+                (Some(model_path), Some(problem)) => format!(
+                    "the model {model_path} of {label} {problem}, not a character skeleton; \
+                     {what} {path} is used"
+                ),
+                _ => format!("{label} names no model; {what} {path} is used"),
+            });
+        }
+        path
     }
 
     /// `form (editor id)`, for notes.
@@ -349,6 +615,82 @@ impl<'i, 'a> Resolver<'i, 'a> {
         }
     }
 
+    /// Expands an inventory item to weapons, through leveled item lists.
+    fn weapon_items(
+        &mut self,
+        key: Key,
+        seen: &mut BTreeSet<Key>,
+        depth: usize,
+        out: &mut Vec<Key>,
+        notes: &mut Notes,
+    ) {
+        if depth > MAX_CHAIN {
+            return;
+        }
+        let Ok((plugin, record)) = self.get(key) else {
+            return;
+        };
+        match record {
+            Record::Weapon(_) => out.push(key),
+            Record::Leveled(list) if list.kind == fnv_esm::LeveledKind::Item => {
+                if !seen.insert(key) {
+                    return;
+                }
+                for next in self.pick(plugin, &list, key, notes) {
+                    self.weapon_items(next, seen, depth + 1, out, notes);
+                }
+                seen.remove(&key);
+            }
+            _ => {}
+        }
+    }
+
+    /// The first weapon of an inventory, in inventory order, through
+    /// leveled item lists by the same rule as the outfit: what the actor
+    /// is drawn holding.
+    fn carried_weapon(&mut self, supplier: Key, notes: &mut Notes) -> Option<ActorWeapon> {
+        let (plugin, record) = self.get(supplier).ok()?;
+        let inventory = match &record {
+            Record::Npc(n) => n.inventory.clone(),
+            _ => return None,
+        };
+        let owner = self.label(supplier);
+        for item in inventory {
+            let what = format!("an inventory item of {owner}");
+            let Some(key) = self.resolve(plugin, item.item, &what, notes) else {
+                continue;
+            };
+            let mut found = Vec::new();
+            self.weapon_items(key, &mut BTreeSet::new(), 0, &mut found, notes);
+            for weapon_key in found {
+                let Ok((_, Record::Weapon(weapon))) = self.get(weapon_key) else {
+                    continue;
+                };
+                let Some(path) = weapon
+                    .common
+                    .model
+                    .as_deref()
+                    .map(normalize_mesh_path)
+                    .filter(|m| !m.is_empty())
+                else {
+                    notes.add(format!("weapon {} has no model", self.label(weapon_key)));
+                    continue;
+                };
+                let animation_type = weapon.combat().map_or(0, |c| c.animation_type);
+                return Some(ActorWeapon {
+                    form: Some(self.index.form_key(weapon_key)),
+                    editor_id: weapon.common.editor_id.clone(),
+                    path,
+                    mesh: None,
+                    animation_type,
+                    family: weapon_family(animation_type).unwrap_or("").to_owned(),
+                    carried: true,
+                });
+            }
+        }
+        None
+    }
+
     /// The worn pieces of an inventory, armour addons included, with the
     /// slots they cover. The first piece in inventory order wins a slot.
     fn outfit(&mut self, supplier: Key, female: bool, notes: &mut Notes) -> (Vec<Worn>, u32) {
@@ -454,7 +796,7 @@ impl<'i, 'a> Resolver<'i, 'a> {
         (worn, covered)
     }
 
-    fn npc(&mut self, actor: Key, doc: &mut ActorDoc, notes: &mut Notes) {
+    fn npc(&mut self, actor: Key, source: &DataSource, doc: &mut ActorDoc, notes: &mut Notes) {
         let index = self.index;
         let mut chains = BTreeMap::new();
         let mut follow = |me: &mut Self, flag: u16, group: &str, notes: &mut Notes| {
@@ -485,13 +827,12 @@ impl<'i, 'a> Resolver<'i, 'a> {
         if let Some((_, n)) = npc_of(self, base_data) {
             doc.name = n.common.full_name.clone();
         }
-        let skeleton = npc_of(self, model)
+        let own_skeleton = npc_of(self, model)
             .and_then(|(_, n)| n.common.model.as_deref().map(normalize_mesh_path))
-            .filter(|m| !m.is_empty())
-            .unwrap_or_else(|| HUMAN_SKELETON.to_owned());
-        doc.skeleton_path = Some(skeleton);
+            .filter(|m| !m.is_empty());
 
         let Some((plugin, traits_npc)) = npc_of(self, traits) else {
+            doc.skeleton_path = Some(self.npc_skeleton(model, own_skeleton, None, source, notes));
             return;
         };
         let female = traits_npc.base.is_some_and(|b| b.flags & FLAG_FEMALE != 0);
@@ -500,6 +841,7 @@ impl<'i, 'a> Resolver<'i, 'a> {
             hair: traits_npc.hair_color.map(|c| [c.r, c.g, c.b]),
         };
         let (worn, covered) = self.outfit(inventory, female, notes);
+        doc.weapons.extend(self.carried_weapon(inventory, notes));
         let mut parts = Vec::new();
 
         // The race: body parts not covered, and the head.
@@ -511,6 +853,7 @@ impl<'i, 'a> Resolver<'i, 'a> {
                 notes,
             )
         });
+        let mut race_skeleton = None;
         match race.map(|r| (r, self.get(r))) {
             None => notes.add(format!("{} has no race", self.label(traits))),
             Some((_, Err(reason))) => notes.add(reason),
@@ -518,6 +861,11 @@ impl<'i, 'a> Resolver<'i, 'a> {
                 doc.race = Some(index.form_key(r));
                 let sex = if female { "female" } else { "male" };
                 let body = race_record.body_parts(female);
+                race_skeleton = body
+                    .iter()
+                    .find(|p| p.index == 0)
+                    .and_then(|p| p.model.as_deref())
+                    .and_then(|m| skeleton_beside(&normalize_mesh_path(m)));
                 for (part_index, slot, name) in BODY_SLOTS {
                     if covered & slot != 0 {
                         continue;
@@ -613,6 +961,8 @@ impl<'i, 'a> Resolver<'i, 'a> {
             }
         }
         doc.parts = parts;
+        doc.skeleton_path =
+            Some(self.npc_skeleton(model, own_skeleton, race_skeleton, source, notes));
     }
 
     fn creature(&mut self, actor: Key, doc: &mut ActorDoc, notes: &mut Notes) {
@@ -702,6 +1052,8 @@ impl<'i, 'a> Resolver<'i, 'a> {
             animations: None,
             stand_path: None,
             walk_path: None,
+            animation_paths: BTreeMap::new(),
+            weapons: Vec::new(),
             tint: ActorTint::default(),
             appearance: String::new(),
             health: 0,
@@ -719,7 +1071,7 @@ impl<'i, 'a> Resolver<'i, 'a> {
             match self.get(actor) {
                 Ok((_, Record::Npc(_))) => {
                     doc.kind = ActorKind::Npc;
-                    self.npc(actor, &mut doc, &mut notes);
+                    self.npc(actor, source, &mut doc, &mut notes);
                 }
                 Ok((_, Record::Creature(_))) => {
                     doc.kind = ActorKind::Creature;
@@ -755,6 +1107,40 @@ impl<'i, 'a> Resolver<'i, 'a> {
                 Some(w) => doc.walk_path = Some(w.to_owned()),
                 None => notes.add(format!("walk {HUMAN_WALK_MALE} is not in the data")),
             }
+            // Further animations: the fixed slots, the carried weapon's
+            // family and the default ones. A slot the data lacks is left
+            // out without a note; the renderer reports what it had.
+            let mut families: Vec<&str> = Vec::new();
+            for weapon in &doc.weapons {
+                if let Some(f) = ARMED_FAMILIES.iter().copied().find(|f| *f == weapon.family) {
+                    families.push(f);
+                }
+            }
+            families.extend(DEFAULT_FAMILIES);
+            for (slot, candidates) in human_animation_slots(doc.female, &families) {
+                if let Some(path) = candidates.into_iter().find(|p| source.contains(p)) {
+                    doc.animation_paths.insert(slot, path);
+                }
+            }
+            for (family, animation_type, paths) in DEFAULT_WEAPONS {
+                if !DEFAULT_FAMILIES.contains(&family) {
+                    continue;
+                }
+                if doc.weapons.iter().any(|w| w.family == family) {
+                    continue;
+                }
+                if let Some(path) = paths.iter().find(|p| source.contains(p)) {
+                    doc.weapons.push(ActorWeapon {
+                        form: None,
+                        editor_id: None,
+                        path: (*path).to_owned(),
+                        mesh: None,
+                        animation_type,
+                        family: family.to_owned(),
+                        carried: false,
+                    });
+                }
+            }
         }
         doc.parts
             .sort_by(|a, b| (a.role, &a.path).cmp(&(b.role, &b.path)));
@@ -762,6 +1148,43 @@ impl<'i, 'a> Resolver<'i, 'a> {
         doc.notes = notes.0;
         doc
     }
+}
+
+/// The race skeleton beside a normalised body model: `skeleton.nif` in
+/// the model's folder.
+fn skeleton_beside(body: &str) -> Option<String> {
+    let (folder, _) = body.rsplit_once('\\')?;
+    Some(format!("{folder}\\{RACE_SKELETON_NAME}"))
+}
+
+/// Why `path` (normalised) is not a character skeleton, if it is not: an
+/// editor marker, a file the data lacks or that does not decode, or a
+/// skeleton without the humanoid root, a hip bone or the head bone.
+fn skeleton_problem(path: &str, source: &DataSource) -> Option<String> {
+    let name = path.rsplit('\\').next().unwrap_or(path);
+    if name.starts_with(MARKER_PREFIX) {
+        return Some("is an editor marker".to_owned());
+    }
+    let bytes = match source.read(path) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Some("is not in the data".to_owned()),
+        Err(error) => return Some(format!("does not read ({error})")),
+    };
+    let skeleton = match nif::parse(&bytes).and_then(|file| nif::extract_skeleton(&file)) {
+        Ok(skeleton) => skeleton,
+        Err(error) => return Some(format!("does not decode ({error})")),
+    };
+    let has = |bone: &str| skeleton.find(bone).is_some();
+    if !has(SKELETON_ROOT) {
+        return Some(format!("has no {SKELETON_ROOT} bone"));
+    }
+    if !SKELETON_HIPS.iter().any(|b| has(b)) {
+        return Some(format!("has no {} bone", SKELETON_HIPS.join(" or ")));
+    }
+    if !has(SKELETON_HEAD) {
+        return Some(format!("has no {SKELETON_HEAD} bone"));
+    }
+    None
 }
 
 /// A race texture path as an override, normalised.
@@ -802,6 +1225,9 @@ pub(crate) fn build<'r>(
             out.meshes.insert(part.path.clone());
             out.textures.extend(part.texture.clone());
         }
+        for weapon in &doc.weapons {
+            out.meshes.insert(weapon.path.clone());
+        }
         out.docs.push(doc);
     }
     out
@@ -837,7 +1263,7 @@ mod tests {
     use fnv_esm::fixture::PluginBuilder;
     use fnv_esm::{
         ActorBase, Armor, BipedData, ContainerItem, FormId, LeveledEntry, LeveledKind, LeveledList,
-        Npc,
+        Npc, Race, RacePart, RaceParts,
     };
 
     const PLUGIN: &str = "test.esm";
@@ -866,6 +1292,12 @@ mod tests {
     }
 
     fn resolve(plugin: &PluginBuilder, base: u32) -> ActorDoc {
+        resolve_with(plugin, base, &[])
+    }
+
+    /// [`resolve`] with loose files in the data directory, by normalised
+    /// path.
+    fn resolve_with(plugin: &PluginBuilder, base: u32, loose: &[(&str, Vec<u8>)]) -> ActorDoc {
         let bytes = plugin.build();
         let files = vec![PluginFile {
             name: PLUGIN.to_owned(),
@@ -874,9 +1306,191 @@ mod tests {
         }];
         let index = Index::build(&files).unwrap();
         let dir = tempfile::tempdir().unwrap();
+        for (path, bytes) in loose {
+            let file = dir.path().join(path.replace('\\', "/"));
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, bytes).unwrap();
+        }
         let source = DataSource::new(dir.path(), &[PLUGIN.to_owned()]).unwrap();
         let key = index.key(&FormKey::new(PLUGIN, base)).unwrap();
         Resolver::new(&index).actor(key, RefKind::Npc, &source)
+    }
+
+    const RACE: u32 = 0x50;
+    const RACE_SKELETON: &str = "meshes\\townsfolk\\skeleton.nif";
+    const CUSTOM_SKELETON: &str = "meshes\\custom\\skeleton.nif";
+    const MARKER: &str = "Marker_Creature.NIF";
+
+    /// A race whose male upper body sits beside [`RACE_SKELETON`].
+    fn race() -> Race {
+        let mut race = Race::new(RACE, "Townsfolk", "Townsfolk");
+        race.body = Some(RaceParts {
+            male: vec![RacePart::new(0, Some("Townsfolk\\UpperBody.nif"), None)],
+            female: Vec::new(),
+        });
+        race
+    }
+
+    /// An NPC of [`race`] with a model.
+    fn person(form: u32, template: Option<u32>, flags: u16, model: &str) -> Npc {
+        let mut n = npc(form, template, flags);
+        n.common.model = Some(model.to_owned()).filter(|m| !m.is_empty());
+        n.race = Some(FormId(RACE));
+        n
+    }
+
+    /// The race's, the custom and the human skeleton, all good ones.
+    fn skeletons() -> Vec<(&'static str, Vec<u8>)> {
+        let skeleton = nif::fixture::skeleton_nif();
+        vec![
+            (RACE_SKELETON, skeleton.clone()),
+            (CUSTOM_SKELETON, skeleton.clone()),
+            (HUMAN_SKELETON, skeleton),
+        ]
+    }
+
+    fn skeleton_notes(doc: &ActorDoc) -> Vec<&String> {
+        doc.notes
+            .iter()
+            .filter(|n| n.contains("skeleton"))
+            .collect()
+    }
+
+    #[test]
+    fn a_marker_model_gives_way_to_the_race_skeleton_then_the_human_one() {
+        let mut plugin = PluginBuilder::new();
+        plugin.add(race()).add(person(0x10, None, 0, MARKER));
+        let doc = resolve_with(&plugin, 0x10, &skeletons());
+        assert_eq!(doc.skeleton_path.as_deref(), Some(RACE_SKELETON));
+        let notes = skeleton_notes(&doc);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].contains("meshes\\marker_creature.nif"),
+            "{notes:?}"
+        );
+        assert!(notes[0].contains("is an editor marker"), "{notes:?}");
+        assert!(notes[0].contains("the race's skeleton"), "{notes:?}");
+
+        // Without the race's skeleton in the data: the human skeleton.
+        let only_human = vec![(HUMAN_SKELETON, nif::fixture::skeleton_nif())];
+        let doc = resolve_with(&plugin, 0x10, &only_human);
+        assert_eq!(doc.skeleton_path.as_deref(), Some(HUMAN_SKELETON));
+        assert!(
+            doc.notes.iter().any(|n| n.contains("the human skeleton")),
+            "{:?}",
+            doc.notes
+        );
+
+        // Nothing usable at all: the human skeleton still, and the extract
+        // says that the file is missing.
+        let doc = resolve_with(&plugin, 0x10, &[]);
+        assert_eq!(doc.skeleton_path.as_deref(), Some(HUMAN_SKELETON));
+        assert!(
+            doc.notes
+                .iter()
+                .any(|n| *n == format!("skeleton {HUMAN_SKELETON} is not in the data")),
+            "{:?}",
+            doc.notes
+        );
+
+        // No model at all: the race's skeleton, noted.
+        let mut plugin = PluginBuilder::new();
+        plugin.add(race()).add(person(0x10, None, 0, ""));
+        let doc = resolve_with(&plugin, 0x10, &skeletons());
+        assert_eq!(doc.skeleton_path.as_deref(), Some(RACE_SKELETON));
+        assert!(
+            doc.notes.iter().any(|n| n.contains("names no model")),
+            "{:?}",
+            doc.notes
+        );
+    }
+
+    #[test]
+    fn a_valid_custom_skeleton_is_kept_and_a_bad_one_is_not() {
+        let mut plugin = PluginBuilder::new();
+        plugin
+            .add(race())
+            .add(person(0x10, None, 0, "Custom\\Skeleton.NIF"))
+            .add(person(0x11, None, 0, "Custom\\Lost.nif"))
+            .add(person(0x12, None, 0, "Custom\\Box.nif"));
+        let mut loose = skeletons();
+        loose.push((
+            "meshes\\custom\\box.nif",
+            nif::fixture::box_mesh([1.0, 1.0, 1.0], "textures\\box.dds"),
+        ));
+        let kept = resolve_with(&plugin, 0x10, &loose);
+        assert_eq!(kept.skeleton_path.as_deref(), Some(CUSTOM_SKELETON));
+        assert!(skeleton_notes(&kept).is_empty(), "{:?}", kept.notes);
+
+        // A missing file and a mesh without the humanoid bones.
+        for (form, problem) in [(0x11, "is not in the data"), (0x12, "has no Bip01 bone")] {
+            let doc = resolve_with(&plugin, form, &loose);
+            assert_eq!(doc.skeleton_path.as_deref(), Some(RACE_SKELETON));
+            let notes = skeleton_notes(&doc);
+            assert_eq!(notes.len(), 1, "{notes:?}");
+            assert!(notes[0].contains(problem), "{notes:?}");
+        }
+    }
+
+    #[test]
+    fn a_marker_reached_through_template_chains_gives_way_too() {
+        let mut plugin = PluginBuilder::new();
+        plugin
+            .add(race())
+            // Stats from a template that is a leveled list, whose actor has
+            // a custom skeleton; the model group is the NPC's own: the
+            // marker, which the race's skeleton replaces.
+            .add(person(0x10, Some(0x40), USE_STATS, MARKER))
+            .add(LeveledList::new(
+                LeveledKind::Npc,
+                0x40,
+                "List",
+                vec![LeveledEntry::new(1, 0x20u32, 1)],
+            ))
+            .add(person(0x20, None, 0, "Custom\\Skeleton.NIF"))
+            // The model group through a list to an actor whose model is
+            // the marker: replaced as well, and the note names that actor.
+            .add(person(0x11, Some(0x41), USE_MODEL, MARKER))
+            .add(LeveledList::new(
+                LeveledKind::Npc,
+                0x41,
+                "MarkerList",
+                vec![LeveledEntry::new(1, 0x21u32, 1)],
+            ))
+            .add(person(0x21, Some(0x40), USE_STATS, MARKER))
+            // The model group through the first list: its actor's custom
+            // skeleton, kept.
+            .add(person(0x12, Some(0x40), USE_MODEL, MARKER));
+        let loose = skeletons();
+
+        let doc = resolve_with(&plugin, 0x10, &loose);
+        assert_eq!(doc.template_chains["stats"].len(), 2);
+        assert_eq!(doc.skeleton_path.as_deref(), Some(RACE_SKELETON));
+        assert!(
+            doc.notes
+                .iter()
+                .any(|n| n.contains("test.esm:000010") && n.contains("editor marker")),
+            "{:?}",
+            doc.notes
+        );
+
+        let doc = resolve_with(&plugin, 0x11, &loose);
+        assert_eq!(
+            doc.template_chains["model"],
+            [FormKey::new(PLUGIN, 0x41), FormKey::new(PLUGIN, 0x21)]
+        );
+        assert_eq!(doc.skeleton_path.as_deref(), Some(RACE_SKELETON));
+        assert!(
+            doc.notes
+                .iter()
+                .any(|n| n.contains("test.esm:000021") && n.contains("editor marker")),
+            "{:?}",
+            doc.notes
+        );
+
+        let doc = resolve_with(&plugin, 0x12, &loose);
+        assert_eq!(doc.skeleton_path.as_deref(), Some(CUSTOM_SKELETON));
+        assert!(skeleton_notes(&doc).is_empty(), "{:?}", doc.notes);
     }
 
     #[test]

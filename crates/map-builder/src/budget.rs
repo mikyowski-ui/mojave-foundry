@@ -16,6 +16,7 @@ pub(crate) const ART_SCENERY: u8 = 2;
 pub(crate) const ART_WALLS: u8 = emit::WALL_CATEGORY;
 pub(crate) const ART_TILES: u8 = emit::TILE_CATEGORY;
 pub(crate) const ART_MISC: u8 = 5;
+pub(crate) const ART_INVENTORY: u8 = emit::icon::INVENTORY_CATEGORY;
 
 /// The art lists a build loads and may extend, in category order.
 pub(crate) const BUILD_LISTS: [u8; 5] = [ART_ITEMS, ART_SCENERY, ART_WALLS, ART_TILES, ART_MISC];

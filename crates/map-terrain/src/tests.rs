@@ -1328,3 +1328,45 @@ fn the_blank_tile_survives_reduction_and_is_never_a_substitute() {
         assert_eq!(zeros, 1);
     }
 }
+
+#[test]
+fn each_interior_storey_builds_its_ground_from_its_own_overlays() {
+    // A map of several elevations (map-builder layers) runs the terrain
+    // once per storey, over no land, with that storey's floor bake: each
+    // ground draws exactly its own overlays, and a storey's ground does
+    // not depend on the others or on the order they are built in.
+    let world = landless_world();
+    let blank = TerrainOptions {
+        dither_strength: 0.0,
+        blank_without_land: true,
+        ..options()
+    };
+    let lower = rgba_block([0, 0, 255, 255], 40, 20);
+    let upper = rgba_block([0, 255, 0, 255], 30, 30);
+    let storey = |origin: [i32; 2], width: u32, height: u32, rgba: &[u8]| {
+        let overlays = [Overlay {
+            origin,
+            width,
+            height,
+            rgba,
+        }];
+        build(&world, &overlays, &blank)
+    };
+    let first = storey([3900, 600], 40, 20, &lower);
+    let second = storey([4300, 700], 30, 30, &upper);
+    let second_alone = storey([4300, 700], 30, 30, &upper);
+    assert_eq!(digest(&second), digest(&second_alone));
+    for (ground, origin, width, height) in [
+        (&first, [3900, 600], 40, 20),
+        (&second, [4300, 700], 30, 30),
+    ] {
+        let drawn = squares_under(origin, width, height);
+        assert_eq!(ground.stats.blank_squares, SQUARES - drawn.len());
+        for q in 0..SQUARES {
+            assert_eq!(ground.is_blank(q), !drawn.contains(&(q as i32)), "{q}");
+        }
+    }
+    // Where one storey has floor the other is blank (drawn black).
+    let other = first.compose_rect([4300, 700], 30, 30).expect("compose");
+    assert!(other.iter().all(|&i| i == 0));
+}

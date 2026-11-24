@@ -35,12 +35,12 @@ pub const NO_PID: i32 = -1;
 
 /// Art categories (the FID's category field) each prototype kind draws
 /// from.
-const ART_ITEMS: u8 = 0;
-const ART_CRITTERS: u8 = 1;
-const ART_SCENERY: u8 = 2;
+pub(crate) const ART_ITEMS: u8 = 0;
+pub(crate) const ART_CRITTERS: u8 = 1;
+pub(crate) const ART_SCENERY: u8 = 2;
 const ART_WALLS: u8 = 3;
 const ART_MISC: u8 = 5;
-const ART_INVENTORY: u8 = 7;
+pub(crate) const ART_INVENTORY: u8 = 7;
 
 /// SPEC-003 §2.3: materials 0 to 7.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -179,11 +179,18 @@ impl Default for ItemStats {
     }
 }
 
-/// A door's initial state.
+/// A door's initial state: the prototype's door-state word (SPEC-003
+/// §2.5, `SceneryData::Door::state`) and key code. A placed door carries
+/// its own copy of the state word (`ObjectDetail::Door`), which is what the
+/// engine reads and changes (SPEC-003 §2.11, SPEC-013 §2.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DoorSpec {
     pub open: bool,
     pub locked: bool,
+    /// The jammed bit `0x04000000`: every skill on the door is refused
+    /// with `misc.msg` 2001 until the engine clears it (each midnight, a
+    /// long absence, or a scripted open or close; SPEC-013 §3.3, §3.8).
+    pub jammed: bool,
     /// The key code; -1 for none (this crate's default).
     pub key: i32,
     /// The door's sound letter, the stored byte.
@@ -195,6 +202,7 @@ impl Default for DoorSpec {
         Self {
             open: false,
             locked: false,
+            jammed: false,
             key: -1,
             sound: 0,
         }
@@ -274,7 +282,11 @@ pub fn message_entries(
     ])
 }
 
-fn check_common(common: &ProtoCommon, category: Category, art: u8) -> Result<(), EmitError> {
+pub(crate) fn check_common(
+    common: &ProtoCommon,
+    category: Category,
+    art: u8,
+) -> Result<(), EmitError> {
     let found = Category::from_pid(common.pid)?;
     if found != category {
         return Err(EmitError::Prototype(format!(
@@ -298,7 +310,7 @@ fn check_common(common: &ProtoCommon, category: Category, art: u8) -> Result<(),
     Ok(())
 }
 
-fn finish(
+pub(crate) fn finish(
     common: &ProtoCommon,
     category: Category,
     extended: ExtendedFlags,
@@ -355,6 +367,12 @@ pub fn scenery(common: ProtoCommon) -> Result<Prototype, EmitError> {
 }
 
 /// A door (scenery subtype 0), with the use permission (`0x800`) set.
+///
+/// The key code is stored for scripts only: the engine has no lock
+/// difficulty, no lockpick roll and no key test of its own; locks work
+/// through the door's script (`obj_is_locked`, `obj_unlock`; SPEC-013
+/// §3.4, §3.8). Without a script a locked door plays its locked sound and
+/// opens anyway (SPEC-007 §3.11.4).
 pub fn door(common: ProtoCommon, door: DoorSpec) -> Result<Prototype, EmitError> {
     check_common(&common, Category::Scenery, ART_SCENERY)?;
     let mut state = 0;
@@ -363,6 +381,9 @@ pub fn door(common: ProtoCommon, door: DoorSpec) -> Result<Prototype, EmitError>
     }
     if door.locked {
         state |= LockFlags::LOCKED.0;
+    }
+    if door.jammed {
+        state |= LockFlags::JAMMED.0;
     }
     Ok(finish(
         &common,
@@ -379,7 +400,11 @@ pub fn door(common: ProtoCommon, door: DoorSpec) -> Result<Prototype, EmitError>
     ))
 }
 
-fn item(common: &ProtoCommon, stats: ItemStats, data: ItemData) -> Result<Item, EmitError> {
+pub(crate) fn item(
+    common: &ProtoCommon,
+    stats: ItemStats,
+    data: ItemData,
+) -> Result<Item, EmitError> {
     if let Some(art) = stats.inventory_art
         && art.category() != ART_INVENTORY
     {
@@ -595,7 +620,7 @@ impl CritterSpec {
         stats
     }
 
-    fn check(&self) -> Result<(), EmitError> {
+    pub(crate) fn check(&self) -> Result<(), EmitError> {
         let bad = |message: String| Err(EmitError::Critter(message));
         if self.hit_points < 1 {
             return bad(format!(

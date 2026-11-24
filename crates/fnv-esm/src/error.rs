@@ -129,6 +129,36 @@ pub enum EsmError {
         /// Number of masters the plugin lists.
         master_count: usize,
     },
+
+    /// The first plugin's `HEDR` version is neither game's; see
+    /// [`crate::GameVariant::detect`].
+    #[error(
+        "plugin {plugin}: HEDR version {version} is neither Fallout 3 (0.94) nor New Vegas \
+         (1.34); name the game explicitly to read it anyway"
+    )]
+    UnknownGame {
+        /// The plugin's file name.
+        plugin: String,
+        /// The stored version, as text.
+        version: String,
+    },
+
+    /// The first plugin is named for one game and declares the other's
+    /// `HEDR` version.
+    #[error(
+        "plugin {plugin}: the file name is {name_game}'s master but HEDR version {version} is \
+         {version_game}'s; name the game explicitly to read it anyway"
+    )]
+    GameMismatch {
+        /// The plugin's file name.
+        plugin: String,
+        /// The stored version, as text.
+        version: String,
+        /// The game the version names.
+        version_game: crate::GameVariant,
+        /// The game the file name names.
+        name_game: crate::GameVariant,
+    },
 }
 
 impl EsmError {
@@ -144,7 +174,9 @@ impl EsmError {
             | Self::DecompressedTooLarge { offset, .. }
             | Self::Decompress { offset, .. }
             | Self::DecompressedSizeMismatch { offset, .. } => Some(*offset),
-            Self::MasterIndexOutOfRange { .. } => None,
+            Self::MasterIndexOutOfRange { .. }
+            | Self::UnknownGame { .. }
+            | Self::GameMismatch { .. } => None,
         }
     }
 
@@ -161,6 +193,7 @@ impl EsmError {
             | Self::Decompress { sig, .. }
             | Self::DecompressedSizeMismatch { sig, .. } => Some(*sig),
             Self::MasterIndexOutOfRange { .. } => None,
+            Self::UnknownGame { .. } | Self::GameMismatch { .. } => Some(crate::sig::sigs::TES4),
         }
     }
 }

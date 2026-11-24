@@ -154,6 +154,28 @@ impl Animation {
                 .find(|t| t.bone.eq_ignore_ascii_case(bone))
         })
     }
+
+    /// The time of the first text key whose text is `name`, ignoring ASCII
+    /// case and surrounding white space (`Hit`, `hit`, ` Hit `). The
+    /// source marks the moment a blow lands or a shot leaves with `Hit`.
+    pub fn text_key_time(&self, name: &str) -> Option<f32> {
+        self.text_keys
+            .iter()
+            .find(|(_, text)| text.trim().eq_ignore_ascii_case(name))
+            .map(|(time, _)| *time)
+            .filter(|time| time.is_finite())
+    }
+
+    /// The time of the first text key that starts with `prefix` and names
+    /// `bone` after it, ignoring ASCII case: the source's parent switch
+    /// (`prn: Bip01 R Hand`) that moves a weapon between holster and hand.
+    pub fn parent_switch_time(&self, bone: &str) -> Option<f32> {
+        self.text_keys.iter().find_map(|(time, text)| {
+            let (head, rest) = text.trim().split_once(':')?;
+            (head.trim().eq_ignore_ascii_case("prn") && rest.trim().eq_ignore_ascii_case(bone))
+                .then_some(*time)
+        })
+    }
 }
 
 /// What [`extract_animation_with_report`] could not turn into tracks.

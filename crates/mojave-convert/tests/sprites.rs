@@ -145,7 +145,7 @@ fn both_installs_are_required() {
     assert!(error.to_string().contains("--f2"), "{error}");
     let error = mojave_convert::Inputs::new(&missing, &fixture.f2, &out, fixture.slice.clone(), 1)
         .expect_err("no source install");
-    assert!(error.to_string().contains("--fnv"), "{error}");
+    assert!(error.to_string().starts_with("--game-dir "), "{error}");
     // A directory that exists but holds no palette is refused as well.
     let empty = fixture.root.path().join("empty");
     std::fs::create_dir_all(&empty).expect("dir");

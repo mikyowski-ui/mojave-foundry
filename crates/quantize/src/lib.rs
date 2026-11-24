@@ -40,6 +40,8 @@ pub enum QuantizeError {
     InvalidFactor(f32),
     #[error("the palette leaves no index that an opaque pixel may use")]
     NoAllowedIndex,
+    #[error("rim options: {0}")]
+    InvalidRim(String),
 }
 
 /// How [`quantize`] treats colours between palette entries.
@@ -229,6 +231,197 @@ pub fn outline_with(
         }
     }
     Ok(())
+}
+
+/// Options for [`rim`], the outline of map sprites and critters.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RimOptions {
+    /// Linear-light multiplier for the rim colour, `0..=4`: below 1 a dark
+    /// outline, above 1 a highlight.
+    pub factor: f32,
+    /// Rim width in pixels, 1 or 2 (steps between 4-neighbours).
+    pub width: u8,
+    /// `false`: the rim is the opaque pixels within `width` of the
+    /// silhouette's edge (the image keeps its size). `true`: the rim is
+    /// drawn around the silhouette, on transparent pixels within `width` of
+    /// it, and the image grows by `width` on every side.
+    pub outer: bool,
+}
+
+impl RimOptions {
+    /// The inner 1-pixel darkening of [`outline_with`] at `factor`.
+    pub const fn inner(factor: f32) -> Self {
+        RimOptions {
+            factor,
+            width: 1,
+            outer: false,
+        }
+    }
+
+    /// A darkened outline drawn around the silhouette, one pixel wide.
+    pub const fn outer(factor: f32) -> Self {
+        RimOptions {
+            factor,
+            width: 1,
+            outer: true,
+        }
+    }
+
+    fn validate(&self) -> Result<(), QuantizeError> {
+        if !(self.factor.is_finite() && (0.0..=4.0).contains(&self.factor)) {
+            return Err(QuantizeError::InvalidRim(format!(
+                "factor {} is not in 0..=4",
+                self.factor
+            )));
+        }
+        if !(1..=2).contains(&self.width) {
+            return Err(QuantizeError::InvalidRim(format!(
+                "width {} is not 1 or 2",
+                self.width
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Default for RimOptions {
+    /// The gallery outline: inner, 1 pixel, linear light halved.
+    fn default() -> Self {
+        RimOptions::inner(0.5)
+    }
+}
+
+/// An image with its rim, and where its pixel `(0, 0)` lies relative to
+/// the input's (`[-width, -width]` for an outer rim, else `[0, 0]`): add
+/// `offset` to the input's origin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rimmed {
+    pub pixels: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub offset: [i32; 2],
+}
+
+/// Outlines an indexed image (index 0 transparent) for map readability:
+/// interactive map sprites (items, containers, doors, terminals) and
+/// critters. A rim pixel takes the nearest allowed index to the linear
+/// light of its source colour times `factor`: its own colour for an inner
+/// rim, the colour of the nearest opaque pixel (4-neighbour steps, then
+/// left, right, up, down) for an outer one. An inner rim pixel whose
+/// candidate is not darker (a highlight: not lighter) in Oklab lightness
+/// keeps its index, unless that index is reserved. No reserved index and
+/// no index 0 is written on an opaque pixel. With width 1, `outer` false
+/// and a factor up to 1 this is exactly [`outline_with`].
+pub fn rim(
+    indexed: &[u8],
+    width: u32,
+    height: u32,
+    map: &PaletteMap,
+    options: &RimOptions,
+) -> Result<Rimmed, QuantizeError> {
+    let (w, pixels) = check_buffer(indexed.len(), width, height, 1)?;
+    options.validate()?;
+    let h = pixels.checked_div(w).unwrap_or(0);
+    let factor = f64::from(options.factor);
+    let lighten = factor > 1.0;
+    let scaled: [u8; 256] = std::array::from_fn(|i| {
+        let linear = map.colour(i as u8).map(|c| color::linear8(c) * factor);
+        map.nearest_linear(linear)
+    });
+    let inner: [u8; 256] = std::array::from_fn(|i| {
+        let index = i as u8;
+        let candidate = scaled[i];
+        let (old, new) = (map.oklab(index)[0], map.oklab(candidate)[0]);
+        let no_gain = if lighten { new <= old } else { new >= old };
+        if map.is_allowed(index) && no_gain {
+            index
+        } else {
+            candidate
+        }
+    });
+    let grow = if options.outer {
+        usize::from(options.width)
+    } else {
+        0
+    };
+    let (ow, oh) = (w + 2 * grow, h + 2 * grow);
+    let (Ok(out_w), Ok(out_h)) = (u32::try_from(ow), u32::try_from(oh)) else {
+        return Err(QuantizeError::TooLarge { width, height });
+    };
+    let mut out = vec![0u8; ow * oh];
+    for y in 0..h {
+        out[(y + grow) * ow + grow..(y + grow) * ow + grow + w]
+            .copy_from_slice(&indexed[y * w..(y + 1) * w]);
+    }
+    // Steps to the nearest transparent pixel (inner) or opaque pixel
+    // (outer), up to the rim width, with the source pixel for an outer rim.
+    let steps: [(isize, isize); 4] = [(-1, 0), (1, 0), (0, -1), (0, 1)];
+    let at = |x: usize, y: usize, dx: isize, dy: isize| -> Option<usize> {
+        let nx = x.checked_add_signed(dx)?;
+        let ny = y.checked_add_signed(dy)?;
+        (nx < ow && ny < oh).then_some(ny * ow + nx)
+    };
+    let source = out.clone();
+    let reach = usize::from(options.width);
+    for y in 0..oh {
+        for x in 0..ow {
+            let here = y * ow + x;
+            if options.outer {
+                if source[here] != 0 {
+                    continue;
+                }
+                // The nearest opaque pixel within the rim width.
+                let mut found = None;
+                'search: for d in 1..=reach as isize {
+                    for &(sx, sy) in &steps {
+                        if let Some(i) = at(x, y, sx * d, sy * d)
+                            && source[i] != 0
+                        {
+                            found = Some(source[i]);
+                            break 'search;
+                        }
+                    }
+                    if d == 2 {
+                        for (sx, sy) in [(-1, -1), (1, -1), (-1, 1), (1, 1)] {
+                            if let Some(i) = at(x, y, sx, sy)
+                                && source[i] != 0
+                            {
+                                found = Some(source[i]);
+                                break 'search;
+                            }
+                        }
+                    }
+                }
+                if let Some(v) = found {
+                    out[here] = scaled[usize::from(v)];
+                }
+            } else {
+                if source[here] == 0 {
+                    continue;
+                }
+                let transparent = |i: Option<usize>| i.is_none_or(|i| source[i] == 0);
+                let mut edge = steps.iter().any(|&(dx, dy)| transparent(at(x, y, dx, dy)));
+                if !edge && reach == 2 {
+                    edge = steps
+                        .iter()
+                        .any(|&(dx, dy)| transparent(at(x, y, 2 * dx, 2 * dy)))
+                        || [(-1, -1), (1, -1), (-1, 1), (1, 1)]
+                            .iter()
+                            .any(|&(dx, dy)| transparent(at(x, y, dx, dy)));
+                }
+                if edge {
+                    out[here] = inner[usize::from(source[here])];
+                }
+            }
+        }
+    }
+    let offset = -(grow as i32);
+    Ok(Rimmed {
+        pixels: out,
+        width: out_w,
+        height: out_h,
+        offset: [offset, offset],
+    })
 }
 
 /// Expands an indexed image to RGBA8 for previews: index 0 is transparent

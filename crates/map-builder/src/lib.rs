@@ -89,6 +89,27 @@
 //! the walkable hex nearest the centre that holds no exit grid (the rule
 //! before components existed). [`BuildReport::entrance`] says which.
 //!
+//! # Readability
+//!
+//! [`BuildReport::readability`] measures the written map for a player:
+//! floor hexes (walkable before blockers), walkable hexes, how a figure
+//! standing on each walkable hex is drawn against the art
+//! ([`cover::Sight`]), the open-floor ratio (clear walkable hexes over
+//! floor hexes) and the share of walkable hexes within one step of a
+//! blocking placement. [`BuildReport::readability_summary`] prints them.
+//!
+//! **Blocking is never art height.** What blocks movement comes from
+//! [`BuildInput::blocked_hexes`], [`Placement::blocking`] and the role
+//! alone: a wall strip trimmed to a low kerb (a foreground cutaway) blocks
+//! its hex, is never opened by a passage and needs no sealing blocker,
+//! exactly as a full-height one does. Art height matters only to
+//! [`cover`]: what a figure is hidden by, and so the entrance and these
+//! metrics.
+//!
+//! **Interactive references** ([`BuildOptions::interactive`]) are never
+//! given the floor piece treatment; [`BuildReport::interactive`] counts
+//! them.
+//!
 //! # Interior demo
 //!
 //! With [`BuildOptions::interior`] the build is one interior cell (its
@@ -116,6 +137,68 @@
 //! - **Ground**: [`BLANK_SQUARE`] squares, and squares of an all-transparent
 //!   library tile, get the blank tile.
 //! - The layer holds the one map; it is checked to hold no exit grid.
+//!
+//! # Layers
+//!
+//! [`build_layer`] builds several maps into one layer ([`LayerInput`]),
+//! each of one to three elevations ([`MapInput::elevations`]). What maps
+//! share is built once: the art, prototype and message lists, one FRM per
+//! distinct image across the layer (a tile an earlier elevation wrote
+//! shares its FRM too), one invisible blocker, one exit-grid marker, the
+//! manifest and `data/maps.txt`, whose start point is each map's entrance
+//! elevation. The art budget is the layer's: every list is checked once
+//! against the sum (a [`BuildError::FidBudget`] of a layer of several maps
+//! names each map's share). Maps are numbered in order (a given number is
+//! honoured), stub maps after every real map; two maps may not share a
+//! stem, nor a stub stem (a stem's first four letters) another map's.
+//!
+//! Each elevation is planned as the single-map build plans its one map:
+//! walkability (its own band, [`ElevationInput::interior`]), passages,
+//! the sealing border, readability, and its objects in its own list (ids
+//! run over elevation 0, 1, 2). The entrance is on
+//! [`MapInput::entrance_elevation`]. A critter goes to the elevation whose
+//! band holds its reference's height in the cells (outside every band:
+//! the nearest, as "on another level" unless that band clamps; unknown:
+//! the entrance elevation; an exterior map: elevation 0).
+//!
+//! # Door links
+//!
+//! With [`LayerOptions::link_doors`], a teleport door whose destination
+//! cell a map of the layer is built from gets exit grids (found as for a
+//! stub exit) leading to that map: the elevation the partner door is
+//! placed on (else the band holding the arrival point's height), onto a
+//! walkable arrival hex 2 to [`exits::RETURN_RADIUS`] steps from the
+//! partner door and on no exit grid, nearest the source's arrival point.
+//! The partner door links back by the same rule, so every link has a
+//! return unless one side finds no arrival hex (reported, the other side
+//! linked one way). A door leading outside the build keeps a stub map on
+//! an exterior map and is reported on an interior map.
+//! [`StairLink`]s (from [`storeys::layout`]) are paired exit grids between
+//! two landings, on one map or two: the engine changes elevation only
+//! through exit grids. Every exit grid is then followed on the written
+//! maps by [`verify_links`]. With [`LayerOptions::isolated`] nothing is
+//! linked and the layer is checked to hold exactly its maps and no exit
+//! grid.
+//!
+//! # Loot
+//!
+//! With a [`loot::Catalogue`] ([`BuildOptions::catalogue`] for
+//! [`build_map`], [`LayerOptions::catalogue`] for [`build_layer`]) items
+//! get real prototypes (one per definition, PIDs in sorted key order),
+//! inventory icons and names; placed items, containers with contents and
+//! locks, locked and keyed doors, and armed and armoured critters are
+//! written through one `emit::ProtoSet`; scenery, doors and containers
+//! get their real look-at names. [`verify_loot`] checks the result. The
+//! [`loot`] module notes give the rules. Without a catalogue nothing of
+//! this runs and the layer is byte for byte what it was.
+//!
+//! # Furniture footprints
+//!
+//! A placement blocks only its anchor hex, and the slicer's strips over
+//! its open hexes block nothing, so a wide sprite or a sliced counter can
+//! be walked into ([`furniture`] notes). [`BuildOptions::footprints`]
+//! blocks every hex a reference's placed base covers; without it the
+//! builder reports such furniture ([`FurnitureReport::suspects`]).
 
 mod assemble;
 mod budget;
@@ -123,17 +206,32 @@ pub mod cover;
 pub mod critters;
 mod error;
 pub mod exits;
+pub mod furniture;
 pub mod islands;
+mod layer;
+mod links;
+pub mod loot;
+mod loot_build;
 mod names;
 mod passages;
+mod plan;
+mod readability;
+pub mod storeys;
 mod verify;
 pub mod walk;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub use budget::{ArtListBudget, art_budget};
 pub use error::BuildError;
-pub use verify::{VerifyReport, read_layer, verify_layer};
+pub use furniture::{FurnitureReport, FurnitureSuspect, SuspectKind};
+pub use loot::{
+    Catalogue, CritterLoot, GroundArt, Held, ItemDef, ItemIcon, ItemKind, LootReport, LootSkip,
+    MapLoot, PlacedLoot,
+};
+pub use verify::{
+    LinkCheck, LootCheck, VerifyReport, read_layer, verify_layer, verify_links, verify_loot,
+};
 pub use walk::{dominant_floor_z, navmesh_centre};
 
 /// The language folder of the prototype message files this crate reads
@@ -141,7 +239,7 @@ pub use walk::{dominant_floor_z, navmesh_centre};
 pub const LANGUAGE: &str = "english";
 
 /// Every base-game VFS path [`base_file_paths`] names.
-const BASE_FILE_PATHS: [&str; 17] = [
+const BASE_FILE_PATHS: [&str; 18] = [
     "art/items/items.lst",
     "art/scenery/scenery.lst",
     "art/walls/walls.lst",
@@ -160,10 +258,14 @@ const BASE_FILE_PATHS: [&str; 17] = [
     "proto/critters/critters.lst",
     "text/english/game/pro_crit.msg",
     "data/ai.txt",
+    // The loot files, from here on.
+    "art/inven/inven.lst",
 ];
 
 /// Where the critter files start in [`BASE_FILE_PATHS`].
 pub(crate) const CRITTER_BASE_FROM: usize = 13;
+/// Where the loot files (read only with a [`loot::Catalogue`]) start.
+pub(crate) const LOOT_BASE_FROM: usize = 17;
 
 /// The base-game VFS paths the caller should read from the Fallout 2
 /// install into [`BuildInput::base_files`]: art lists, prototype lists,
@@ -180,6 +282,12 @@ pub(crate) const CRITTER_BASE_FROM: usize = 13;
 /// well unless [`BuildOptions::critter_ai_packet`] names the packet. A
 /// build without critters never reads them, so its output does not depend
 /// on them. `data/ai.txt` is read, never shipped.
+///
+/// The last one, `art/inven/inven.lst` (inventory icons), is read only by
+/// a build given a [`loot::Catalogue`]; such a build needs it whenever any
+/// base file is supplied, and needs the critter files too when an armour
+/// names a critter sprite set as its figure. A build without a catalogue
+/// never reads it.
 pub fn base_file_paths() -> &'static [&'static str] {
     &BASE_FILE_PATHS
 }
@@ -333,6 +441,31 @@ pub struct BuildOptions {
     /// exterior window (crate notes, "Interior demo"). Default `None`: the
     /// exterior build, unchanged.
     pub interior: Option<InteriorBuild>,
+    /// Reference form keys ([`Placement::reference`]) the caller marks as
+    /// interactive or protected (doors, containers, terminals, anything a
+    /// player must see and click). Their placements never get the floor
+    /// piece treatment (flat, non-blocking, never cut): a
+    /// [`Role::FloorPiece`] of one is built as upright [`Role::Scenery`]
+    /// that blocks as [`Placement::blocking`] says. Every other placement
+    /// of theirs is built as given. [`BuildReport::interactive`] counts
+    /// them. Default empty: nothing changes.
+    pub interactive: BTreeSet<String>,
+    /// Items, loot and fighters ([`loot`]): item prototypes, placed items,
+    /// filled and locked containers, locked doors, armed critters, and real
+    /// names for scenery, doors and containers. Default `None`: nothing
+    /// changes. In [`build_layer`] the catalogue is
+    /// [`LayerOptions::catalogue`]; a map's own must be `None` or equal.
+    pub catalogue: Option<std::sync::Arc<loot::Catalogue>>,
+    /// Placed bounding footprints of furniture, by reference form key: the
+    /// corners `[x east, y north]` (source units) of the reference's base
+    /// bounds as placed, in order around the polygon (crate notes,
+    /// "Furniture footprints"). Every hex whose centre lies inside (or
+    /// within [`furniture::FOOTPRINT_REACH`] floor squares of) the polygon
+    /// is blocked on each elevation where the reference has an upright
+    /// placement (a wall strip, scenery or a container; doors, items and
+    /// floor pieces never), and a passage never opens it. Default empty:
+    /// nothing changes.
+    pub footprints: BTreeMap<String, Vec<[f32; 2]>>,
 }
 
 /// The default of [`InteriorBuild::below`]: source units under the floor
@@ -433,6 +566,9 @@ impl Default for BuildOptions {
             door_reach: exits::DOOR_REACH,
             entrance_box: ENTRANCE_BOX,
             interior: None,
+            interactive: BTreeSet::new(),
+            catalogue: None,
+            footprints: BTreeMap::new(),
         }
     }
 }
@@ -510,6 +646,12 @@ pub struct Built {
     /// 40,000 entries, by hex; passages opened included.
     pub walkable: Vec<bool>,
     pub report: BuildReport,
+    /// What the catalogue ([`BuildOptions::catalogue`]) made; `None`
+    /// without one.
+    pub loot: Option<LootReport>,
+    /// Furniture footprints used, and upright art that does not block
+    /// where a walker can stand ([`FurnitureReport::summary`]).
+    pub furniture: FurnitureReport,
 }
 
 /// One door that became an exit.
@@ -724,6 +866,46 @@ pub struct IslandReport {
     pub reason: String,
 }
 
+/// How readable the written map is for a player (crate notes,
+/// "Readability"). Deterministic counts over the 40,000 hexes; nothing in
+/// the layer depends on them.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ReadabilityReport {
+    /// Hexes walkable before blockers: the walkability pass's walkable
+    /// hexes and those it rejected only because something blocks them.
+    pub floor_hexes: usize,
+    /// Walkable hexes on the written map (passages included).
+    pub walkable_hexes: usize,
+    /// Walkable hexes by how a figure of [`BuildOptions::entrance_box`]
+    /// standing there is drawn against the placements' art
+    /// ([`cover::Cover::sight`]): no art over it, only art drawn behind it,
+    /// art drawn over it.
+    pub clear: usize,
+    pub behind: usize,
+    pub covered: usize,
+    /// `clear / floor_hexes`: the share of the floor a figure can stand on
+    /// in plain view (0 without floor).
+    pub open_floor_ratio: f64,
+    /// Walkable hexes within one step of a hex holding a blocking placement
+    /// (sealing blockers, critters and baked relief do not count).
+    pub near_blocking: usize,
+    /// `near_blocking / walkable_hexes` (0 without walkable hexes).
+    pub near_blocking_share: f64,
+}
+
+/// What [`BuildOptions::interactive`] matched.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InteractiveReport {
+    /// Reference keys given.
+    pub references: usize,
+    /// Of those, keys at least one placement names.
+    pub matched: usize,
+    /// Placements of those references.
+    pub placements: usize,
+    /// Of those, floor pieces built upright instead.
+    pub kept_upright: usize,
+}
+
 /// Counts and decisions of one build.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BuildReport {
@@ -786,6 +968,10 @@ pub struct BuildReport {
     pub verify: VerifyReport,
     /// The interior demo's own account; `None` on an exterior build.
     pub interior: Option<InteriorReport>,
+    /// How readable the written map is ([`BuildReport::readability_summary`]).
+    pub readability: ReadabilityReport,
+    /// What [`BuildOptions::interactive`] matched.
+    pub interactive: InteractiveReport,
 }
 
 /// A teleport door of an interior demo, which leads nowhere on it.
@@ -829,6 +1015,54 @@ pub struct InteriorReport {
 }
 
 impl BuildReport {
+    /// Plain-language lines on the map's readability
+    /// ([`BuildReport::readability`]) and, when any were given, the
+    /// interactive references ([`BuildReport::interactive`]).
+    pub fn readability_summary(&self) -> Vec<String> {
+        let r = &self.readability;
+        let percent = |part: usize, whole: usize| {
+            if whole == 0 {
+                0.0
+            } else {
+                100.0 * part as f64 / whole as f64
+            }
+        };
+        let mut lines = vec![
+            format!(
+                "floor: {} hexes walkable before blockers, {} walkable on the map",
+                r.floor_hexes, r.walkable_hexes
+            ),
+            format!(
+                "a standing figure on walkable hexes: {} clear ({:.1} %), {} behind art ({:.1} \
+                 %), {} covered ({:.1} %)",
+                r.clear,
+                percent(r.clear, r.walkable_hexes),
+                r.behind,
+                percent(r.behind, r.walkable_hexes),
+                r.covered,
+                percent(r.covered, r.walkable_hexes)
+            ),
+            format!(
+                "open-floor ratio {:.3} (clear walkable hexes / floor hexes)",
+                r.open_floor_ratio
+            ),
+            format!(
+                "{} walkable hexes ({:.1} %) are within one step of a blocking object",
+                r.near_blocking,
+                100.0 * r.near_blocking_share
+            ),
+        ];
+        let i = &self.interactive;
+        if i.references > 0 {
+            lines.push(format!(
+                "interactive references: {} given, {} on the map with {} placements; {} floor \
+                 pieces kept upright",
+                i.references, i.matched, i.placements, i.kept_upright
+            ));
+        }
+        lines
+    }
+
     /// Plain-language lines on an interior demo: the map, the doors not
     /// converted, and every critter placed or skipped with the reason.
     /// Empty on an exterior build.
@@ -911,7 +1145,248 @@ impl BuildReport {
     }
 }
 
-/// Build the layer for one map window (see the crate notes).
+/// Build the layer for one map window (see the crate notes). A thin
+/// adapter over [`build_layer`]: one map, one elevation, door links off,
+/// and [`LayerOptions::isolated`] exactly when [`BuildOptions::interior`]
+/// is set. Its output is byte for byte what it was before layers existed
+/// (`tests/golden.rs`).
 pub fn build_map(input: &BuildInput) -> Result<Built, BuildError> {
     assemble::build(input)
+}
+
+/// One elevation of a [`MapInput`] (crate notes, "Layers"): what the
+/// terrain and the slicer produced for one storey. Every elevation of a
+/// map shares its window, projection and so one [`walk::Frame`]: the hex
+/// under a source point `(x, y)` is the same on each.
+pub struct ElevationInput<'a> {
+    /// The ground heights; indoors `mir::GroundSampler::flat(floor)` or an
+    /// empty sampler (an interior elevation never reads it).
+    pub sampler: &'a mir::GroundSampler,
+    /// This elevation's own ground tiles (its own library).
+    pub ground: GroundTiles<'a>,
+    /// This elevation's own slicer output; [`Placement::art`] indexes it.
+    pub art: &'a [ArtImage],
+    pub placements: &'a [Placement],
+    pub blocked_hexes: &'a [i32],
+    /// The storey's floor and band: walkability is the interior rule
+    /// ([`walk::interior_verdicts`]) over this band. `None`: the exterior
+    /// rules (navmesh, terrain slope).
+    pub interior: Option<InteriorBuild>,
+}
+
+/// One map of a layer: one to three elevations sharing a window.
+pub struct MapInput<'a> {
+    /// The map's file stem, as [`BuildInput::map_name`].
+    pub map_name: &'a str,
+    /// The map's number; `None` takes the next free one from the first a
+    /// layer may use, in map order. Stub maps are numbered after every
+    /// real map of the layer.
+    pub map_number: Option<u32>,
+    pub window: mir::MapWindow,
+    pub projection: &'a foundry_render::Projection,
+    /// Elevation `e` is `elevations[e]`; one to three.
+    pub elevations: Vec<ElevationInput<'a>>,
+    /// The elevation the map's entrance is on; `None`: the first elevation
+    /// whose [`InteriorBuild::entrance_near`] is given, else 0.
+    pub entrance_elevation: Option<u8>,
+    /// The cells the map is built from (exterior cells of the window, or
+    /// the interior cell), plus the interior cells its exterior doors lead
+    /// to (return positions). With [`LayerOptions::link_doors`] a door
+    /// leads to the map built from its destination cell: an exterior map
+    /// is built from its exterior cells, an interior map (an elevation
+    /// with [`ElevationInput::interior`]) from its interior cells.
+    pub cells: &'a [mir::CellDoc],
+    /// The characters; each goes to the elevation whose band holds its
+    /// reference's height in `cells` (crate notes, "Layers").
+    pub critters: &'a [CritterPlacement],
+    /// Per-map tuning. The layer-wide fields (`standalone`,
+    /// `write_maps_txt`, `critter_ai_packet`, `critter_team`) must agree
+    /// with [`LayerOptions`], and `interior` must be `None` (each
+    /// elevation carries its own band).
+    pub options: BuildOptions,
+}
+
+/// Layer-wide settings of [`build_layer`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct LayerOptions {
+    /// As [`BuildOptions::standalone`].
+    pub standalone: bool,
+    /// As [`BuildOptions::write_maps_txt`].
+    pub write_maps_txt: bool,
+    /// As [`BuildOptions::critter_ai_packet`].
+    pub critter_ai_packet: Option<i32>,
+    /// As [`BuildOptions::critter_team`].
+    pub critter_team: i32,
+    /// The layer holds exactly the given maps and no exit grid: no door is
+    /// converted (each is reported), no stub map is made, and stairs are
+    /// refused. Today's interior demo; `build_map` sets it for
+    /// [`BuildOptions::interior`].
+    pub isolated: bool,
+    /// Turn every teleport door whose destination cell a map of the layer
+    /// is built from into exit grids to that map (crate notes, "Door
+    /// links"). Off: exterior maps make stub maps as [`build_map`] does,
+    /// interior maps report their doors.
+    pub link_doors: bool,
+    /// The layer's items, loot and fighters ([`loot`]), as
+    /// [`BuildOptions::catalogue`]: one catalogue for every map (item
+    /// definitions are layer-wide; references are keyed by form key, which
+    /// no two maps share). Default `None`: nothing changes.
+    pub catalogue: Option<std::sync::Arc<loot::Catalogue>>,
+}
+
+impl Default for LayerOptions {
+    fn default() -> Self {
+        Self {
+            standalone: false,
+            write_maps_txt: true,
+            critter_ai_packet: None,
+            critter_team: critters::DEFAULT_CRITTER_TEAM,
+            isolated: false,
+            link_doors: true,
+            catalogue: None,
+        }
+    }
+}
+
+/// One end of a [`StairLink`]: a map of the layer (index into
+/// [`LayerInput::maps`]), its elevation, and the landing point in that
+/// map's source coordinates (where the stair or ramp meets the floor).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Landing {
+    pub map: usize,
+    pub elevation: u8,
+    pub point: [f32; 3],
+}
+
+/// A stair, ramp or ladder between two floors: paired exit grids, each
+/// end's grids on the walkable hexes at its landing leading to a walkable
+/// arrival hex near the other landing ([`storeys::StoreyLayout::stair_links`]
+/// makes them from a [`storeys::StoreySplit`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StairLink {
+    /// A short label for reports, such as `stairs 0-1`.
+    pub label: String,
+    pub ends: [Landing; 2],
+}
+
+/// Everything one layer is built from.
+pub struct LayerInput<'a> {
+    pub layer_id: &'a str,
+    pub layer_name: &'a str,
+    pub base_files: &'a BTreeMap<String, Vec<u8>>,
+    /// The sprite sets every map's critters index.
+    pub critter_art: &'a [CritterArt],
+    /// One or more maps, numbered and written in this order.
+    pub maps: Vec<MapInput<'a>>,
+    pub stairs: Vec<StairLink>,
+    pub options: LayerOptions,
+}
+
+/// What a link of exit grids is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LinkKind {
+    /// A teleport door into a map of the layer.
+    Door,
+    /// A [`StairLink`] end.
+    Stairs,
+}
+
+/// One door or stair end whose exit grids lead to a map of the layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkReport {
+    pub kind: LinkKind,
+    /// The door's form key, or the stair's label.
+    pub from: String,
+    /// The elevation its grids are on, the door's hex (doors only), and
+    /// the grid hexes.
+    pub elevation: u8,
+    pub door_hex: Option<i32>,
+    pub grid_hexes: Vec<i32>,
+    /// Hex steps from the door (or landing) to the grids.
+    pub grid_steps: i32,
+    /// Where the grids lead: map file and number, elevation, arrival hex
+    /// and facing.
+    pub to_file: String,
+    pub to_number: u32,
+    pub to_elevation: u8,
+    pub to_hex: i32,
+    pub to_orientation: u8,
+    /// Whether some link of the destination elevation leads back to this
+    /// map and elevation.
+    pub returns: bool,
+}
+
+/// One elevation of a built map.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ElevationReport {
+    pub elevation: u8,
+    /// The band walked (interior elevations).
+    pub band: Option<[f32; 2]>,
+    pub walk: walk::WalkStats,
+    /// The entrance, on the entrance elevation only.
+    pub entrance: Option<EntranceReport>,
+    /// Components of the written elevation; `main` is the entrance's (or,
+    /// off the entrance elevation, the first arrival hex's, else the
+    /// largest).
+    pub components: ComponentReport,
+    pub passages: Vec<PassageReport>,
+    pub islands_left: Vec<IslandReport>,
+    pub opened_hexes: usize,
+    pub blockers: usize,
+    pub objects: usize,
+    pub readability: ReadabilityReport,
+    /// Arrival hexes other links lead to here, with what leads there and
+    /// the arrival's component on the written elevation.
+    pub arrivals: Vec<(String, i32, Option<usize>)>,
+    /// References of the critters placed here.
+    pub critters: Vec<String>,
+}
+
+/// One map of a built layer.
+#[derive(Debug)]
+pub struct BuiltMap {
+    /// `maps/<stem>.map` and its number.
+    pub file: String,
+    pub number: u32,
+    pub entrance_elevation: u8,
+    /// Per elevation, 40,000 entries by hex; passages included.
+    pub walkable: Vec<Vec<bool>>,
+    pub elevations: Vec<ElevationReport>,
+    /// Links whose grids are on this map, by elevation then door order.
+    pub links: Vec<LinkReport>,
+    /// The elevation of each of `report.critters`.
+    pub critter_elevations: Vec<u8>,
+    /// The map's report. On a map of several elevations its `walk`,
+    /// `entrance`, `components`, `passages`, `islands_left`,
+    /// `opened_hexes`, `blockers` and `readability` describe the entrance
+    /// elevation (`elevations` has every one); `objects`, `critters`,
+    /// `exits` and `skipped_teleports` cover the whole map; the layer-wide
+    /// fields (`maps`, `art_*`, `prototypes`, `critter_sets`,
+    /// `critter_prototypes`, `maps_txt`, `first_map_number`, `verify`)
+    /// describe the layer.
+    pub report: BuildReport,
+    /// Furniture footprints used on this map, and upright art that does
+    /// not block where a walker can stand.
+    pub furniture: FurnitureReport,
+}
+
+/// What [`build_layer`] returns.
+#[derive(Debug)]
+pub struct BuiltLayer {
+    pub layer: emit::ModLayer,
+    pub maps: Vec<BuiltMap>,
+    /// Stub maps (file, number) for doors leading outside the build.
+    pub stubs: Vec<(String, u32)>,
+    pub verify: VerifyReport,
+    /// The exit-grid check over the written maps ([`verify_links`]).
+    pub links: LinkCheck,
+    /// What the catalogue ([`LayerOptions::catalogue`]) made, with its
+    /// check ([`verify_loot`]); `None` without one.
+    pub loot: Option<LootReport>,
+}
+
+/// Build one layer of several maps, each of one to three elevations, with
+/// doors and stairs linked (crate notes, "Layers").
+pub fn build_layer(input: &LayerInput) -> Result<BuiltLayer, BuildError> {
+    assemble::build_layer(input)
 }

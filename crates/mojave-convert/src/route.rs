@@ -273,23 +273,29 @@ impl WalkMap {
     /// lowest hex number). `None` when nothing but the entry is reachable
     /// and the entry is not the request, or the entry is blocked.
     pub fn route_to(&self, requested: i32) -> Option<Route> {
+        self.route_between(self.entry, requested)
+    }
+
+    /// [`WalkMap::route_to`] from `from` instead of the entry: a walk
+    /// that continues from where an earlier one ended. `None` when `from`
+    /// is blocked or off the grid.
+    pub fn route_between(&self, from: i32, requested: i32) -> Option<Route> {
         let mut avoid = self.exit_mask();
         if in_grid(requested) {
             avoid[requested as usize] = false;
         }
-        let parent = flood(&self.blocked, &avoid, self.entry);
-        if !reached(&parent, self.entry) {
+        if in_grid(from) {
+            avoid[from as usize] = false;
+        }
+        let parent = flood(&self.blocked, &avoid, from);
+        if !reached(&parent, from) {
             return None;
         }
         let destination = if reached(&parent, requested) {
             requested
         } else {
             // A requested hex off the grid is measured from its clamp.
-            let target = if in_grid(requested) {
-                requested
-            } else {
-                self.entry
-            };
+            let target = if in_grid(requested) { requested } else { from };
             (0..HEXES as i32)
                 .filter(|h| reached(&parent, *h) && !avoid[*h as usize])
                 .min_by_key(|h| {
@@ -429,6 +435,31 @@ mod tests {
         let route = map.route_to(hex(105, 100)).expect("a route");
         assert_eq!(route.destination, hex(105, 100));
         assert_eq!(route.steps(), 5);
+    }
+
+    #[test]
+    fn a_route_continues_from_where_the_last_one_ended() {
+        let mut map = open_map(hex(100, 100));
+        for r in 50..=150 {
+            map.blocked[hex(110, r) as usize] = true;
+        }
+        let first = map.route_to(hex(105, 100)).expect("a route");
+        let second = map
+            .route_between(first.destination, hex(120, 100))
+            .expect("a route");
+        assert_eq!(second.path[0], hex(105, 100));
+        assert_eq!(second.destination, hex(120, 100));
+        assert!(second.path.iter().all(|h| !map.blocked[*h as usize]));
+        // Into a blocked hex: the nearest reachable one, measured from it.
+        map.blocked[hex(130, 100) as usize] = true;
+        let third = map
+            .route_between(second.destination, hex(130, 100))
+            .expect("a route");
+        assert_eq!(
+            HexGrid::lattice_distance(third.destination, hex(130, 100)),
+            Ok(1)
+        );
+        assert_eq!(map.route_between(hex(110, 100), hex(120, 100)), None);
     }
 
     #[test]

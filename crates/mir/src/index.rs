@@ -194,6 +194,10 @@ pub(crate) struct Index<'a> {
     entries: Vec<Entry<'a>>,
     /// Framing errors met while indexing.
     pub walk_errors: Vec<BadRecord>,
+    /// Records whose own form id names a master index past the plugin's
+    /// master list. The engine reads such an id as the plugin's own, and
+    /// so does the index; they are reported as notes, not errors.
+    pub remapped: Vec<BadRecord>,
 }
 
 impl<'a> Index<'a> {
@@ -241,6 +245,7 @@ impl<'a> Index<'a> {
             plugins,
             entries: Vec::new(),
             walk_errors: Vec::new(),
+            remapped: Vec::new(),
         };
         for (number, plugin) in parsed.iter().enumerate() {
             let number = u16::try_from(number).unwrap_or(u16::MAX);
@@ -293,7 +298,28 @@ impl<'a> Index<'a> {
     }
 
     fn add(&mut self, plugin: u16, record: RecordRef<'a>, context: &Context) {
-        let Some(key) = self.resolve_any(plugin, record.form_id()) else {
+        let key = match self.resolve_any(plugin, record.form_id()) {
+            Some(key) => Some(key),
+            None => self.own_key(plugin, record.form_id()).inspect(|&key| {
+                let masters = self
+                    .plugins
+                    .get(usize::from(plugin))
+                    .map_or(0, |p| p.masters.len().saturating_sub(1));
+                self.remapped.push(BadRecord {
+                    plugin: self.plugin_name(plugin).to_owned(),
+                    offset: record.offset as u64,
+                    sig: record.sig().to_string(),
+                    form: Some(self.form_key(key)),
+                    error: format!(
+                        "form id {} names master index {}, past the plugin's {masters} masters; \
+                         it is read as the plugin's own form, as the engine reads it",
+                        record.form_id(),
+                        record.form_id().master_index()
+                    ),
+                });
+            }),
+        };
+        let Some(key) = key else {
             self.walk_errors.push(BadRecord {
                 plugin: self.plugin_name(plugin).to_owned(),
                 offset: record.offset as u64,
@@ -330,6 +356,14 @@ impl<'a> Index<'a> {
     /// Every record, sorted by form.
     pub fn entries(&self) -> &[Entry<'a>] {
         &self.entries
+    }
+
+    /// The key of a form id taken as the plugin's own, whatever its master
+    /// index says.
+    fn own_key(&self, plugin: u16, form: FormId) -> Option<Key> {
+        let ctx = self.plugins.get(usize::from(plugin))?;
+        let name = *ctx.masters.last()?;
+        Some(Key::new(name, form.local_id()))
     }
 
     fn resolve_any(&self, plugin: u16, form: FormId) -> Option<Key> {

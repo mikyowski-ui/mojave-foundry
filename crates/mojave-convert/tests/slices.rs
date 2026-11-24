@@ -4,14 +4,27 @@
 //! stage reads that margin for objects reaching in). An interior slice
 //! names its room, reaches it through the cells of one of the exterior
 //! slices (or the built-in Goodsprings one), and places everyone.
+//!
+//! New Vegas slices are in `slices/`, Fallout 3 slices in `slices/fo3/`;
+//! each says (or its plugins imply) its own game.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use mojave_convert::SliceSpec;
+use mojave_convert::{GameVariant, SliceSpec};
 
 fn read_slices() -> BTreeMap<String, SliceSpec> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../slices");
+    read_dir("", GameVariant::FalloutNewVegas)
+}
+
+fn read_fo3_slices() -> BTreeMap<String, SliceSpec> {
+    read_dir("fo3", GameVariant::Fallout3)
+}
+
+fn read_dir(sub: &str, game: GameVariant) -> BTreeMap<String, SliceSpec> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../slices")
+        .join(sub);
     let mut out = BTreeMap::new();
     for entry in std::fs::read_dir(&dir).expect("slices/ exists") {
         let path = entry.expect("an entry").path();
@@ -23,7 +36,8 @@ fn read_slices() -> BTreeMap<String, SliceSpec> {
             SliceSpec::from_toml(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         let stem = path.file_stem().and_then(|s| s.to_str()).expect("a stem");
         assert_eq!(spec.name, stem, "{}", path.display());
-        assert_eq!(spec.plugins, ["FalloutNV.esm"], "{stem}");
+        assert_eq!(spec.plugins, [game.master_name()], "{stem}");
+        assert_eq!(spec.stated_game(), Some(game), "{stem}");
         assert_eq!(spec.interior_depth, 1, "{stem}");
         // What the parser reads, it writes back.
         assert_eq!(SliceSpec::from_toml(&spec.to_toml()), Ok(spec.clone()));
@@ -138,4 +152,110 @@ fn every_checked_in_interior_slice_names_its_room_and_its_town() {
         assert!(!spec.clamp_levels, "{stem}");
         assert_eq!(spec.map_center, None, "{stem}");
     }
+}
+
+#[test]
+fn every_fallout3_slice_parses_and_names_its_game() {
+    let slices = read_fo3_slices();
+    let names: Vec<&str> = slices.keys().map(String::as_str).collect();
+    assert_eq!(
+        names,
+        [
+            "megaton",
+            "megaton-saloon",
+            "springvale",
+            "super-duper-mart",
+            "super-duper-mart-exterior"
+        ]
+    );
+    for (stem, spec) in &slices {
+        assert_eq!(
+            spec.game,
+            Some(GameVariant::Fallout3),
+            "{stem}: game = \"fo3\""
+        );
+    }
+    // The exterior windows: centred in their cells, which hold the window
+    // plus one cell all round, except Megaton, whose worldspace has the
+    // three by three cells of the town only.
+    for (stem, spec) in slices.iter().filter(|(_, s)| !s.is_interior()) {
+        let center = spec
+            .map_center
+            .unwrap_or_else(|| panic!("{stem}: no map_center"));
+        for (axis, range, value) in [("x", spec.x, center[0]), ("y", spec.y, center[1])] {
+            let low = range[0] as f32 * 4096.0;
+            let high = (range[1] + 1) as f32 * 4096.0;
+            assert!(
+                (low..high).contains(&value),
+                "{stem}: map_center {axis} {value} outside cells {range:?}"
+            );
+        }
+        let margin = if stem == "megaton" { -1 } else { 1 };
+        let window = mir::MapWindow::from_center(center, 140.0);
+        let (xs, ys) = window.cells(margin);
+        assert!(
+            spec.x[0] <= *xs.start() && *xs.end() <= spec.x[1],
+            "{stem}: cells x {:?} do not hold {xs:?}",
+            spec.x
+        );
+        assert!(
+            spec.y[0] <= *ys.start() && *ys.end() <= spec.y[1],
+            "{stem}: cells y {:?} do not hold {ys:?}",
+            spec.y
+        );
+    }
+    assert_eq!(slices["megaton"].worldspace, "MegatonWorld");
+    assert_eq!(
+        (slices["megaton"].x, slices["megaton"].y),
+        ([-2, 0], [-8, -6])
+    );
+    // The Super-Duper Mart's centre lies in cell (4, -5), by its doors.
+    let mart = &slices["super-duper-mart-exterior"];
+    let [cx, cy] = mart.map_center.expect("a centre");
+    assert_eq!(
+        ((cx / 4096.0).floor() as i32, (cy / 4096.0).floor() as i32),
+        (4, -5)
+    );
+    // The rooms and the exterior cells their doors are in.
+    for (stem, room, town) in [
+        (
+            "super-duper-mart",
+            "SuperDuperMart",
+            ("Wasteland", [3, 5], [-6, -4]),
+        ),
+        (
+            "megaton-saloon",
+            "MegatonMoriartysSaloon",
+            ("MegatonWorld", [-2, 0], [-8, -6]),
+        ),
+    ] {
+        let spec = &slices[stem];
+        assert_eq!(spec.interior.as_deref(), Some(room), "{stem}");
+        assert_eq!((spec.worldspace.as_str(), spec.x, spec.y), town, "{stem}");
+        assert!(spec.place_disabled, "{stem}");
+        let slicer = spec.interior_slice(0.0);
+        assert!(slicer.floor_band[1] < slicer.cut_height, "{stem}");
+    }
+    assert_eq!(slices["megaton-saloon"].cut_height, Some(120.0));
+}
+
+#[test]
+fn the_built_in_slices_are_per_game() {
+    assert_eq!(
+        SliceSpec::default_name(GameVariant::FalloutNewVegas),
+        "goodsprings"
+    );
+    assert_eq!(SliceSpec::default_name(GameVariant::Fallout3), "springvale");
+    let goodsprings = SliceSpec::preset("goodsprings").expect("built in");
+    assert_eq!(
+        goodsprings.stated_game(),
+        Some(GameVariant::FalloutNewVegas)
+    );
+    // Goodsprings states no game key: its plugins say it, and its TOML (in
+    // the map stage's cache key) is what it always was.
+    assert_eq!(goodsprings.game, None);
+    assert!(!goodsprings.to_toml().contains("game"));
+    // The built-in Springvale is the checked-in file.
+    let springvale = SliceSpec::preset("springvale").expect("built in");
+    assert_eq!(springvale, read_fo3_slices()["springvale"]);
 }
