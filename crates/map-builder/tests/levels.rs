@@ -598,6 +598,9 @@ fn a_one_map_exterior_takes_the_entrance_target_too() {
         critters: &[],
         options: BuildOptions {
             entrance_near: entrance,
+            // Several components, the entrance in a smaller one: this test is
+            // about where the entrance goes, not about closing the rest.
+            close_unreached: false,
             ..BuildOptions::default()
         },
     };

@@ -350,7 +350,7 @@ the build keeping their stub maps, one art budget for the whole layer.
 name = "super-duper-mart"     # the layer; the report's title
 start = "sdmart"              # the start map's stem (default: the first map)
 with_interiors = false        # also every interior the exterior's doors lead to
-close_unreached = false       # true: close every walkable component no walk from the start map's entrance reaches
+close_unreached = true        # default; false keeps every walkable component, reached or not
 
 [all_maps]                    # slice keys laid over every map's slice
 loot = true
@@ -371,12 +371,21 @@ storeys = "auto"
 interior = "MegatonClinic"    # no slice file: the first exterior's keys, as an interior
 ```
 
-`close_unreached = true` closes every walkable component that no walk from
-the start map's entrance reaches through the layer's links (stepping on an
-exit grid goes on from its arrival hex): the hexes become not walkable, no
-person, entrance or arrival stands on them, and each is listed as "closed
-as unreached". Off by default, so a layer keeps its bytes; the reach is
-reported either way.
+`close_unreached` (on by default, in a layer file and on a one-map build;
+`close_unreached = false` in the layer file, or in a slice for a one-map
+build, turns it off) closes every walkable component that no walk from the
+start map's entrance reaches through the layer's links (stepping on an exit
+grid goes on from its arrival hex): the hexes become not walkable, no
+entrance or arrival stands on them, and each is listed as "closed as
+unreached". A component a person would stand on is kept: it is judged from
+each critter's own source position before anything is closed, and an
+isolated deck or island that holds a placed person stays walkable and is
+listed as an "occupied perch" (size, a representative hex, who stands
+there, for example "occupied perch: 49 hexes at hex H, holds Stockholm
+(not reached from the start)"). A person is never dropped by closing: each
+elevation says "critters lost to closing: none" (the build lists any it
+would lose). The reach is reported either way. Link hexes keep their
+keep-clear rule on a perch as anywhere else.
 
 Every map must be of one game, one plugin list and one worldspace: extract,
 sprites and critters run once over their union (the union of the cell
@@ -405,12 +414,19 @@ window) lead to, each with the exterior's keys, `place_disabled = true`,
 | `entrance_sight` | `any` | the entrance rule's sight |
 | `navmesh_only` | off | exterior: cells without a navmesh are not walkable when the window has one elsewhere (`BuildOptions::navmesh_only`); used for the ground outside Megaton's wall |
 | `vertex_color_floor` | 0 | exterior: the darkest a land vertex colour may make the ground, 0 to 1 (`TerrainOptions::vertex_color_floor`) |
-| `coverage_bridges` | off | with a strict `navmesh_coverage`, joins the islands it cuts out of one floor through hexes the tolerance rule covers, at most 8 per join (`BuildOptions::coverage_bridges`) |
+| `coverage_bridges` | on | with a strict `navmesh_coverage`, joins the islands it cuts out of one floor through hexes the tolerance rule covers, at most 8 per join (`BuildOptions::coverage_bridges`) |
+| `close_unreached` | on | one-map builds (a layer takes the layer file's key): close the walkable components no walk from the entrance reaches, except those a person stands on (`BuildOptions::close_unreached`) |
 
 These keys are read on a one-map run as well, each only when present; a
 slice with `storeys = "auto"` or `levels = "auto"` is built as a layer of
-one map. Without them nothing changes: Goodsprings, the Prospector Saloon
-and every earlier slice keep their bytes.
+one map. Two exceptions are on by default: `coverage_bridges` (it acts only
+under a strict `navmesh_coverage`) and `close_unreached` (above), for both
+games and for one-map builds too; `= false` in a slice (or a layer file for
+`close_unreached`) restores the old bytes. Because of that default,
+Goodsprings differs from the baselines recorded before 2026-11-24 wherever it
+had a walkable island no walk from the entrance reaches; the Prospector
+Saloon (one interior component) is unchanged unless the results below say
+otherwise.
 
 **Storeys.** One slicer run and one terrain run per storey: the slicer's
 interior mode at the storey's floor, its ceiling cut never above the next
@@ -484,6 +500,11 @@ passages and islands left:
   links", and what it holds (grids, arrivals, critters);
 - `closed as unreached: <size> hexes at <hex>, holding ...`, with
   `close_unreached`;
+- `occupied perch: <size> hexes at hex <hex>, holds <names> (not reached
+  from the start)`: an unreached component kept walkable because a person
+  stands there; `critters lost to closing: none` (or the names) after it;
+  a one-map build prints the same lines, with the reached count, under
+  `## Reach`;
 - `moved off link hexes: N`, a line of the map's `## Notes` (prefixed
   `elevation <e>: ` above elevation 0): the ground items and containers the
   builder moved off the exit grids of links (below).
@@ -611,7 +632,7 @@ in `docs/vault-engine-briefs/`.
 `scripts/gate.sh` runs the local gate in order and stops at the first failure:
 `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, the clean-room
 brief linter, and then byte-identity checks of the Goodsprings and Prospector
-Saloon conversions against local baselines (`out/baseline-goodsprings-2.sha`,
+Saloon conversions against local baselines (`out/baseline-goodsprings-3.sha`,
 `out/baseline-saloon.sha`; the file counts must match too). Give the installs
 with `FNV_DIR` and `F2_DIR` (or `--fnv` and `--f2`); `GATE_BASELINES`,
 `GATE_SCRATCH`, `GATE_BIN` and `GATE_JOBS` override the defaults. Without the

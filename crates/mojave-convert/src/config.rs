@@ -195,13 +195,19 @@ pub struct SliceSpec {
     /// Default 0: the colours as stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vertex_color_floor: Option<f32>,
-    /// `coverage_bridges = true`: with a `navmesh_coverage` stricter than
+    /// `coverage_bridges` (on by default): with a `navmesh_coverage` stricter than
     /// the tolerance rule, the islands it cuts out of one floor (a narrow
     /// flight of steps) are joined again through the hexes the tolerance
     /// rule covers (`map_builder::BuildOptions::coverage_bridges`).
-    /// Default off.
+    /// Default on; `false` leaves the islands as the strict rule cut them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coverage_bridges: Option<bool>,
+    /// Single-map builds: close the walkable components no walk from the
+    /// entrance reaches, except those a critter stands on
+    /// (`map_builder::BuildOptions::close_unreached`). Default on; `false`
+    /// keeps them. A layer takes the layer file's key instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_unreached: Option<bool>,
 }
 
 /// `game = "fo3" | "fnv"` (the longer ids `fallout3` and `falloutnv` are
@@ -275,6 +281,7 @@ impl Default for SliceSpec {
             navmesh_only: None,
             vertex_color_floor: None,
             coverage_bridges: None,
+            close_unreached: None,
         }
     }
 }

@@ -563,8 +563,13 @@ pub struct BuildOptions {
     /// (a narrow flight of steps, a doorway) to the larger part they meet
     /// under the tolerance rule, through at most
     /// [`walk::BRIDGE_MAX_LENGTH`] hexes per join ([`walk::bridge_coverage`]).
-    /// Default `false`: nothing changes.
+    /// Default `true`; `false` leaves the islands as the strict rule cut
+    /// them.
     pub coverage_bridges: bool,
+    /// Single-map builds only ([`build_map`]): close what the start cannot
+    /// reach, as [`LayerOptions::close_unreached`] does for a layer (a layer
+    /// takes its own). Default `true`.
+    pub close_unreached: bool,
 }
 
 /// One level of a multi-level exterior map ([`levels::LevelSplit::exterior_level`]):
@@ -694,7 +699,8 @@ impl Default for BuildOptions {
             navmesh_coverage: walk::NavmeshCoverage::Tolerance,
             level: None,
             navmesh_only: false,
-            coverage_bridges: false,
+            coverage_bridges: true,
+            close_unreached: true,
         }
     }
 }
@@ -1073,6 +1079,12 @@ pub struct BuildReport {
     /// Islands holding an exit, a return hex or a critter that were left
     /// as they were, with the reason.
     pub islands_left: Vec<IslandReport>,
+    /// The entrance elevation's reach, closed components, occupied perches
+    /// and critters lost to closing, as [`ElevationReport`] gives them.
+    pub reach: Option<(usize, usize)>,
+    pub closed: Vec<(i32, usize, Vec<String>)>,
+    pub perches: Vec<reach::Perch>,
+    pub lost_to_closing: Option<Vec<String>>,
     pub walk: walk::WalkStats,
     /// Hexes passages made walkable (not counted in `walk`, which is the
     /// walkability pass before them).
@@ -1466,10 +1478,13 @@ pub struct LayerOptions {
     /// Close what the layer's start cannot reach (crate notes, "Reach"):
     /// after passages, every walkable component that no walk from the
     /// first map's entrance reaches, through the exit grids of the
-    /// layer's links, is made not walkable (no critter, entrance or
-    /// arrival stands on it) and reported on its elevation
-    /// ([`ElevationReport::closed`]). Default `false`: nothing changes;
-    /// the reach is reported either way ([`ElevationReport::reached`]).
+    /// layer's links, is made not walkable (no entrance or arrival stands
+    /// on it) and reported on its elevation ([`ElevationReport::closed`]),
+    /// except a component a critter would stand on (judged from the
+    /// critter's own source position before anything is closed), which
+    /// stays walkable and is reported as an occupied perch
+    /// ([`ElevationReport::perches`]). Default `true`; the reach is reported
+    /// either way ([`ElevationReport::reached`]).
     pub close_unreached: bool,
 }
 
@@ -1483,7 +1498,7 @@ impl Default for LayerOptions {
             isolated: false,
             link_doors: true,
             catalogue: None,
-            close_unreached: false,
+            close_unreached: true,
         }
     }
 }
@@ -1592,6 +1607,14 @@ pub struct ElevationReport {
     /// Components closed as unreached ([`LayerOptions::close_unreached`]):
     /// first hex, size, what they held.
     pub closed: Vec<(i32, usize, Vec<String>)>,
+    /// Unreached components kept walkable because a critter stands on
+    /// them ([`reach::Perch`]): occupied perches.
+    pub perches: Vec<reach::Perch>,
+    /// With closing on: critters that would have stood on this elevation
+    /// before anything was closed and were not placed after it (it should
+    /// be empty: a critter is never dropped by closing); `None` when
+    /// closing is off.
+    pub lost_to_closing: Option<Vec<String>>,
     /// Ground items and containers moved off the exit grids, arrival hexes
     /// and stair surroundings of links ([`clearance`]).
     pub moved_off_links: usize,

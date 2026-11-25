@@ -269,7 +269,14 @@ fn the_mini_town_door_leads_into_its_house_and_back() {
         base_files: &base,
         critter_art: &[],
         critters: &[],
-        options: BuildOptions::default(),
+        options: BuildOptions {
+            // The door's island is too far from the entrance to join (a
+            // passage of 12 hexes, the limit 6): this test follows the
+            // chain through its grids, which closing the island would
+            // make not walkable.
+            close_unreached: false,
+            ..BuildOptions::default()
+        },
     };
     let built = build_map(&input).unwrap();
     let report = &built.report;

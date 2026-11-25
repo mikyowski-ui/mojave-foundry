@@ -1192,7 +1192,17 @@ reaches. The numbers below came with them.
 |---|---|---|
 | Super-Duper Mart, upper floor | main component 71.7 % of its walkable hexes | 100 % |
 | Megaton, level 0 | three components, 34.2 % in the main one | one component |
-| Megaton, level 1 | islands of 197, 88 and 48 hexes | fully reached through the stairs, except one 49-hex deck, which is closed; closing it drops one sentry placed on it |
+| Megaton, level 1 | islands of 197, 88 and 48 hexes | fully reached through the stairs, except one 49-hex deck; closing it dropped the sentry placed on it, so since 2026-11-24 it is kept as an occupied perch |
+
+**Island fixes on by default (2026-11-24).** `coverage_bridges` and
+`close_unreached` are now the defaults for every build, both games, one map or
+a layer (`= false` in a slice, or `close_unreached = false` in a layer file,
+turns one off; the four layer files no longer carry them). Closing now keeps
+an unreached component a person stands on, judged from the critter's own
+source position before anything is closed: the 49-hex Megaton deck and its
+sentry stay, reported as an "occupied perch", and no critter is dropped by
+closing (`critters lost to closing: none`). The default New Vegas output
+changed, so the Goodsprings baselines are regenerated from it.
 
 **Rendering.** The white plane in Megaton and the white box of Moriarty's
 Saloon were two kinds of shape drawn with ordinary blending: untextured

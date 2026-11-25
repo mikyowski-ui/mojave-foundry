@@ -1010,8 +1010,11 @@ pub(crate) fn apply_slice_keys(slice: &crate::SliceSpec, scene: &mut Scene) {
     if !slice.is_interior() && slice.navmesh_only == Some(true) {
         scene.build_options.navmesh_only = true;
     }
-    if slice.coverage_bridges == Some(true) {
-        scene.build_options.coverage_bridges = true;
+    if let Some(bridges) = slice.coverage_bridges {
+        scene.build_options.coverage_bridges = bridges;
+    }
+    if let Some(close) = slice.close_unreached {
+        scene.build_options.close_unreached = close;
     }
 }
 
@@ -2579,6 +2582,49 @@ pub(crate) fn write_reach_sections(text: &mut String, report: &map_builder::Buil
             .count(),
         components.leaked
     );
+    if let Some((reached, planned)) = report.reach {
+        let closed: usize = report.closed.iter().map(|c| c.1).sum();
+        let _ = writeln!(
+            text,
+            "## Reach\n\n- walkable hexes reached from the entrance: {reached} of {planned}\n\
+             - closed as unreached: {} components, {closed} hexes\n\
+             - occupied perches: {}",
+            report.closed.len(),
+            report.perches.len()
+        );
+        for (hex, size, held) in &report.closed {
+            let _ = writeln!(
+                text,
+                "- closed as unreached: {size} hexes at {hex}{}",
+                if held.is_empty() {
+                    String::new()
+                } else {
+                    format!(", holding {}", held.join(", "))
+                }
+            );
+        }
+        for perch in &report.perches {
+            let _ = writeln!(
+                text,
+                "- occupied perch: {} hexes at hex {}, holds {} (not reached from the start)",
+                perch.size,
+                perch.hex,
+                perch.holds.join(", ")
+            );
+        }
+        if let Some(lost) = &report.lost_to_closing {
+            let _ = writeln!(
+                text,
+                "- critters lost to closing: {}",
+                if lost.is_empty() {
+                    "none".to_owned()
+                } else {
+                    lost.join(", ")
+                }
+            );
+        }
+        let _ = writeln!(text);
+    }
     let _ = writeln!(
         text,
         "## Passages\n\n{} opened, {} hexes made walkable.\n",

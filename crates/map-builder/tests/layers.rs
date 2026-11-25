@@ -879,38 +879,109 @@ fn the_link_check_refuses_grids_onto_blocked_hexes_grids_and_hex_zero() {
     assert!(check.one_way[0].starts_with("synth.map elevation 0 -> saloon.map"));
 }
 
-#[test]
-fn reach_is_reported_and_what_the_start_cannot_reach_is_closed() {
-    let t = tower(3, "tower");
-    let maps = tower_maps(&t);
+/// The tower with only the stairs between floors 0 and 1: floor 2 has no
+/// way in. `keep` says which critters stay.
+fn tower_without_the_top_stairs(keep: impl Fn(&str) -> bool) -> Tower {
+    let mut t = tower(3, "tower");
+    t.critters.retain(|c| keep(&c.name));
+    t
+}
+
+fn layer_without_the_top_stairs<'a>(t: &'a Tower, maps: Vec<MapInput<'a>>) -> LayerInput<'a> {
     let mut input = layer(maps, &t.base, &t.critter_art);
-    // Only the stairs between floors 0 and 1: floor 2 has no way in.
     input.stairs = t.layout.stair_links(0);
     input
         .stairs
         .retain(|s| s.ends.iter().all(|e| e.elevation < 2));
     assert_eq!(input.stairs.len(), 1);
+    input
+}
+
+#[test]
+fn reach_is_reported_and_what_the_start_cannot_reach_is_closed() {
+    // Floor 2 holds no critter here: it is an empty deck and closes.
+    let t = tower_without_the_top_stairs(|name| name != "Floor 2");
+    let maps = tower_maps(&t);
+    let mut input = layer_without_the_top_stairs(&t, maps);
+    input.options.close_unreached = false;
     let open = build_layer(&input).unwrap();
     let e = &open.maps[0].elevations;
     let (reached0, planned0) = e[0].reached.expect("reach");
     assert_eq!(reached0, planned0);
     assert_eq!(e[1].reached.map(|r| r.0 == r.1), Some(true));
     assert_eq!(e[2].reached.map(|r| r.0), Some(0));
-    assert!(e[2].closed.is_empty(), "off by default");
-    // Closed: elevation 2 holds nothing walkable, and says what it closed.
+    assert!(e[2].closed.is_empty(), "off when asked");
+    assert!(e[2].lost_to_closing.is_none());
+    // On (the default): elevation 2 holds nothing walkable, and says what
+    // it closed.
+    assert!(LayerOptions::default().close_unreached);
     input.options.close_unreached = true;
     let closed = build_layer(&input).unwrap();
     let e = &closed.maps[0].elevations;
     assert!(!e[2].closed.is_empty());
+    assert!(e[2].perches.is_empty(), "nobody stands there");
     assert_eq!(e[2].reached, Some((0, 0)));
     assert!(closed.maps[0].walkable[2].iter().all(|w| !w));
     assert_eq!(e[0].reached, open.maps[0].elevations[0].reached);
-    // Its critter now has nowhere to stand.
     assert!(closed.maps[0].critter_elevations.iter().all(|e| *e < 2));
+    assert_eq!(e[2].lost_to_closing, Some(Vec::new()));
     // Deterministic.
     assert_eq!(
         build_layer(&input).unwrap().layer.files(),
         closed.layer.files()
+    );
+}
+
+#[test]
+fn an_unlinked_deck_with_a_critter_stays_walkable_and_the_critter_stands_on_it() {
+    // Floor 2 is reached by no stairs but "Floor 2" stands on it: an
+    // occupied perch, never closed, and the critter is placed there.
+    let t = tower_without_the_top_stairs(|_| true);
+    let maps = tower_maps(&t);
+    let mut input = layer_without_the_top_stairs(&t, maps);
+    input.options.close_unreached = true;
+    let built = build_layer(&input).unwrap();
+    let e = &built.maps[0].elevations;
+    assert!(e[2].closed.is_empty(), "{:?}", e[2].closed);
+    assert_eq!(e[2].perches.len(), 1, "{:?}", e[2].perches);
+    let perch = &e[2].perches[0];
+    assert_eq!(perch.holds, vec!["Floor 2".to_owned()]);
+    let planned = built.maps[0].walkable[2].iter().filter(|w| **w).count();
+    assert_eq!(perch.size, planned, "the whole deck is kept");
+    assert!(built.maps[0].walkable[2][perch.hex as usize]);
+    // Not reached from the start, and said so.
+    assert_eq!(e[2].reached.map(|r| r.0), Some(0));
+    // The critter is placed on elevation 2, on a walkable hex of the deck.
+    assert!(
+        built.maps[0].critter_elevations.contains(&2),
+        "{:?}",
+        built.maps[0].critter_elevations
+    );
+    let on_deck = e[2].critters.iter().any(|c| c.contains("8202"));
+    assert!(on_deck, "{:?}", e[2].critters);
+    // A named person is never dropped by closing.
+    for elevation in e {
+        assert_eq!(elevation.lost_to_closing, Some(Vec::new()));
+    }
+    // The map's skipped list holds nobody from the deck.
+    assert!(
+        built.maps[0]
+            .report
+            .skipped_critters
+            .iter()
+            .all(|s| !s.reference.contains("8202")),
+        "{:?}",
+        built.maps[0].report.skipped_critters
+    );
+    // Closing off keeps the same deck: the perch is what closing would have
+    // left alone, and the build is deterministic.
+    input.options.close_unreached = false;
+    let open = build_layer(&input).unwrap();
+    assert_eq!(open.maps[0].walkable[2], built.maps[0].walkable[2]);
+    input.options.close_unreached = true;
+    assert_eq!(
+        build_layer(&input).unwrap().layer.files(),
+        built.layer.files()
     );
 }
 

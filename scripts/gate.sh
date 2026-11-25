@@ -276,7 +276,7 @@ real_checks() {
   esac
   rm -rf "$SCRATCH"
   mkdir -p "$SCRATCH"
-  identity goodsprings "$BASELINES/baseline-goodsprings-2.sha" || return 1
+  identity goodsprings "$BASELINES/baseline-goodsprings-3.sha" || return 1
   identity saloon "$BASELINES/baseline-saloon.sha" \
     --standalone --slice "$ROOT/slices/saloon.toml" || return 1
 }
@@ -288,7 +288,7 @@ elif [ -z "$FNV" ] || [ -z "$F2" ]; then
   skip_reason="FNV_DIR / F2_DIR not set"
 elif [ ! -d "$FNV" ] || [ ! -d "$F2" ]; then
   skip_reason="install directory not found"
-elif [ ! -f "$BASELINES/baseline-goodsprings-2.sha" ] || [ ! -f "$BASELINES/baseline-saloon.sha" ]; then
+elif [ ! -f "$BASELINES/baseline-goodsprings-3.sha" ] || [ ! -f "$BASELINES/baseline-saloon.sha" ]; then
   skip_reason="baselines not found in $BASELINES"
 fi
 

@@ -568,7 +568,7 @@ As built for the demonstration maps (2026-11-22):
   `borrowed_base_layers`, summarised in `map-report.md`'s `## Ground`. It
   changed 46 of the real Goodsprings map's 10,000 squares (15 squares
   re-pointed, 6 tile images redrawn), and nothing else in its layer
-  (`out/baseline-goodsprings-2.sha`).
+  (`out/baseline-goodsprings-3.sha`).
 - **Reach.** `map_builder` reports the entrance (`BuildReport::entrance`:
   hex, how a figure there is drawn, whether it is in the largest
   component, steps from the window centre), the written map's components
@@ -843,17 +843,25 @@ one-map path of 9.4 to 9.6, byte for byte. The code is
   links (`reach::layer_reach`). `ElevationReport::reached` is (hexes
   reached, planned walkable hexes); `ElevationReport::closed` lists the
   components closed as unreached. `LayerOptions::close_unreached` (layer
-  file `close_unreached`, default off) closes every walkable component no
-  walk from the first map's entrance reaches (the start map comes first),
-  stepping on an exit grid continuing from its arrival hex; the report
-  counts them. Both are computed from the planned grids before anything is
+  file `close_unreached`, default on since 2026-11-24; on a one-map build
+  `BuildOptions::close_unreached` / the slice key, default on) closes every
+  walkable component no walk from the first map's entrance reaches (the
+  start map comes first), stepping on an exit grid continuing from its
+  arrival hex, except a component a critter would stand on: before closing,
+  the critters are placed by the ordinary rule on the grid as it is and any
+  unreached component that receives one is kept walkable and listed as an
+  occupied perch (`ElevationReport::perches`: size, lowest hex, names; the
+  report line "occupied perch: N hexes at hex H, holds X (not reached from
+  the start)"). A critter placed before closing is placed after it:
+  `ElevationReport::lost_to_closing` is empty, and the report says so.
+  Empty unreached components close; the report counts them. Both are computed from the planned grids before anything is
   written.
 - **Exterior ground options.** `BuildOptions::navmesh_only` (slice key
   `navmesh_only`, exterior only, default off): a hex in a cell without a
   navmesh is not walkable when some other cell of the window has one
   (`Verdict::NoGround`), instead of the slope rule; Megaton's ground
   outside its wall. `BuildOptions::coverage_bridges` (slice key
-  `coverage_bridges`, default off): under a `navmesh_coverage` stricter than
+  `coverage_bridges`, default on since 2026-11-24): under a `navmesh_coverage` stricter than
   the tolerance rule, the islands it cuts out of one floor are joined to the
   larger part through the hexes the tolerance rule covers, at most
   `walk::BRIDGE_MAX_LENGTH` (8) hexes per join (`walk::bridge_coverage`).

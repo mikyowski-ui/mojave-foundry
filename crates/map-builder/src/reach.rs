@@ -331,11 +331,27 @@ pub(crate) fn planned_reach(plans: &[MapPlan]) -> Option<Vec<Vec<Vec<bool>>>> {
     Some(reached)
 }
 
+/// A walkable component no walk from the layer's start reaches, kept
+/// because a critter of the map would stand on it
+/// ([`crate::LayerOptions::close_unreached`]): an occupied perch, such as a
+/// sentry's deck.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Perch {
+    /// Its lowest hex (the representative) and its size.
+    pub hex: i32,
+    pub size: usize,
+    /// Who stands there: each critter's name, or its reference when it has
+    /// none, sorted.
+    pub holds: Vec<String>,
+}
+
 /// [`crate::LayerOptions::close_unreached`]: every walkable component no
 /// walk from the first map's entrance reaches through the layer's links is
 /// made not walkable, and recorded on its elevation
-/// ([`ElevationPlan::closed`]) with what it held; the sealing border is
-/// laid again. Returns the hexes closed.
+/// ([`ElevationPlan::closed`]) with what it held, except a component a
+/// critter would stand on, judged from the critter's own source position
+/// before anything is closed: that stays walkable and is recorded as a
+/// [`Perch`]. The sealing border is laid again. Returns the hexes closed.
 pub(crate) fn close_unreached(plans: &mut [MapPlan]) -> usize {
     let Some(reached) = planned_reach(plans) else {
         return 0;
@@ -344,7 +360,22 @@ pub(crate) fn close_unreached(plans: &mut [MapPlan]) -> usize {
     for (m, plan) in plans.iter_mut().enumerate() {
         for e in 0..plan.elevations.len() {
             let holds = holdings(plan, e);
+            let before = crate::plan::would_place(plan, e);
+            let names: Vec<(i32, String)> = before
+                .iter()
+                .map(|spot| {
+                    let critter = &plan.input.critters[spot.index];
+                    let who = if critter.name.is_empty() {
+                        critter.reference.clone()
+                    } else {
+                        critter.name.clone()
+                    };
+                    (spot.hex, who)
+                })
+                .collect();
+            let placed: Vec<usize> = before.iter().map(|spot| spot.index).collect();
             let elevation = &mut plan.elevations[e];
+            elevation.placed_before_closing = Some(placed);
             let open: Vec<bool> = (0..HEXES)
                 .map(|h| elevation.walkable[h] && !reached[m][e][h])
                 .collect();
@@ -356,6 +387,21 @@ pub(crate) fn close_unreached(plans: &mut [MapPlan]) -> usize {
                 let Some(first_hex) = comps.first_hex(id) else {
                     continue;
                 };
+                let mut who: Vec<String> = names
+                    .iter()
+                    .filter(|(hex, _)| comps.of(*hex) == Some(id))
+                    .map(|(_, who)| who.clone())
+                    .collect();
+                if !who.is_empty() {
+                    who.sort();
+                    who.dedup();
+                    elevation.perches.push(Perch {
+                        hex: first_hex,
+                        size: comps.sizes()[id],
+                        holds: who,
+                    });
+                    continue;
+                }
                 let mut held: Vec<String> = comps
                     .members(id)
                     .filter_map(|h| holds.get(&h))

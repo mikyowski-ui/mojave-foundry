@@ -257,7 +257,7 @@ pub(crate) fn build(input: &BuildInput) -> Result<Built, BuildError> {
         isolated: interior.is_some(),
         link_doors: false,
         catalogue: options.catalogue.clone(),
-        close_unreached: false,
+        close_unreached: options.close_unreached,
     };
     let layer = LayerInput {
         layer_id: input.layer_id,
@@ -1320,6 +1320,23 @@ pub(crate) fn build_layer(input: &LayerInput) -> Result<BuiltLayer, BuildError> 
                     )
                 }),
                 closed: elevation.closed.clone(),
+                perches: elevation.perches.clone(),
+                lost_to_closing: elevation.placed_before_closing.as_ref().map(|placed| {
+                    let mut lost: Vec<String> = placed
+                        .iter()
+                        .filter(|i| elevation.spots.iter().all(|s| s.index != **i))
+                        .map(|i| {
+                            let c = &plan.input.critters[*i];
+                            if c.name.is_empty() {
+                                c.reference.clone()
+                            } else {
+                                c.name.clone()
+                            }
+                        })
+                        .collect();
+                    lost.sort();
+                    lost
+                }),
                 moved_off_links: elevation.moved_off_links,
             });
         }
@@ -1354,6 +1371,10 @@ pub(crate) fn build_layer(input: &LayerInput) -> Result<BuiltLayer, BuildError> 
         report.components = main.components.clone();
         report.passages = main.passages.clone();
         report.islands_left = main.islands_left.clone();
+        report.reach = main.reached;
+        report.closed = main.closed.clone();
+        report.perches = main.perches.clone();
+        report.lost_to_closing = main.lost_to_closing.clone();
         report.opened_hexes = main.opened_hexes;
         report.blockers = main.blockers;
         report.readability = main.readability;

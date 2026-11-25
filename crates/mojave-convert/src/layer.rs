@@ -88,7 +88,8 @@ pub struct LayerSpec {
     pub with_interiors: bool,
     /// `close_unreached = true`: what no walk from the start map's entrance
     /// reaches through the layer's links is closed and reported
-    /// (`map_builder::LayerOptions::close_unreached`). Default off.
+    /// (`map_builder::LayerOptions::close_unreached`), except a component a
+    /// person stands on. Default on.
     pub close_unreached: bool,
     pub maps: Vec<LayerMap>,
     /// The first exterior's slice as a table, and the `[all_maps]` keys:
@@ -100,6 +101,10 @@ pub struct LayerSpec {
     source: String,
 }
 
+fn on() -> bool {
+    true
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LayerFile {
@@ -108,7 +113,7 @@ struct LayerFile {
     start: Option<String>,
     #[serde(default)]
     with_interiors: bool,
-    #[serde(default)]
+    #[serde(default = "on")]
     close_unreached: bool,
     #[serde(default)]
     all_maps: toml::Table,
@@ -281,7 +286,7 @@ impl LayerSpec {
             name: slice.name.clone(),
             start: None,
             with_interiors: true,
-            close_unreached: false,
+            close_unreached: slice.close_unreached.unwrap_or(true),
             maps: vec![LayerMap {
                 slice: slice.clone(),
                 automatic: false,
@@ -298,7 +303,7 @@ impl LayerSpec {
             name: slice.name.clone(),
             start: None,
             with_interiors: false,
-            close_unreached: false,
+            close_unreached: slice.close_unreached.unwrap_or(true),
             maps: vec![LayerMap {
                 slice: slice.clone(),
                 automatic: false,
@@ -2443,6 +2448,26 @@ fn elevation_reach(text: &mut String, e: &map_builder::ElevationReport) {
                 format!(", holding {}", holds.join(", "))
             }
         );
+    }
+    for perch in &e.perches {
+        let _ = writeln!(
+            text,
+            "- occupied perch: {} hexes at hex {}, holds {} (not reached from the start)",
+            perch.size,
+            perch.hex,
+            perch.holds.join(", ")
+        );
+    }
+    match &e.lost_to_closing {
+        Some(lost) if lost.is_empty() => {
+            if !e.closed.is_empty() || !e.perches.is_empty() {
+                let _ = writeln!(text, "- critters lost to closing: none");
+            }
+        }
+        Some(lost) => {
+            let _ = writeln!(text, "- critters LOST to closing: {}", lost.join(", "));
+        }
+        None => {}
     }
     for passage in &e.passages {
         let _ = writeln!(

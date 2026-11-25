@@ -41,8 +41,20 @@ fn digests(built: &Built) -> (u64, u64) {
     )
 }
 
-/// Every scene, by name.
-fn scenes() -> Vec<(&'static str, Scene)> {
+/// Every scene, by name, with the options that kept the old bytes (islands
+/// neither bridged nor closed: both are on by default now) when `old`.
+fn scenes(old: bool) -> Vec<(&'static str, Scene)> {
+    let mut out = scene_list();
+    if old {
+        for (_, scene) in &mut out {
+            scene.options.close_unreached = false;
+            scene.options.coverage_bridges = false;
+        }
+    }
+    out
+}
+
+fn scene_list() -> Vec<(&'static str, Scene)> {
     let mut out = Vec::new();
     out.push(("town", town()));
     let mut s = town();
@@ -113,30 +125,30 @@ fn scenes() -> Vec<(&'static str, Scene)> {
 
 /// Recorded on 2026-11-23 before any refactor: (scene, layer, report).
 const GOLDEN: &[(&str, u64, u64)] = &[
-    ("town", 0x402c95f006c12ebc, 0x4217c51d43b24176),
-    ("town-base", 0x595090e43aaea43e, 0x7a0be1510972b5e9),
-    ("town-standalone", 0x873ec107721e02ef, 0x20b6946d37725cb9),
-    ("town-numbered", 0x1609907bd8919e3f, 0xda3c777091fb01dc),
-    ("critter-town", 0x595090e43aaea43e, 0x7a0be1510972b5e9),
-    ("door-scene", 0x92101346821a50c3, 0xb3121fe6082e1c94),
-    ("doors", 0x9fea1cd23449b105, 0x0732e8ef2db0c7a7),
-    ("doors-base", 0x70f3e819a253b1c0, 0xebd894ede57f47b5),
-    ("doors-standalone", 0xed2d0daf54dac6d7, 0x1cbb9be7f38a10b9),
-    ("populated", 0x1f8f5973f5d68272, 0xe4999c2fa5c6bf22),
-    ("populated-packet", 0xa0352fc7e5a597f0, 0xfd8e9ef06c4ae22c),
-    ("cut-town", 0xa8fb86c44e7bccdf, 0xcb977f756a4f7c3d),
-    ("cut-town-off", 0x3a22299086deac99, 0xbc4fed3e7bcd3cd0),
-    ("cut-town-rings", 0x320f76d8f1e8bad4, 0x0d9f649f7d334b6e),
-    ("connected", 0xb3448c1435e02344, 0xc88d2b4454f8684a),
-    ("saloon", 0xca17d4ce4d8e8243, 0xc86f159d14248939),
-    ("saloon-clamped", 0x631db0ae2f35752c, 0x3ee4fbcc1dafa276),
-    ("saloon-interactive", 0xca17d4ce4d8e8243, 0x3102a289ef18a72a),
+    ("town", 0x402c95f006c12ebc, 0xc980e5eb7a501bc9),
+    ("town-base", 0x595090e43aaea43e, 0x7288485670a06dfe),
+    ("town-standalone", 0x873ec107721e02ef, 0xaec2e3c2ac9d2612),
+    ("town-numbered", 0x1609907bd8919e3f, 0xa004353677849ee5),
+    ("critter-town", 0x595090e43aaea43e, 0x7288485670a06dfe),
+    ("door-scene", 0x92101346821a50c3, 0x47ae7b3b9830b7e9),
+    ("doors", 0x9fea1cd23449b105, 0xb32b1035072169f2),
+    ("doors-base", 0x70f3e819a253b1c0, 0x22d96af569242e8e),
+    ("doors-standalone", 0xed2d0daf54dac6d7, 0xd6b50a57d06faff2),
+    ("populated", 0x1f8f5973f5d68272, 0xa80baf81a5d5e013),
+    ("populated-packet", 0xa0352fc7e5a597f0, 0x7272837490fb8a5d),
+    ("cut-town", 0xa8fb86c44e7bccdf, 0xf156751106fbd596),
+    ("cut-town-off", 0x3a22299086deac99, 0xa0759ee7c83a2364),
+    ("cut-town-rings", 0x320f76d8f1e8bad4, 0x95bd4a4a8b5044c1),
+    ("connected", 0xb3448c1435e02344, 0xd781f373497094bb),
+    ("saloon", 0xca17d4ce4d8e8243, 0x06e942d3b85b952e),
+    ("saloon-clamped", 0x631db0ae2f35752c, 0xe77bbff5ea258b5d),
+    ("saloon-interactive", 0xca17d4ce4d8e8243, 0x272656b058e3d33d),
 ];
 
 #[test]
 fn every_single_map_scene_is_byte_identical() {
     let mut seen = Vec::new();
-    for (name, scene) in scenes() {
+    for (name, scene) in scenes(true) {
         let built = build_map(&scene.input()).unwrap();
         let (layer, report) = digests(&built);
         // Twice: determinism.
@@ -160,6 +172,8 @@ fn every_single_map_scene_is_byte_identical() {
 #[test]
 fn the_town_digests_from_before_critters_hold() {
     let mut s = town();
+    s.options.close_unreached = false;
+    s.options.coverage_bridges = false;
     assert_eq!(
         digest(&build_map(&s.input()).unwrap().layer),
         0x402c_95f0_06c1_2ebc
@@ -169,4 +183,51 @@ fn the_town_digests_from_before_critters_hold() {
         digest(&build_map(&s.input()).unwrap().layer),
         0x5950_90e4_3aae_a43e
     );
+}
+
+/// The same scenes with the defaults (islands closed and bridged), recorded
+/// on 2026-11-24 when both became the default: only the scenes holding an
+/// island that no walk from the entrance reaches differ from `GOLDEN`.
+const GOLDEN_DEFAULT: &[(&str, u64, u64)] = &[
+    ("town", 0x8a41fe78eda93240, 0x445d17987aedd483),
+    ("town-base", 0x304b6a6ef4ee2bda, 0xed784380452730b4),
+    ("town-standalone", 0x480b8d6e3af8eb2b, 0xe238b8dcdef292c8),
+    ("town-numbered", 0x02a0b77905576b83, 0xbd4b5b29d876d5cb),
+    ("critter-town", 0x304b6a6ef4ee2bda, 0xed784380452730b4),
+    ("door-scene", 0x75ceb7924cf9990f, 0x219e1936cb924cf0),
+    ("doors", 0x036df4bc0425b4b5, 0x55e9cafd9d1ae7d2),
+    ("doors-base", 0xc9558611bd72fe28, 0x5b39eefb65513cae),
+    ("doors-standalone", 0xcc5972f85efe5837, 0x53003d6d57dd7cb6),
+    ("populated", 0x8903fcdcfed8473a, 0x3b8383caf8c7d2e4),
+    ("populated-packet", 0x0b10d07ffc8907d8, 0x82a05c3737cd4fda),
+    ("cut-town", 0x3c7f049bc9def297, 0x0e24a5efbb1484b9),
+    ("cut-town-off", 0x41e7c01b36b650ab, 0x3e791edb7c410dd1),
+    ("cut-town-rings", 0x528cf97ea7b14ed8, 0x2193e6648534ab6e),
+    ("connected", 0x36b3bc62a75371ec, 0x24bbf7fad926a4d1),
+    ("saloon", 0xca17d4ce4d8e8243, 0xb872e0d86e1e4013),
+    ("saloon-clamped", 0x631db0ae2f35752c, 0xbf30113185efeb1c),
+    ("saloon-interactive", 0xca17d4ce4d8e8243, 0x2bfff174f5daedec),
+];
+
+#[test]
+fn every_single_map_scene_with_the_defaults_is_pinned_and_deterministic() {
+    let mut seen = Vec::new();
+    for (name, scene) in scenes(false) {
+        let built = build_map(&scene.input()).unwrap();
+        let (layer, report) = digests(&built);
+        assert_eq!(
+            digests(&build_map(&scene.input()).unwrap()),
+            (layer, report),
+            "{name}"
+        );
+        seen.push((name, layer, report));
+    }
+    for (name, layer, report) in &seen {
+        println!("    (\"{name}\", {layer:#018x}, {report:#018x}),");
+    }
+    assert_eq!(seen.len(), GOLDEN_DEFAULT.len(), "one entry per scene");
+    for ((name, layer, report), (g_name, g_layer, g_report)) in seen.iter().zip(GOLDEN_DEFAULT) {
+        assert_eq!(name, g_name);
+        assert_eq!((layer, report), (g_layer, g_report), "scene {name}");
+    }
 }

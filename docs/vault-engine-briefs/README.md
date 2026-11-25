@@ -19,6 +19,7 @@ requirement `[Must-match]`, `[May-improve]` or `[Safe rule]`.
 | [terminal-and-note-modal.md](terminal-and-note-modal.md) | A data-driven document and terminal reader in `vault_core::ui`, opened by new mod script words, with skill locks, passwords, `.msg` text and logged-input replay (at `4d5183a`) |
 | [ogg-audio-streaming.md](ogg-audio-streaming.md) | Ogg Vorbis playback for mod layers' music, speech and effects, with a portable decoder in `vault-formats` and streaming in `vault-platform`, base data unaffected (at `4d5183a`) |
 | [elevation-change-audit.md](elevation-change-audit.md) | Carried objects take their holder's elevation when it moves to another elevation (a same-map exit grid), so the live world equals its own save and load and the autoplay audit stops reporting `AuditMismatch` (at `4d5183a`) |
+| [manifest-script-dialogue-msg.md](manifest-script-dialogue-msg.md) | Dialogue message files (`dialog/<name>.msg`) for script rows a `[[scripts]]` manifest table registers, resolved through the same registry that finds the program, in every layer order, with `Error` text for a missing file (at `4d5183a`) |
 
 Until a writer lands upstream, this repository's own adapter in
 `crates/emit` (behind the `FormatWriters` trait) produces the same bytes;

@@ -6,11 +6,7 @@
 name = "goodsprings-linked"
 start = "goodspri"
 
-# What the start cannot reach through the links is closed and reported.
-close_unreached = true
-
 [all_maps]
-coverage_bridges = true
 loot = true
 
 [[maps]]

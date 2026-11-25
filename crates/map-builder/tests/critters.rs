@@ -656,7 +656,11 @@ fn the_same_input_gives_the_same_bytes() {
 
 #[test]
 fn a_build_without_critters_has_not_moved() {
+    // The digests were recorded before islands were closed and bridged,
+    // both now on by default: this test is about the old bytes.
     let mut scene = town();
+    scene.options.close_unreached = false;
+    scene.options.coverage_bridges = false;
     assert_eq!(
         digest(&build_map(&scene.input()).unwrap().layer),
         BEFORE_EMPTY

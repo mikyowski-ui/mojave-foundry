@@ -49,6 +49,8 @@ fn a_town_cut_by_a_blocked_line_gets_a_passage_to_its_door() {
     // Without reconnecting: the door's island is reported, left alone.
     let mut off = cut_town().0;
     off.options.reconnect = false;
+    // The island is reported and left alone: closing it is not the subject.
+    off.options.close_unreached = false;
     let before = build_map(&off.input()).unwrap();
     let report = &before.report;
     assert!(report.passages.is_empty());
@@ -300,6 +302,9 @@ fn a_connected_scene_is_unchanged_byte_for_byte() {
     // digests), and a connected town with doors and a critter, with and
     // without reconnecting.
     let mut scene = town();
+    // The old bytes: islands closed and bridged are now the default.
+    scene.options.close_unreached = false;
+    scene.options.coverage_bridges = false;
     assert_eq!(
         digest(&build_map(&scene.input()).unwrap().layer),
         0x402c_95f0_06c1_2ebc

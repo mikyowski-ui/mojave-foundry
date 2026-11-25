@@ -322,3 +322,39 @@ fn every_checked_in_layer_resolves() {
         ])
     );
 }
+
+#[test]
+fn island_fixes_are_on_unless_a_file_says_false() {
+    use mojave_convert::layer::LayerSpec;
+    let dir = Path::new(".");
+    let layer = |extra: &str| {
+        LayerSpec::from_toml(
+            &format!("name = \"x\"\n{extra}\n[[maps]]\nslice = \"goodsprings\"\n"),
+            dir,
+        )
+        .unwrap()
+    };
+    assert!(layer("").close_unreached);
+    assert!(layer("close_unreached = true").close_unreached);
+    assert!(!layer("close_unreached = false").close_unreached);
+    // Slices: absent means the builder's default (on); false is accepted.
+    let head = "name = \"a\"\nworldspace = \"W\"\nplugins = [\"F.esm\"]\nx = [0, 0]\ny = [0, 0]\n";
+    let none = SliceSpec::from_toml(head).unwrap();
+    assert_eq!(none.close_unreached, None);
+    assert_eq!(none.coverage_bridges, None);
+    let off = SliceSpec::from_toml(&format!(
+        "{head}close_unreached = false\ncoverage_bridges = false\n"
+    ))
+    .unwrap();
+    assert_eq!(off.close_unreached, Some(false));
+    assert_eq!(off.coverage_bridges, Some(false));
+    let options = map_builder::BuildOptions::default();
+    assert!(options.close_unreached && options.coverage_bridges);
+    // A single slice made into a layer follows its own key.
+    let slice = SliceSpec {
+        close_unreached: Some(false),
+        ..SliceSpec::preset("goodsprings").unwrap()
+    };
+    assert!(!LayerSpec::single(&slice).close_unreached);
+    assert!(LayerSpec::single(&SliceSpec::preset("goodsprings").unwrap()).close_unreached);
+}

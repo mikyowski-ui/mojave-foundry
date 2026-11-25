@@ -92,6 +92,13 @@ pub(crate) struct ElevationPlan<'a> {
     /// Components closed as unreached ([`crate::LayerOptions::close_unreached`]):
     /// first hex, size, what they held.
     pub closed: Vec<(i32, usize, Vec<String>)>,
+    /// Unreached components kept because a critter would stand on them
+    /// ([`crate::reach::Perch`]).
+    pub perches: Vec<crate::reach::Perch>,
+    /// With closing on: the critters (indices into the map's critters)
+    /// that would have been placed on this elevation before anything was
+    /// closed; `None` when closing is off.
+    pub placed_before_closing: Option<Vec<usize>>,
     /// Items and containers moved off link hexes ([`crate::clearance`]).
     pub moved_off_links: usize,
     pub opened: BTreeSet<i32>,
@@ -738,6 +745,8 @@ pub(crate) fn plan_map<'a>(
             passages: Vec::new(),
             islands_left: Vec::new(),
             closed: Vec::new(),
+            perches: Vec::new(),
+            placed_before_closing: None,
             moved_off_links: 0,
             opened: BTreeSet::new(),
             border: Vec::new(),
@@ -1136,21 +1145,39 @@ pub(crate) fn place_critters(plan: &mut MapPlan) {
     if plan.input.critters.is_empty() {
         return;
     }
-    let entry = plan.entrance_hex();
     for e in 0..plan.elevations.len() {
         let elevation = &plan.elevations[e];
-        let mut reserved = elevation.grid_hexes();
-        if e == plan.entrance_elevation {
-            reserved.extend(entry);
-        }
-        reserved.extend(elevation.arrival_hexes());
-        reserved.extend(&elevation.door_hexes);
-        reserved.extend(&elevation.opened);
-        reserved.extend(crate::clearance::elevation_keep_clear(elevation));
+        let reserved = critter_reserved(plan, e);
         let (spots, skipped) = place_on(plan, e, &elevation.walkable, &reserved);
         plan.elevations[e].spots = spots;
         plan.elevations[e].skipped_critters = skipped;
     }
+}
+
+/// The hexes no critter of elevation `e` may take: exit grids, doors, the
+/// entrance, arrivals, passages and the keep-clear set of links.
+fn critter_reserved(plan: &MapPlan, e: usize) -> BTreeSet<i32> {
+    let elevation = &plan.elevations[e];
+    let mut reserved = elevation.grid_hexes();
+    if e == plan.entrance_elevation {
+        reserved.extend(plan.entrance_hex());
+    }
+    reserved.extend(elevation.arrival_hexes());
+    reserved.extend(&elevation.door_hexes);
+    reserved.extend(&elevation.opened);
+    reserved.extend(crate::clearance::elevation_keep_clear(elevation));
+    reserved
+}
+
+/// Where the critters of elevation `e` would stand on its walkable grid as
+/// it is now ([`place_critters`]'s rule, nothing recorded): what closing
+/// the unreached asks before it closes anything.
+pub(crate) fn would_place(plan: &MapPlan, e: usize) -> Vec<Spot> {
+    if plan.input.critters.is_empty() {
+        return Vec::new();
+    }
+    let reserved = critter_reserved(plan, e);
+    place_on(plan, e, &plan.elevations[e].walkable, &reserved).0
 }
 
 /// The entrance by the crate notes' rule: in the largest component (with
