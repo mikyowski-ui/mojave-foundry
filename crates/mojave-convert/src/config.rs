@@ -208,6 +208,22 @@ pub struct SliceSpec {
     /// keeps them. A layer takes the layer file's key instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub close_unreached: Option<bool>,
+    /// `enable_groups = true` (Pass 2, `docs/simulation-layer-spec.md` 8.3):
+    /// a reference of an enable-parent group (it has an enable parent, or
+    /// is one) that starts disabled is placed with the hidden flag instead
+    /// of being left off, so a script can show it later. It blocks
+    /// nothing while hidden and is not a placed person, item or
+    /// container for the counts; the placement index lists it. Default
+    /// off: such references are left out as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_groups: Option<bool>,
+    /// `hostile_packet = <n>`: the AI packet number hostile people take
+    /// when `loot` is on (`crate::catalogue`), instead of the rebalance
+    /// table's (`convert.hostility.hostile_packet`, then
+    /// `hostile_packet_number`). Must be a packet of the base `ai.txt`.
+    /// Default: the table's, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostile_packet: Option<i32>,
 }
 
 /// `game = "fo3" | "fnv"` (the longer ids `fallout3` and `falloutnv` are
@@ -282,6 +298,8 @@ impl Default for SliceSpec {
             vertex_color_floor: None,
             coverage_bridges: None,
             close_unreached: None,
+            enable_groups: None,
+            hostile_packet: None,
         }
     }
 }
@@ -391,6 +409,9 @@ impl SliceSpec {
         }
         if self.worldspace.is_empty() {
             return Err("worldspace is empty".to_owned());
+        }
+        if self.hostile_packet.is_some_and(|n| n < 0) {
+            return Err("hostile_packet must be an AI packet number, 0 or more".to_owned());
         }
         if self.plugins.is_empty() {
             return Err("plugins is empty".to_owned());
@@ -918,6 +939,12 @@ impl Inputs {
             with_interiors: false,
             ..self.clone()
         }
+    }
+
+    /// Whether enable-group children that start disabled are placed hidden
+    /// (the slice's `enable_groups`, default off).
+    pub fn enable_groups_on(&self) -> bool {
+        self.slice.enable_groups.unwrap_or(false)
     }
 
     /// Whether this run builds items and loot: `--loot`, else the slice's

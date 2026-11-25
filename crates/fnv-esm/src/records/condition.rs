@@ -100,7 +100,48 @@ pub struct Condition {
     pub reference: FormId,
 }
 
+/// The condition functions whose parameters can name a placed reference,
+/// with the parameter slots (`[first, second]`) that do.
+///
+/// Found by resolving the two parameters of every condition of both
+/// masters against the placed references (`REFR`, `ACHR`, `ACRE`): only
+/// these functions ever have one. The names are the public function names
+/// where they are settled (`GetDistance`, `GetInSameCell`, `GetDetected`,
+/// `GetScriptVariable`, `GetIsReference`, `IsCombatTarget`); 162 and 464
+/// (New Vegas) and 230 (Fallout 3, second parameter) are listed by what the
+/// data shows. `GetDead` and `GetDisabled` do not appear: they run on a
+/// reference, which the condition's `run_on` and `reference` fields give.
+pub const REFERENCE_PARAMETER_FUNCTIONS: &[(u16, [bool; 2])] = &[
+    (1, [true, false]),
+    (32, [true, false]),
+    (45, [true, false]),
+    (53, [true, false]),
+    (136, [true, false]),
+    (162, [true, false]),
+    (230, [false, true]),
+    (464, [true, false]),
+    (515, [true, false]),
+];
+
+/// Which parameters of a condition function can name a placed reference;
+/// see [`REFERENCE_PARAMETER_FUNCTIONS`].
+pub fn reference_parameter_slots(function: u16) -> [bool; 2] {
+    REFERENCE_PARAMETER_FUNCTIONS
+        .iter()
+        .find(|(index, _)| *index == function)
+        .map_or([false, false], |&(_, slots)| slots)
+}
+
 impl Condition {
+    /// The parameters that can name a placed reference, as form ids (as
+    /// stored; a value of 0 is `None`): see
+    /// [`REFERENCE_PARAMETER_FUNCTIONS`].
+    pub fn reference_params(&self) -> [Option<FormId>; 2] {
+        let slots = reference_parameter_slots(self.function_index());
+        let param = |slot: bool, value: u32| (slot && value != 0).then_some(FormId(value));
+        [param(slots[0], self.param1), param(slots[1], self.param2)]
+    }
+
     /// This condition is OR-ed with the next one instead of AND-ed.
     pub const FLAG_OR: u8 = 0x01;
     /// Run on the target (the older form of [`Condition::run_on`]).

@@ -43,6 +43,15 @@ pub enum EmitError {
     /// refused a value.
     #[error(transparent)]
     Format(#[from] vault_formats::ParseError),
+    /// Assembler source the `.int` format cannot carry.
+    #[error(transparent)]
+    Asm(#[from] crate::int::AsmError),
+    /// A map edit the map cannot take (`map::attach_scripts`).
+    #[error("map: {0}")]
+    Map(String),
+    /// A row or base file an appender (`append`) cannot extend.
+    #[error("append: {0}")]
+    Append(String),
     /// A mod manifest that cannot be written or registered.
     #[error("mod manifest: {0}")]
     Manifest(String),

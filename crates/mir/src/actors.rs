@@ -16,8 +16,19 @@
 //! | `0x0080` | base data | display name | with the bit 24 % store no name, without it 0.1 % |
 //! | `0x0100` | inventory | the worn outfit | with the bit 29 % store no inventory, without it 4 % |
 //!
-//! The other bits (`0x0004` factions, `0x0008` actor effects, `0x0010` AI
-//! data, `0x0020` AI packages, `0x0200` script) carry nothing a body needs.
+//! Three more groups are read for the simulation tables
+//! (`actor_ai`, `actor_factions`), measured the same way on the two
+//! masters' templated actors of the same kind (the stored data equals the
+//! template's, with the bit and without it):
+//!
+//! | Bit | Group | What the tables take from it | Fallout 3 | New Vegas |
+//! |---|---|---|---|---|
+//! | `0x0001` | traits | the voice type (`VTCK`), besides the traits above | 436 of 460, 316 of 652 | 692 of 702, 596 of 1,914 |
+//! | `0x0004` | factions | the faction list (`SNAM`) | 500 of 779, 33 of 333 | 1,286 of 2,022, 56 of 594 |
+//! | `0x0010` | AI data | `AIDT` (the three garbage bytes aside) | 674 of 784, 41 of 328 | 1,590 of 1,671, 383 of 945 |
+//!
+//! The other bits (`0x0008` actor effects, `0x0020` AI packages, `0x0200`
+//! script) carry nothing a body or those tables need.
 //! Each group is followed on its own: from the actor, while the current
 //! actor has the group's bit and a template, move to the template. The
 //! actor reached supplies the group.
@@ -68,6 +79,10 @@ pub const USE_MODEL: u16 = 0x0040;
 pub const USE_BASE_DATA: u16 = 0x0080;
 /// Template flag: inventory.
 pub const USE_INVENTORY: u16 = 0x0100;
+/// Template flag: factions.
+pub const USE_FACTIONS: u16 = 0x0004;
+/// Template flag: AI data.
+pub const USE_AI_DATA: u16 = 0x0010;
 
 /// Actor flag in `ACBS`: female.
 const FLAG_FEMALE: u32 = 0x0000_0001;
@@ -282,6 +297,23 @@ pub(crate) struct ActorBuild {
     pub textures: BTreeSet<String>,
 }
 
+/// The actor that supplies the data group of the template flag `flag` for
+/// `start`, followed through templates and leveled lists as the actor
+/// documents do, and the notes the walk made (a template that does not
+/// resolve, a cycle). `start` itself when its flag bit is clear or the
+/// chain does not resolve.
+pub(crate) fn template_supplier(
+    index: &Index<'_>,
+    start: Key,
+    flag: u16,
+    group: &str,
+) -> (Key, Vec<String>) {
+    let mut resolver = Resolver::new(index);
+    let mut notes = Notes::default();
+    let (supplier, _chain) = resolver.supplier(start, flag, group, &mut notes);
+    (supplier, notes.0)
+}
+
 /// A decoded record and the plugin it was read from.
 type Found = (u16, Record);
 
@@ -295,7 +327,7 @@ struct Resolver<'i, 'a> {
 
 /// The notes of one actor.
 #[derive(Default)]
-struct Notes(Vec<String>);
+pub(crate) struct Notes(pub(crate) Vec<String>);
 
 impl Notes {
     fn add(&mut self, note: String) {

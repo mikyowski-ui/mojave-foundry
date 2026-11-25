@@ -70,6 +70,10 @@ pub(crate) struct ElevationPlan<'a> {
     /// The map's options with this elevation's band.
     pub options: BuildOptions,
     pub placements: Cow<'a, [Placement]>,
+    /// Placements written hidden ([`BuildOptions::hidden`]): they take no
+    /// part in anything above, only in prototypes, link clearance and the
+    /// written objects.
+    pub hidden_placements: Vec<Placement>,
     pub engine_blocked: Vec<bool>,
     pub open: Vec<bool>,
     pub placement_blocks: Vec<bool>,
@@ -105,6 +109,9 @@ pub(crate) struct ElevationPlan<'a> {
     pub border: Vec<i32>,
     pub entrance: Option<EntranceReport>,
     pub spots: Vec<Spot>,
+    /// Where the hidden critters of this elevation stand
+    /// ([`crate::CritterPlacement::hidden`]), after the visible ones.
+    pub hidden_spots: Vec<Spot>,
     pub skipped_critters: Vec<SkippedCritter>,
     /// The furniture footprints that apply here, and the hexes they alone
     /// blocked.
@@ -567,6 +574,17 @@ pub(crate) fn plan_map<'a>(
         options.level = elevation.level.clone();
         let (placements, report) =
             crate::readability::protect(elevation.placements, interactive_keys);
+        // Hidden placements (children of an enable group that start
+        // disabled) stand apart from everything the plan reads.
+        let (placements, hidden_placements) = if input.options.hidden.is_empty() {
+            (placements, Vec::new())
+        } else {
+            let (hidden, shown): (Vec<Placement>, Vec<Placement>) = placements
+                .iter()
+                .cloned()
+                .partition(|p| input.options.hidden.contains(&p.reference));
+            (Cow::Owned(shown), hidden)
+        };
         interactive.placements += report.placements;
         interactive.kept_upright += report.kept_upright;
         for p in elevation.placements {
@@ -728,6 +746,7 @@ pub(crate) fn plan_map<'a>(
             input: elevation,
             options,
             placements,
+            hidden_placements,
             engine_blocked,
             open,
             placement_blocks,
@@ -752,6 +771,7 @@ pub(crate) fn plan_map<'a>(
             border: Vec::new(),
             entrance: None,
             spots: Vec::new(),
+            hidden_spots: Vec::new(),
             skipped_critters: Vec::new(),
             footprints,
             footprint_blocked,
@@ -1003,7 +1023,7 @@ fn place_on(
     reserved: &BTreeSet<i32>,
 ) -> (Vec<Spot>, Vec<SkippedCritter>) {
     let radius = |index: usize| {
-        if plan.critter_elevation[index] != e {
+        if plan.critter_elevation[index] != e || plan.input.critters[index].hidden {
             Err(OTHER_ELEVATION.to_owned())
         } else {
             plan.critter_radius[index].clone()
@@ -1013,9 +1033,51 @@ fn place_on(
         critters::place(&plan.frame, plan.input.critters, walkable, reserved, radius);
     let skipped = skipped
         .into_iter()
-        .filter(|s| plan.critter_elevation[s.index] == e)
+        .filter(|s| plan.critter_elevation[s.index] == e && !plan.input.critters[s.index].hidden)
         .collect();
     (spots, skipped)
+}
+
+/// How far (hex steps) a hidden critter looks for a walkable hex: three
+/// times a visible critter's reach, since a presence copy's package
+/// location may lie outside what the map draws.
+pub(crate) const HIDDEN_CRITTER_RADIUS: i32 = 3 * critters::CRITTER_RADIUS;
+
+/// Phase C, third part: the hidden critters of every elevation, after the
+/// visible ones and everything that moves them (passages, closing,
+/// clearance). Each takes the nearest walkable hex ([`critters::place`])
+/// clear of what visible critters are kept from, of the keep-clear hexes
+/// of links, and of the visible critters themselves.
+pub(crate) fn place_hidden_critters(plan: &mut MapPlan) {
+    if !plan.input.critters.iter().any(|c| c.hidden) {
+        return;
+    }
+    for e in 0..plan.elevations.len() {
+        let mut reserved = critter_reserved(plan, e);
+        reserved.extend(plan.elevations[e].spots.iter().map(|s| s.hex));
+        let walkable = &plan.elevations[e].walkable;
+        let radius = |index: usize| {
+            let critter = &plan.input.critters[index];
+            if plan.critter_elevation[index] != e || !critter.hidden {
+                Err(OTHER_ELEVATION.to_owned())
+            } else {
+                Ok(HIDDEN_CRITTER_RADIUS)
+            }
+        };
+        let (spots, skipped) = critters::place(
+            &plan.frame,
+            plan.input.critters,
+            walkable,
+            &reserved,
+            radius,
+        );
+        let skipped: Vec<SkippedCritter> = skipped
+            .into_iter()
+            .filter(|s| plan.critter_elevation[s.index] == e && plan.input.critters[s.index].hidden)
+            .collect();
+        plan.elevations[e].hidden_spots = spots;
+        plan.elevations[e].skipped_critters.extend(skipped);
+    }
 }
 
 /// Phase C, first half: per elevation, join the islands holding exits,

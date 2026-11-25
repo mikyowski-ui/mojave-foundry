@@ -1,0 +1,26 @@
+; Keywords, block types, variables and functions in every case.
+SCN TSCaseScript
+SHORT Flag
+Float Rate
+
+BEGIN gamemode
+	IF flag == 0
+		SET FLAG TO 1
+	ELSEIF FLAG == 1
+		Set Rate To getstage tsquest
+	ELSE
+		setstage TSQUEST 10
+	ENDIF
+END
+
+Begin GameMode
+	if Flag
+		SetAV health 50
+		player.setav STRENGTH 5
+	endIf
+End
+
+begin gameMode
+end
+begin Gamemode
+end

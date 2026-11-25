@@ -33,9 +33,40 @@ use crate::walk::{Frame, HEXES};
 use crate::{
     ArtListReport, BLANK_SQUARE, BuildError, BuildInput, BuildReport, Built, BuiltLayer, BuiltMap,
     ComponentReport, CritterComponent, CritterPrototypeReport, CritterSetReport, ElevationInput,
-    ElevationReport, ExitComponents, ExitReport, InteriorReport, LayerInput, LayerOptions,
-    LinkReport, MapInput, PlacedCritter, Role,
+    ElevationReport, ExitComponents, ExitReport, HiddenCritter, InteriorReport, LayerInput,
+    LayerOptions, LinkReport, MapInput, ObjectRef, PlacedCritter, Role,
 };
+
+/// Records the top-level objects a placement just became (`objects[first..]`)
+/// in the exact reference-to-object map, and for a hidden placement sets
+/// the hidden flag on each and lists it.
+fn note_objects(
+    objects: &mut [MapObject],
+    first: usize,
+    placement: &crate::Placement,
+    level: u8,
+    hidden: bool,
+    refs: &mut Vec<ObjectRef>,
+    hidden_objects: &mut Vec<(String, u8, i32)>,
+) {
+    for object in &mut objects[first..] {
+        if hidden {
+            object.flags = BasicFlags(object.flags.0 | BasicFlags::HIDDEN.0);
+        }
+        let hex = object.hex.unwrap_or(placement.hex);
+        refs.push(ObjectRef {
+            reference: placement.reference.clone(),
+            elevation: level,
+            id: object.id,
+            hex,
+            pid: object.pid,
+            hidden,
+        });
+        if hidden {
+            hidden_objects.push((placement.reference.clone(), level, hex));
+        }
+    }
+}
 
 /// The exit-grid prototype every exit uses (variant 0).
 pub(crate) const EXIT_GRID_PID: u32 = 0x0500_0010;
@@ -296,6 +327,7 @@ pub(crate) fn build(input: &BuildInput) -> Result<Built, BuildError> {
         layer: built.layer,
         walkable: map.walkable.swap_remove(0),
         report: map.report,
+        objects: map.objects,
         loot: built.loot,
         furniture: map.furniture,
     })
@@ -451,6 +483,7 @@ pub(crate) fn build_layer(input: &LayerInput) -> Result<BuiltLayer, BuildError> 
     // Nothing to pick up on a link's hexes (crate notes, "Link clearance").
     for plan in &mut plans {
         crate::clearance::move_off_links(plan);
+        crate::clearance::move_hidden_off_links(plan);
     }
     // The catalogue, checked against every plan before anything is
     // written.
@@ -474,16 +507,22 @@ pub(crate) fn build_layer(input: &LayerInput) -> Result<BuiltLayer, BuildError> 
     }
     for plan in &mut plans {
         plan::place_critters(plan);
+        plan::place_hidden_critters(plan);
     }
-    let any_spot = plans
-        .iter()
-        .any(|p| p.elevations.iter().any(|e| !e.spots.is_empty()));
+    let any_spot = plans.iter().any(|p| {
+        p.elevations
+            .iter()
+            .any(|e| !e.spots.is_empty() || !e.hidden_spots.is_empty())
+    });
     let used_sets: BTreeSet<usize> = plans
         .iter()
         .flat_map(|p| {
-            p.elevations
-                .iter()
-                .flat_map(|e| e.spots.iter().map(|s| p.input.critters[s.index].art))
+            p.elevations.iter().flat_map(|e| {
+                e.spots
+                    .iter()
+                    .chain(e.hidden_spots.iter())
+                    .map(|s| p.input.critters[s.index].art)
+            })
         })
         .chain(figure_sets.iter().copied())
         .collect();
@@ -760,7 +799,11 @@ pub(crate) fn build_layer(input: &LayerInput) -> Result<BuiltLayer, BuildError> 
     for (m, plan) in plans.iter().enumerate() {
         let mut map_protos = BTreeMap::new();
         for (e, elevation) in plan.elevations.iter().enumerate() {
-            for placement in elevation.placements.iter() {
+            for placement in elevation
+                .placements
+                .iter()
+                .chain(elevation.hidden_placements.iter())
+            {
                 if placement.role == Role::Item
                     && loot
                         .as_ref()
@@ -899,13 +942,15 @@ pub(crate) fn build_layer(input: &LayerInput) -> Result<BuiltLayer, BuildError> 
         let mut per = Vec::new();
         for elevation in &plan.elevations {
             let mut keys = Vec::with_capacity(elevation.spots.len());
-            for spot in &elevation.spots {
+            for spot in elevation.spots.iter().chain(elevation.hidden_spots.iter()) {
                 let critter = &plan.input.critters[spot.index];
                 let name = message_text(&critter.name, 128);
                 let description = critter_description(&critter.description, &name);
                 let kit = match &loot {
-                    Some(loot) => loot.critter_proto(critter, critter_ai, ai_table)?,
-                    None => None,
+                    Some(loot) if !critter.hidden => {
+                        loot.critter_proto(critter, critter_ai, ai_table)?
+                    }
+                    _ => None,
                 };
                 let key = (
                     critter.art,
@@ -1023,7 +1068,10 @@ pub(crate) fn build_layer(input: &LayerInput) -> Result<BuiltLayer, BuildError> 
             first_map_number: first_number,
             ..BuildReport::default()
         };
-        let placed_any = plan.elevations.iter().any(|e| !e.spots.is_empty());
+        let placed_any = plan
+            .elevations
+            .iter()
+            .any(|e| !e.spots.is_empty() || !e.hidden_spots.is_empty());
         if placed_any {
             report.notes.extend(packet_note.clone());
             report.critter_ai_packet = Some(critter_ai.0);
@@ -1040,13 +1088,23 @@ pub(crate) fn build_layer(input: &LayerInput) -> Result<BuiltLayer, BuildError> 
             ..MapLoot::default()
         };
         let mut per_objects: Vec<Vec<MapObject>> = Vec::new();
+        let mut object_refs: Vec<ObjectRef> = Vec::new();
+        let mut hidden_objects: Vec<(String, u8, i32)> = Vec::new();
+        let mut hidden_critters: Vec<HiddenCritter> = Vec::new();
         let mut placed_critters: Vec<(u8, PlacedCritter)> = Vec::new();
         let mut elevation_critters: Vec<Vec<PlacedCritter>> = Vec::new();
         for (e, elevation) in plan.elevations.iter().enumerate() {
             let level = e as u8;
             let mut objects: Vec<MapObject> = Vec::new();
-            for placement in elevation.placements.iter() {
+            // The visible placements, then the hidden ones.
+            for (placement, hidden) in elevation
+                .placements
+                .iter()
+                .map(|p| (p, false))
+                .chain(elevation.hidden_placements.iter().map(|p| (p, true)))
+            {
                 let fid = art_fid[m][e][placement.art];
+                let first = objects.len();
                 if let Some(loot) = loot.as_mut()
                     && placement.role == Role::Item
                     && loot.is_item(&placement.reference)
@@ -1054,6 +1112,15 @@ pub(crate) fn build_layer(input: &LayerInput) -> Result<BuiltLayer, BuildError> 
                     let placed =
                         loot.objects(placement, None, fid, level, &mut take_id, &mut counts)?;
                     objects.extend(placed.unwrap_or_default());
+                    note_objects(
+                        &mut objects,
+                        first,
+                        placement,
+                        level,
+                        hidden,
+                        &mut object_refs,
+                        &mut hidden_objects,
+                    );
                     continue;
                 }
                 let blocking = effective_blocking(placement.role, placement.blocking);
@@ -1079,6 +1146,15 @@ pub(crate) fn build_layer(input: &LayerInput) -> Result<BuiltLayer, BuildError> 
                         &mut counts,
                     )? {
                         objects.extend(placed);
+                        note_objects(
+                            &mut objects,
+                            first,
+                            placement,
+                            level,
+                            hidden,
+                            &mut object_refs,
+                            &mut hidden_objects,
+                        );
                         continue;
                     }
                 }
@@ -1100,6 +1176,15 @@ pub(crate) fn build_layer(input: &LayerInput) -> Result<BuiltLayer, BuildError> 
                     },
                 };
                 objects.push(object);
+                note_objects(
+                    &mut objects,
+                    first,
+                    placement,
+                    level,
+                    hidden,
+                    &mut object_refs,
+                    &mut hidden_objects,
+                );
             }
             for hex in &elevation.border {
                 objects.push(plain_object(
@@ -1152,7 +1237,12 @@ pub(crate) fn build_layer(input: &LayerInput) -> Result<BuiltLayer, BuildError> 
                 }
             }
             let mut here = Vec::new();
-            for (spot, key) in elevation.spots.iter().zip(&spot_keys[m][e]) {
+            for (spot, key) in elevation
+                .spots
+                .iter()
+                .chain(elevation.hidden_spots.iter())
+                .zip(&spot_keys[m][e])
+            {
                 let critter = &plan.input.critters[spot.index];
                 let prototype = &critter_protos[key];
                 let record = CritterRecord::from_prototype(
@@ -1164,21 +1254,33 @@ pub(crate) fn build_layer(input: &LayerInput) -> Result<BuiltLayer, BuildError> 
                 )
                 .map_err(|e| BuildError::emit(format!("critter {}", critter.reference), e))?;
                 let kitted = match loot.as_mut() {
-                    Some(loot) => loot.critter_object(
+                    Some(loot) if !critter.hidden => loot.critter_object(
                         &record,
                         &critter.reference,
                         &critter_files[&critter.art],
                         &mut take_id,
                         &mut counts,
                     )?,
-                    None => None,
+                    _ => None,
                 };
-                objects.push(match kitted {
+                let mut object = match kitted {
                     Some(object) => object,
                     None => critter_object(&record).map_err(|e| {
                         BuildError::emit(format!("critter {}", critter.reference), e)
                     })?,
+                };
+                if critter.hidden {
+                    object.flags = BasicFlags(object.flags.0 | BasicFlags::HIDDEN.0);
+                }
+                object_refs.push(ObjectRef {
+                    reference: critter.reference.clone(),
+                    elevation: level,
+                    id: object.id,
+                    hex: spot.hex,
+                    pid: object.pid,
+                    hidden: critter.hidden,
                 });
+                objects.push(object);
                 let placed = PlacedCritter {
                     reference: critter.reference.clone(),
                     index: spot.index,
@@ -1189,6 +1291,14 @@ pub(crate) fn build_layer(input: &LayerInput) -> Result<BuiltLayer, BuildError> 
                     pid: prototype.pid,
                     stem: set_art[&critter.art].0.clone(),
                 };
+                if critter.hidden {
+                    hidden_critters.push(HiddenCritter {
+                        elevation: level,
+                        placed,
+                        presence_of: critter.presence_of.clone(),
+                    });
+                    continue;
+                }
                 here.push(placed.clone());
                 placed_critters.push((level, placed));
             }
@@ -1219,6 +1329,9 @@ pub(crate) fn build_layer(input: &LayerInput) -> Result<BuiltLayer, BuildError> 
         report.objects = total;
         placed_critters.sort_by_key(|(_, c)| c.index);
         report.critters = placed_critters.iter().map(|(_, c)| c.clone()).collect();
+        hidden_critters.sort_by_key(|c| c.placed.index);
+        report.hidden_critters = hidden_critters;
+        report.hidden_objects = hidden_objects;
         let critter_elevations: Vec<u8> = placed_critters.iter().map(|(e, _)| *e).collect();
         let mut skipped_critters: Vec<_> = plan
             .elevations
@@ -1416,6 +1529,7 @@ pub(crate) fn build_layer(input: &LayerInput) -> Result<BuiltLayer, BuildError> 
             elevations,
             links: Vec::new(),
             critter_elevations,
+            objects: object_refs,
             report,
             furniture,
         });

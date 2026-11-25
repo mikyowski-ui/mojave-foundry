@@ -92,6 +92,22 @@ pub struct LinkedMart {
     pub layer_file: PathBuf,
 }
 
+/// What [`write_groups`] adds to the linked mart: an enable group in the
+/// store (a parent that starts disabled, a normal child that starts
+/// disabled, an opposite child that starts enabled, a rifle and a clerk
+/// that are children too), a trigger volume, a linked reference, and a
+/// travel package that takes the clerk to the car park's door.
+pub const R_GROUP_PARENT: u32 = 0x940;
+pub const R_GROUP_CHILD: u32 = 0x941;
+pub const R_GROUP_OPPOSITE: u32 = 0x942;
+pub const R_GROUP_RIFLE: u32 = 0x943;
+pub const R_GROUP_CLERK: u32 = 0x944;
+pub const R_TRIGGER: u32 = 0x945;
+/// A plain door whose linked reference is the locker.
+pub const R_LINKED_DOOR: u32 = 0x946;
+const TRIGGER_BASE: u32 = 0x827;
+const CLERK_PACKAGE: u32 = 0x860;
+
 /// The upper storey's height (a mezzanine east of the shop floor, up a
 /// ramp of slope 1).
 pub const UPPER_Z: f32 = 200.0;
@@ -203,7 +219,24 @@ fn bc1(rgb: [u8; 3]) -> Vec<u8> {
 
 /// Writes the install under `dir` (`dir/Data/...`).
 pub fn write(dir: &Path) -> MiniMart {
-    write_install(dir, false)
+    write_install(dir, false, false)
+}
+
+/// The linked mart (as [`write_linked`]) with the references of
+/// [`R_GROUP_PARENT`] and the rest, and `groups.layer.toml`: the same two
+/// maps with `enable_groups = true` and `presence_copies = true`.
+pub fn write_groups(dir: &Path) -> LinkedMart {
+    let mart = write_linked_with(dir, true);
+    let layer = "name = \"minimart-groups\"\nstart = \"mmlot\"\npresence_copies = true\n\n\
+                 [all_maps]\nwire = true\nenable_groups = true\n\n\
+                 [[maps]]\nslice = \"lot.toml\"\nmap = \"mmlot\"\n\n\
+                 [[maps]]\nslice = \"store.toml\"\nmap = \"mmstore\"\nstoreys = \"auto\"\n";
+    let layer_file = dir.join("groups.layer.toml");
+    std::fs::write(&layer_file, layer).expect("the layer file");
+    LinkedMart {
+        data_dir: mart.data_dir,
+        layer_file,
+    }
 }
 
 /// The install with the mezzanine (a shelf and a raider up there), and
@@ -211,7 +244,11 @@ pub fn write(dir: &Path) -> MiniMart {
 /// `store.toml` (the store, its storeys split) and `mart.layer.toml`
 /// naming both as one layer whose start map is the car park.
 pub fn write_linked(dir: &Path) -> LinkedMart {
-    let mart = write_install(dir, true);
+    write_linked_with(dir, false)
+}
+
+fn write_linked_with(dir: &Path, groups: bool) -> LinkedMart {
+    let mart = write_install(dir, true, groups);
     let lot = format!(
         "name = \"minimart-lot\"\ngame = \"fo3\"\nworldspace = \"{WORLDSPACE}\"\n\
          plugins = [\"{PLUGIN}\"]\nx = [0, 0]\ny = [0, 0]\ninterior_depth = 1\n\
@@ -230,7 +267,7 @@ pub fn write_linked(dir: &Path) -> LinkedMart {
     }
 }
 
-fn write_install(dir: &Path, upper: bool) -> MiniMart {
+fn write_install(dir: &Path, upper: bool, groups: bool) -> MiniMart {
     let data = dir.join("Data");
     std::fs::create_dir_all(&data).expect("data dir");
     let mut plugin = PluginBuilder::new();
@@ -276,6 +313,20 @@ fn write_install(dir: &Path, upper: bool) -> MiniMart {
         "MMPaperDebris",
         "minimart\\paperdebris01.nif",
     ));
+    if groups {
+        plugin.add_raw(
+            RawRecord::new(b"ACTI", TRIGGER_BASE)
+                .with(b"EDID", zstr("MMStoreTrigger"))
+                .with(b"MODL", zstr("minimart\\wall.nif")),
+        );
+        let mut package = fnv_esm::Package::new(CLERK_PACKAGE, "MMClerkToTheLot", 6);
+        package.location = Some(fnv_esm::PackageLocation {
+            location_type: fnv_esm::PackageLocation::NEAR_REFERENCE,
+            value: R_DOOR_OUT,
+            radius: 256,
+        });
+        plugin.add(package);
+    }
     plugin.add(Door::new(
         FRONT_DOOR_BASE,
         "MMFrontDoor",
@@ -549,7 +600,7 @@ fn write_install(dir: &Path, upper: bool) -> MiniMart {
         RAIDER_FACTION,
         vec![ContainerItem::new(CAPS, 12)],
     ));
-    plugin.add(person(
+    let mut clerk = person(
         CLERK,
         "MMClerk",
         "Clerk",
@@ -558,7 +609,11 @@ fn write_install(dir: &Path, upper: bool) -> MiniMart {
         0,
         SHOP_FACTION,
         Vec::new(),
-    ));
+    );
+    if groups {
+        clerk.packages = vec![FormId(CLERK_PACKAGE)];
+    }
+    plugin.add(clerk);
 
     // The exterior: one flat cell with the store's door.
     let door_out_at = [2048.0, 2048.0, 0.0];
@@ -639,6 +694,42 @@ fn write_install(dir: &Path, upper: bool) -> MiniMart {
         .with_temporary(npc(R_RAIDERS[0], RAIDER, [-200.0, 20.0, 0.0]))
         .with_temporary(npc(R_RAIDERS[1], RAIDER, [100.0, 260.0, 0.0]))
         .with_temporary(npc(R_CLERK, CLERK, [120.0, -200.0, 0.0]));
+    if groups {
+        // The group: a parent that starts disabled (a shelf), a child that
+        // follows it, an opposite child that starts enabled, a rifle and a
+        // clerk that follow it too, and a trigger volume.
+        let mut linked_door = at(R_LINKED_DOOR, FRONT_DOOR_BASE, [-400.0, 300.0, 0.0]);
+        linked_door.linked_ref = Some(FormId(R_LOCKER));
+        inside = inside
+            .with_temporary(at(R_GROUP_PARENT, SHELF, [-100.0, 300.0, 0.0]).initially_disabled())
+            .with_temporary(
+                at(R_GROUP_CHILD, SHELF, [-200.0, 300.0, 0.0])
+                    .with_enable_parent(R_GROUP_PARENT, false)
+                    .initially_disabled(),
+            )
+            .with_temporary(
+                at(R_GROUP_OPPOSITE, SHELF, [0.0, 300.0, 0.0])
+                    .with_enable_parent(R_GROUP_PARENT, true),
+            )
+            .with_temporary(
+                at(R_GROUP_RIFLE, RIFLE, [-250.0, -350.0, 0.0])
+                    .with_enable_parent(R_GROUP_PARENT, false)
+                    .initially_disabled(),
+            )
+            .with_temporary(
+                npc(R_GROUP_CLERK, CLERK, [250.0, 180.0, 0.0])
+                    .with_enable_parent(R_GROUP_PARENT, false)
+                    .initially_disabled(),
+            )
+            .with_temporary(
+                at(R_TRIGGER, TRIGGER_BASE, [0.0, -50.0, 0.0]).with_primitive(fnv_esm::Primitive {
+                    bounds: [60.0, 60.0, 60.0],
+                    shape: fnv_esm::Primitive::SHAPE_BOX,
+                    ..fnv_esm::Primitive::default()
+                }),
+            )
+            .with_temporary(linked_door);
+    }
     if upper {
         inside = inside
             .with_temporary(at(R_UPPER_SHELF, SHELF, [1000.0, 250.0, UPPER_Z]))

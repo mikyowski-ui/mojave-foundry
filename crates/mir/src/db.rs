@@ -6,17 +6,19 @@
 //! Records are decoded on `jobs` threads, a wave at a time, while the
 //! previous wave is inserted; the insert statements are prepared once.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::thread;
 
-use fnv_esm::{Condition, FormId, Record, Sig, decoder_for};
+use fnv_esm::{Condition, FormId, Record, Sig, decoder_for, sigs};
 use rusqlite::types::Value;
 use rusqlite::{Connection, params_from_iter};
 use sha2::{Digest, Sha256};
 
+use crate::actors::{USE_AI_DATA, USE_FACTIONS, USE_TRAITS, template_supplier};
 use crate::error::MirError;
-use crate::index::{BadRecord, Entry, Index, PluginFile, scan_common};
+use crate::index::{BadRecord, Entry, Index, Key, PluginFile, scan_common};
 use crate::model::{RECORDS_REVISION, RawStore, SCHEMA_VERSION};
 use crate::paths::{creature_model_path, normalize_mesh_path, normalize_texture_path};
 
@@ -159,6 +161,7 @@ tables! {
         "form TEXT PRIMARY KEY", "topic TEXT", "quest TEXT", "info_type INTEGER",
         "next_speaker INTEGER", "flags INTEGER", "speaker TEXT", "previous_info TEXT",
         "prompt TEXT", "responses INTEGER NOT NULL", "choices INTEGER NOT NULL",
+        "flag_bytes INTEGER", "knam TEXT", "knam_sig TEXT", "speech_challenge INTEGER",
     ];
     InfoResponses => "info_responses" [
         "info TEXT NOT NULL", "seq INTEGER NOT NULL", "number INTEGER", "emotion_type INTEGER",
@@ -169,6 +172,7 @@ tables! {
         "function INTEGER NOT NULL", "comparison TEXT NOT NULL", "value REAL",
         "global TEXT", "param1 INTEGER NOT NULL", "param2 INTEGER NOT NULL",
         "run_on INTEGER NOT NULL", "reference TEXT", "is_or INTEGER NOT NULL",
+        "param1_ref TEXT", "param2_ref TEXT",
     ];
     Terminals => "terminals" [
         "form TEXT PRIMARY KEY", "editor_id TEXT", "name TEXT", "model TEXT", "script TEXT",
@@ -195,7 +199,8 @@ tables! {
         "location2_value INTEGER", "location2_radius INTEGER", "target_type INTEGER",
         "target TEXT", "target_value INTEGER", "target_count INTEGER", "target2_type INTEGER",
         "target2 TEXT", "target2_value INTEGER", "target2_count INTEGER", "dialogue_topic TEXT",
-        "combat_style TEXT", "conditions INTEGER NOT NULL",
+        "combat_style TEXT", "conditions INTEGER NOT NULL", "pkdt_size INTEGER",
+        "behaviour_flags INTEGER", "behaviour_raw INTEGER", "type_flags INTEGER",
     ];
     ActorPackages => "actor_packages" [
         "actor TEXT NOT NULL", "seq INTEGER NOT NULL", "package TEXT",
@@ -207,6 +212,63 @@ tables! {
     QuestTargets => "quest_targets" [
         "quest TEXT NOT NULL", "objective INTEGER NOT NULL", "seq INTEGER NOT NULL",
         "target TEXT", "flags INTEGER NOT NULL",
+    ];
+    Globals => "globals" [
+        "form TEXT PRIMARY KEY", "editor_id TEXT", "type_code TEXT", "kind TEXT", "value REAL",
+    ];
+    GameSettings => "game_settings" [
+        "form TEXT PRIMARY KEY", "editor_id TEXT", "kind TEXT", "int_value INTEGER",
+        "float_value REAL", "text_value TEXT",
+    ];
+    Messages => "messages" [
+        "form TEXT PRIMARY KEY", "editor_id TEXT", "title TEXT", "text TEXT", "icon TEXT",
+        "flags INTEGER", "display_time INTEGER", "buttons INTEGER NOT NULL",
+    ];
+    MessageButtons => "message_buttons" [
+        "message TEXT NOT NULL", "seq INTEGER NOT NULL", "text TEXT",
+        "conditions INTEGER NOT NULL",
+    ];
+    Factions => "factions" [
+        "form TEXT PRIMARY KEY", "editor_id TEXT", "name TEXT", "flags INTEGER", "flags2 INTEGER",
+        "relations INTEGER NOT NULL",
+    ];
+    FactionRelations => "faction_relations" [
+        "faction TEXT NOT NULL", "seq INTEGER NOT NULL", "other TEXT", "modifier INTEGER NOT NULL",
+        "reaction INTEGER",
+    ];
+    ActorAi => "actor_ai" [
+        "actor TEXT PRIMARY KEY", "kind TEXT NOT NULL", "aggression INTEGER", "confidence INTEGER",
+        "energy_level INTEGER", "responsibility INTEGER", "mood INTEGER", "services INTEGER",
+        "trained_skill INTEGER", "trainer_level INTEGER", "assistance INTEGER",
+        "aggro_radius_behaviour INTEGER", "aggro_radius INTEGER", "ai_from TEXT", "voice TEXT",
+        "voice_from TEXT",
+    ];
+    ActorFactions => "actor_factions" [
+        "actor TEXT NOT NULL", "seq INTEGER NOT NULL", "faction TEXT", "rank INTEGER NOT NULL",
+        "from_actor TEXT NOT NULL",
+    ];
+    InfoLinks => "info_links" [
+        "info TEXT NOT NULL", "kind TEXT NOT NULL", "seq INTEGER NOT NULL", "topic TEXT",
+    ];
+    PackageEvents => "package_events" [
+        "package TEXT NOT NULL", "event TEXT NOT NULL", "idle TEXT", "topic TEXT",
+        "script_source TEXT",
+    ];
+    ScriptContexts => "script_contexts" [
+        "owner TEXT NOT NULL", "context TEXT NOT NULL", "script_type INTEGER", "flags INTEGER",
+        "ref_count INTEGER", "compiled_size INTEGER", "variable_count INTEGER",
+        "has_source INTEGER NOT NULL", "has_compiled INTEGER NOT NULL",
+    ];
+    ScriptRefList => "script_ref_list" [
+        "owner TEXT NOT NULL", "context TEXT NOT NULL", "seq INTEGER NOT NULL",
+        "kind TEXT NOT NULL", "form TEXT", "raw INTEGER NOT NULL",
+    ];
+    ScriptLocals => "script_locals" [
+        "owner TEXT NOT NULL", "context TEXT NOT NULL", "idx INTEGER NOT NULL", "name TEXT",
+        "flags INTEGER NOT NULL",
+    ];
+    DecodeSkips => "decode_skips" [
+        "area TEXT NOT NULL", "reason TEXT NOT NULL", "count INTEGER NOT NULL",
     ];
     BadRecords => "bad_records" [
         "seq INTEGER PRIMARY KEY", "plugin TEXT NOT NULL", "offset INTEGER NOT NULL",
@@ -243,7 +305,20 @@ const INDEXES: &[&str] = &[
     "CREATE INDEX actor_packages_package ON actor_packages(package)",
     "CREATE INDEX script_refs_owner ON script_refs(owner)",
     "CREATE INDEX quest_targets_quest ON quest_targets(quest, objective, seq)",
+    "CREATE INDEX message_buttons_message ON message_buttons(message, seq)",
+    "CREATE INDEX faction_relations_faction ON faction_relations(faction, seq)",
+    "CREATE INDEX actor_factions_actor ON actor_factions(actor, seq)",
+    "CREATE INDEX info_links_info ON info_links(info, kind, seq)",
+    "CREATE INDEX package_events_package ON package_events(package)",
+    "CREATE INDEX script_contexts_owner ON script_contexts(owner)",
+    "CREATE INDEX script_ref_list_owner ON script_ref_list(owner, context, seq)",
+    "CREATE INDEX script_locals_owner ON script_locals(owner, context, idx)",
+    "CREATE INDEX game_settings_name ON game_settings(editor_id)",
 ];
+
+/// The form id the player's own reference has in every plugin list; no
+/// plugin holds a record for it.
+const PLAYER_REFERENCE: u32 = 0x14;
 
 /// Records decoded per thread and wave.
 const CHUNK: usize = 2048;
@@ -253,6 +328,8 @@ struct RecordRows {
     rows: Vec<(T, Vec<Value>)>,
     raw: Vec<(Sig, Vec<u8>)>,
     bad: Option<BadRecord>,
+    /// What the record's decoders could not use: `(area, reason)`.
+    skips: Vec<(String, String)>,
 }
 
 /// What a build reports back.
@@ -319,6 +396,16 @@ impl Forms<'_, '_> {
         form.map_or(Value::Null, |f| self.get(f))
     }
 
+    /// The key of the placed reference (`REFR`, `ACHR` or `ACRE`) a form
+    /// id names; `None` when it names nothing in the list or a record of
+    /// another kind.
+    fn placed_ref(&self, form: FormId) -> Option<Value> {
+        let key = self.index.resolve(self.plugin, form)?;
+        let entry = self.index.get(key)?;
+        matches!(entry.sig(), sigs::REFR | sigs::ACHR | sigs::ACRE)
+            .then(|| Value::Text(self.index.form_key(key).to_string()))
+    }
+
     /// The signature of the record a form id names, when the list has it.
     fn sig(&self, form: Option<FormId>) -> Value {
         form.and_then(|f| self.index.resolve(self.plugin, f))
@@ -366,6 +453,9 @@ struct Rows<'f, 'i, 'a> {
     owner: String,
     out: Vec<(T, Vec<Value>)>,
     conditions: i64,
+    /// Counted notes of what a decoder could not use, as `(area, reason)`;
+    /// they end up in `decode_skips`.
+    skips: Vec<(String, String)>,
 }
 
 impl Rows<'_, '_, '_> {
@@ -373,11 +463,46 @@ impl Rows<'_, '_, '_> {
         self.out.push((table, values));
     }
 
+    /// Counts one occurrence of something a decoder could not use.
+    fn skip(&mut self, area: &str, reason: impl Into<String>) {
+        self.skips.push((area.to_owned(), reason.into()));
+    }
+
+    /// The parameters of a condition that name a placed reference,
+    /// resolved. A parameter the function can name one with but that does
+    /// not resolve to one is counted.
+    fn reference_params(&mut self, c: &Condition) -> [Value; 2] {
+        let mut out = [Value::Null, Value::Null];
+        for (slot, form) in c.reference_params().into_iter().enumerate() {
+            let Some(form) = form else { continue };
+            match self.forms.placed_ref(form) {
+                Some(key) => out[slot] = key,
+                None => {
+                    let what = if form.0 == PLAYER_REFERENCE {
+                        "names the player (form 0x14), which has no record"
+                    } else {
+                        "is not a placed reference of the plugin list"
+                    };
+                    self.skip(
+                        "CTDA/parameter",
+                        format!(
+                            "function {} parameter {} {what}",
+                            c.function_index(),
+                            slot + 1
+                        ),
+                    );
+                }
+            }
+        }
+        out
+    }
+
     fn condition(&mut self, context: &str, c: &Condition) {
         let (value, global) = match c.value {
             fnv_esm::ConditionValue::Float(v) => (real(v), Value::Null),
             fnv_esm::ConditionValue::Global(g) => (Value::Null, self.forms.get(g)),
         };
+        let [param1_ref, param2_ref] = self.reference_params(c);
         let row = vec![
             text(self.owner.clone()),
             int(self.conditions),
@@ -395,6 +520,8 @@ impl Rows<'_, '_, '_> {
                 self.forms.get(c.reference)
             },
             flag(c.is_or()),
+            param1_ref,
+            param2_ref,
         ];
         self.conditions += 1;
         self.push(T::Conditions, row);
@@ -436,6 +563,50 @@ impl Rows<'_, '_, '_> {
         }
     }
 
+    /// One embedded script body with its header, its whole reference list
+    /// (in order, forms and local-variable indexes both: compiled code
+    /// indexes it from 1) and its variable declarations.
+    fn script_context(&mut self, context: &str, body: &fnv_esm::ScriptBody) {
+        let header = body.header;
+        let row = vec![
+            text(self.owner.clone()),
+            text(context),
+            opt_int(header.map(|h| h.script_type)),
+            opt_int(header.map(|h| h.flags)),
+            opt_int(header.map(|h| h.ref_count)),
+            opt_int(header.map(|h| h.compiled_size)),
+            opt_int(header.map(|h| h.variable_count)),
+            flag(body.source.is_some()),
+            flag(body.compiled.is_some()),
+        ];
+        self.push(T::ScriptContexts, row);
+        for (seq, reference) in body.references.iter().enumerate() {
+            let (kind, form, raw) = match *reference {
+                fnv_esm::ScriptReference::Form(form) => ("form", self.forms.get(form), form.0),
+                fnv_esm::ScriptReference::Local(index) => ("local", Value::Null, index),
+            };
+            let row = vec![
+                text(self.owner.clone()),
+                text(context),
+                len(seq),
+                text(kind),
+                form,
+                int(raw),
+            ];
+            self.push(T::ScriptRefList, row);
+        }
+        for local in &body.locals {
+            let row = vec![
+                text(self.owner.clone()),
+                text(context),
+                int(local.index),
+                opt_text(local.name.as_deref()),
+                int(local.flags),
+            ];
+            self.push(T::ScriptLocals, row);
+        }
+    }
+
     fn packages(&mut self, packages: &[FormId]) {
         for (seq, package) in packages.iter().enumerate() {
             let row = vec![text(self.owner.clone()), len(seq), self.forms.get(*package)];
@@ -471,8 +642,201 @@ fn target_values(f: &Forms<'_, '_>, target: Option<fnv_esm::PackageTarget>) -> [
     }
 }
 
-/// The typed rows of one decoded record.
-fn typed_rows(index: &Index<'_>, entry: &Entry<'_>, record: &Record) -> Vec<(T, Vec<Value>)> {
+/// An actor record a template group is read from.
+enum Source<'r> {
+    /// The actor being tabled.
+    Own(&'r Record),
+    /// A template, decoded, with the plugin it was read from.
+    Other(u16, Box<Record>),
+}
+
+impl Source<'_> {
+    fn record(&self) -> &Record {
+        match self {
+            Self::Own(record) => record,
+            Self::Other(_, record) => record,
+        }
+    }
+}
+
+/// The AI data, voice type and factions an actor record holds itself.
+type ActorParts<'r> = (
+    Option<fnv_esm::AiData>,
+    Option<FormId>,
+    &'r [fnv_esm::FactionRank],
+);
+
+fn actor_parts(record: &Record) -> ActorParts<'_> {
+    match record {
+        Record::Npc(n) => (n.ai, n.voice, &n.factions),
+        Record::Creature(c) => (c.ai, c.voice, &c.factions),
+        _ => (None, None, &[]),
+    }
+}
+
+/// The AI data, voice type and faction rows of an NPC or creature, each
+/// group read from the actor its template flag points at, as the actor
+/// documents follow templates ([`crate::actors::template_supplier`]):
+/// `0x0010` for the AI data, `0x0001` (traits) for the voice type and
+/// `0x0004` for the factions. A chain that does not resolve leaves the
+/// actor's own data and is counted.
+fn actor_tables(index: &Index<'_>, entry: &Entry<'_>, own: &Record, rows: &mut Rows<'_, '_, '_>) {
+    let (kind, sig, base, template) = match own {
+        Record::Npc(n) => ("npc", "NPC_", n.base, n.template),
+        Record::Creature(c) => ("creature", "CREA", c.base, c.template),
+        _ => return,
+    };
+    let flags = base.map_or(0, |b| b.template_flags);
+    let has_template = template.is_some_and(|t| !t.is_null());
+    let ctx = SupplierContext {
+        index,
+        entry,
+        own,
+        sig,
+        enabled: has_template,
+        flags,
+    };
+    let source =
+        |flag: u16, group: &str, rows: &mut Rows<'_, '_, '_>| ctx.source(flag, group, rows);
+    let plugin_of = |source: &Source<'_>| match source {
+        Source::Own(_) => entry.plugin,
+        Source::Other(plugin, _) => *plugin,
+    };
+    let key_text = |key: Key| text(index.form_key(key).to_string());
+
+    // AI data.
+    let (ai_key, ai_source) = source(USE_AI_DATA, "AI data", rows);
+    let ai = ai_source.as_ref().and_then(|s| actor_parts(s.record()).0);
+    // Voice type, which the traits group carries.
+    let (voice_key, voice_source) = source(USE_TRAITS, "traits", rows);
+    let voice_form = voice_source.as_ref().and_then(|s| {
+        let plugin = plugin_of(s);
+        actor_parts(s.record()).1.map(|v| (plugin, v))
+    });
+    let voice = voice_form.and_then(|(plugin, voice)| index.form(plugin, voice));
+    let mut row = vec![rows_owner(rows), text(kind)];
+    match ai {
+        Some(a) => row.extend([
+            int(a.aggression),
+            int(a.confidence),
+            int(a.energy_level),
+            int(a.responsibility),
+            int(a.mood),
+            int(a.services),
+            int(a.trained_skill),
+            int(a.trainer_level),
+            int(a.assistance),
+            int(a.aggro_radius_behaviour),
+            int(a.aggro_radius),
+            key_text(ai_key),
+        ]),
+        None => {
+            row.extend(std::iter::repeat_n(Value::Null, 12));
+            rows.skip(
+                &format!("{sig}/AIDT"),
+                "no AIDT on the actor or on the template that supplies its AI data",
+            );
+        }
+    }
+    match voice {
+        Some(v) => row.extend([text(v.to_string()), key_text(voice_key)]),
+        None => {
+            row.extend([Value::Null, Value::Null]);
+            rows.skip(
+                &format!("{sig}/VTCK"),
+                "no voice type on the actor or on the template that supplies its traits",
+            );
+        }
+    }
+    rows.push(T::ActorAi, row);
+
+    // Factions.
+    let (faction_key, faction_source) = source(USE_FACTIONS, "factions", rows);
+    if let Some(s) = faction_source {
+        let plugin = plugin_of(&s);
+        let forms = Forms { index, plugin };
+        for (seq, member) in actor_parts(s.record()).2.iter().enumerate() {
+            let row = vec![
+                rows_owner(rows),
+                len(seq),
+                forms.get(member.faction),
+                int(member.rank),
+                key_text(faction_key),
+            ];
+            rows.push(T::ActorFactions, row);
+        }
+    }
+}
+
+/// What [`actor_tables`] needs to find the actor a group comes from.
+struct SupplierContext<'c, 'i, 'a> {
+    index: &'c Index<'a>,
+    entry: &'c Entry<'i>,
+    own: &'c Record,
+    sig: &'c str,
+    /// The actor names a template.
+    enabled: bool,
+    /// Its template flags.
+    flags: u16,
+}
+
+impl<'c> SupplierContext<'c, '_, '_> {
+    /// The actor that supplies the group of `flag`, and its record.
+    fn source(
+        &self,
+        flag: u16,
+        group: &str,
+        rows: &mut Rows<'_, '_, '_>,
+    ) -> (Key, Option<Source<'c>>) {
+        let key = if self.flags & flag != 0 && self.enabled {
+            let (key, notes) = template_supplier(self.index, self.entry.key, flag, group);
+            if !notes.is_empty() {
+                rows.skip(
+                    &format!("{}/TPLT", self.sig),
+                    format!(
+                        "{group} template chain did not resolve (the actor's own data is used)"
+                    ),
+                );
+            }
+            key
+        } else {
+            if self.flags & flag != 0 {
+                rows.skip(
+                    &format!("{}/TPLT", self.sig),
+                    format!(
+                        "{group} flag set but the actor names no template (its own data is used)"
+                    ),
+                );
+            }
+            self.entry.key
+        };
+        let found = if key == self.entry.key {
+            Some(Source::Own(self.own))
+        } else {
+            self.index.get(key).and_then(|e| {
+                self.index
+                    .decode(e)
+                    .ok()
+                    .map(|r| Source::Other(e.plugin, Box::new(r)))
+            })
+        };
+        (key, found)
+    }
+}
+
+fn rows_owner(rows: &Rows<'_, '_, '_>) -> Value {
+    text(rows.owner.clone())
+}
+
+/// A table and the values of one of its rows.
+type TableRow = (T, Vec<Value>);
+
+/// The typed rows of one decoded record, and what it could not use.
+fn typed_rows(
+    index: &Index<'_>,
+    entry: &Entry<'_>,
+    record: &Record,
+) -> (Vec<TableRow>, Vec<(String, String)>) {
     let forms = Forms {
         index,
         plugin: entry.plugin,
@@ -483,6 +847,7 @@ fn typed_rows(index: &Index<'_>, entry: &Entry<'_>, record: &Record) -> Vec<(T, 
         owner: owner.clone(),
         out: Vec::new(),
         conditions: 0,
+        skips: Vec::new(),
     };
     let f = &forms;
     let common = record.common();
@@ -827,6 +1192,7 @@ fn typed_rows(index: &Index<'_>, entry: &Entry<'_>, record: &Record) -> Vec<(T, 
             );
             rows.inventory(&n.inventory);
             rows.packages(&n.packages);
+            actor_tables(index, entry, record, &mut rows);
         }
         Record::Creature(c) => {
             // The body model names are relative to the skeleton's folder.
@@ -858,6 +1224,7 @@ fn typed_rows(index: &Index<'_>, entry: &Entry<'_>, record: &Record) -> Vec<(T, 
             );
             rows.inventory(&c.inventory);
             rows.packages(&c.packages);
+            actor_tables(index, entry, record, &mut rows);
         }
         Record::LandTexture(l) => {
             rows.push(
@@ -1010,8 +1377,33 @@ fn typed_rows(index: &Index<'_>, entry: &Entry<'_>, record: &Record) -> Vec<(T, 
                     opt_text(i.prompt.as_deref()),
                     len(i.responses.len()),
                     len(i.choices.len()),
+                    d.map_or(Value::Null, |d| match (d.flags, d.short) {
+                        (None, _) => int(0),
+                        (Some(_), true) => int(1),
+                        (Some(_), false) => int(2),
+                    }),
+                    f.opt(i.knam),
+                    f.sig(i.knam),
+                    opt_int(i.speech_challenge),
                 ],
             );
+            if d.is_some_and(|d| d.short) {
+                rows.skip(
+                    "INFO/DATA",
+                    "3-byte form has no second flag byte (say-once-a-day and always-darken read as clear)",
+                );
+            }
+            for (kind, list) in [
+                ("choice", &i.choices),
+                ("link_from", &i.link_from),
+                ("follow_up", &i.follow_up),
+                ("add_topic", &i.add_topics),
+            ] {
+                for (seq, topic) in list.iter().enumerate() {
+                    let row = vec![key(), text(kind), len(seq), f.get(*topic)];
+                    rows.push(T::InfoLinks, row);
+                }
+            }
             for (seq, response) in i.responses.iter().enumerate() {
                 let r = response.data;
                 let row = vec![
@@ -1122,12 +1514,134 @@ fn typed_rows(index: &Index<'_>, entry: &Entry<'_>, record: &Record) -> Vec<(T, 
             row.push(f.opt(p.dialogue.as_ref().map(|d| d.topic)));
             row.push(f.opt(p.combat_style));
             row.push(len(p.conditions.len()));
+            row.push(opt_int(d.map(|d| d.rest.len() as u32 + 5)));
+            row.push(opt_int(d.and_then(|d| d.behaviour_flags())));
+            row.push(opt_int(d.and_then(|d| d.behaviour_flags_raw())));
+            row.push(opt_int(d.and_then(|d| d.type_flags())));
             rows.push(T::Packages, row);
+            if let Some(d) = d {
+                if d.is_short_form() {
+                    rows.skip("PACK/PKDT", "8-byte form has no type-specific flags");
+                }
+                if d.behaviour_flags_raw().is_some() && d.behaviour_flags().is_none() {
+                    rows.skip(
+                        "PACK/PKDT",
+                        "behaviour flags are the 0xCDCD uninitialised fill (read as not set)",
+                    );
+                }
+            }
             for c in &p.conditions {
                 rows.condition("package", c);
             }
             for (name, event) in p.events() {
                 rows.embedded(name, &event.script);
+                let row = vec![
+                    key(),
+                    text(name),
+                    f.opt(event.idle),
+                    f.opt(event.topic),
+                    opt_text(
+                        event
+                            .script
+                            .source
+                            .as_deref()
+                            .filter(|s| !s.trim().is_empty()),
+                    ),
+                ];
+                rows.push(T::PackageEvents, row);
+            }
+        }
+        Record::Global(g) => {
+            rows.push(
+                T::Globals,
+                vec![
+                    key(),
+                    editor_id(),
+                    opt_text(
+                        g.value_type
+                            .map(|t| char::from(t.code()).to_string())
+                            .as_deref(),
+                    ),
+                    opt_text(g.value_type.map(|t| t.name())),
+                    opt_real(g.value),
+                ],
+            );
+        }
+        Record::GameSetting(g) => {
+            use fnv_esm::GameSettingValue as V;
+            let value = g.value.as_ref();
+            rows.push(
+                T::GameSettings,
+                vec![
+                    key(),
+                    editor_id(),
+                    opt_text(value.map(V::kind)),
+                    opt_int(value.and_then(V::as_i64)),
+                    match value {
+                        Some(V::Float(v)) => real(*v),
+                        _ => Value::Null,
+                    },
+                    match value {
+                        Some(V::String(text)) => Value::Text(text.clone()),
+                        _ => Value::Null,
+                    },
+                ],
+            );
+        }
+        Record::Message(m) => {
+            rows.push(
+                T::Messages,
+                vec![
+                    key(),
+                    editor_id(),
+                    name(),
+                    opt_text(m.text.as_deref()),
+                    f.opt(m.icon.filter(|i| !i.is_null())),
+                    opt_int(m.flags),
+                    opt_int(m.display_time),
+                    len(m.buttons.len()),
+                ],
+            );
+            for (seq, button) in m.buttons.iter().enumerate() {
+                let row = vec![
+                    key(),
+                    len(seq),
+                    opt_text(button.text.as_deref()),
+                    len(button.conditions.len()),
+                ];
+                rows.push(T::MessageButtons, row);
+                for c in &button.conditions {
+                    rows.condition(&format!("button {seq}"), c);
+                }
+            }
+        }
+        Record::Faction(fa) => {
+            rows.push(
+                T::Factions,
+                vec![
+                    key(),
+                    editor_id(),
+                    name(),
+                    opt_int(fa.data.map(|d| d.flags)),
+                    opt_int(fa.data.and_then(|d| d.flags2)),
+                    len(fa.relations.len()),
+                ],
+            );
+            if fa.data.is_some_and(|d| d.flags2.is_none()) {
+                rows.skip("FACT/DATA", "1-byte form has no second flag byte");
+            }
+            for (seq, relation) in fa.relations.iter().enumerate() {
+                let row = vec![
+                    key(),
+                    len(seq),
+                    f.get(relation.faction),
+                    int(relation.modifier),
+                    opt_int(relation.combat_reaction),
+                ];
+                rows.push(T::FactionRelations, row);
+                if relation.combat_reaction.is_none() {
+                    rows.skip("FACT/XNAM", "8-byte relation has no group combat reaction");
+                }
             }
         }
         Record::Race(_)
@@ -1139,7 +1653,10 @@ fn typed_rows(index: &Index<'_>, entry: &Entry<'_>, record: &Record) -> Vec<(T, 
         | Record::Leveled(_)
         | Record::Unknown(_) => {}
     }
-    rows.out
+    for (context, body) in record.script_bodies() {
+        rows.script_context(&context, body);
+    }
+    (rows.out, rows.skips)
 }
 
 /// Everything one record contributes: its `records` row, its typed rows
@@ -1161,6 +1678,7 @@ fn record_rows(index: &Index<'_>, id: usize, entry: &Entry<'_>, raw: RawStore) -
         rows: Vec::new(),
         raw: Vec::new(),
         bad: None,
+        skips: Vec::new(),
     };
     let keep_raw = match raw {
         RawStore::All => true,
@@ -1219,8 +1737,68 @@ fn record_rows(index: &Index<'_>, id: usize, entry: &Entry<'_>, raw: RawStore) -
             .collect();
     }
     let decoded = fnv_esm::decode_record(entry.sig(), data_meta(entry), &subrecords);
-    out.rows.extend(typed_rows(index, entry, &decoded));
+    let (rows, skips) = typed_rows(index, entry, &decoded);
+    out.rows.extend(rows);
+    out.skips = skips;
+    unknown_skips(&decoded, &mut out.skips);
     out
+}
+
+/// The script subrecords every embedded script reads.
+const SCRIPT_SUBRECORDS: &[&[u8; 4]] = &[
+    b"SCHR", b"SCDA", b"SCTX", b"SLSD", b"SCVR", b"SCRO", b"SCRV",
+];
+
+/// What the decoders of the simulation records read, by record: a
+/// subrecord of one of these left in `unknown` is malformed (a size no
+/// layout fits, a repeat, out of place); any other left in `unknown` was
+/// not decoded. `None` for a record type this accounting does not cover.
+fn read_subrecords(sig: &str) -> Option<&'static [&'static [u8; 4]]> {
+    Some(match sig {
+        "GLOB" => &[b"FNAM", b"FLTV"],
+        "GMST" => &[b"DATA"],
+        "MESG" => &[b"DESC", b"INAM", b"DNAM", b"TNAM", b"ITXT", b"CTDA"],
+        "FACT" => &[b"DATA", b"XNAM"],
+        "PACK" => &[
+            b"PKDT", b"PLDT", b"PLD2", b"PSDT", b"PTDT", b"PTD2", b"CTDA", b"PKDD", b"CNAM",
+            b"POBA", b"POEA", b"POCA", b"INAM", b"TNAM", b"SCHR", b"SCDA", b"SCTX", b"SLSD",
+            b"SCVR", b"SCRO", b"SCRV",
+        ],
+        "INFO" => &[
+            b"DATA", b"QSTI", b"TPIC", b"PNAM", b"NAME", b"TRDT", b"NAM1", b"NAM2", b"NAM3",
+            b"SNAM", b"LNAM", b"CTDA", b"TCLT", b"TCLF", b"TCFU", b"NEXT", b"RNAM", b"ANAM",
+            b"DNAM", b"KNAM", b"SCHR", b"SCDA", b"SCTX", b"SLSD", b"SCVR", b"SCRO", b"SCRV",
+        ],
+        "NPC_" | "CREA" => &[b"AIDT", b"VTCK"],
+        "QUST" | "TERM" | "SCPT" => SCRIPT_SUBRECORDS,
+        _ => return None,
+    })
+}
+
+/// Counts the subrecords a record's decoder left in `unknown`, for the
+/// record types of [`read_subrecords`]: those it reads but could not use
+/// (by size), and, for the simulation records themselves, the rest as not
+/// decoded.
+fn unknown_skips(record: &Record, skips: &mut Vec<(String, String)>) {
+    let sig = record.sig().to_string();
+    let Some(read) = read_subrecords(&sig) else {
+        return;
+    };
+    let report_rest = !matches!(sig.as_str(), "NPC_" | "CREA" | "QUST" | "TERM" | "SCPT");
+    for sub in record.unknown_subrecords() {
+        let area = format!("{sig}/{}", sub.sig);
+        if read.contains(&&sub.sig.0) {
+            skips.push((
+                area,
+                format!(
+                    "malformed, repeated or out of place, size {}",
+                    sub.data.len()
+                ),
+            ));
+        } else if report_rest {
+            skips.push((area, "not decoded".to_owned()));
+        }
+    }
 }
 
 fn data_meta(entry: &Entry<'_>) -> fnv_esm::RecordMeta {
@@ -1325,6 +1903,7 @@ pub(crate) fn build(
             let mut raw_insert =
                 tx.prepare("INSERT INTO raw_subrecords VALUES (?1, ?2, ?3, ?4)")?;
             let mut bad_records: Vec<BadRecord> = index.walk_errors.clone();
+            let mut skips: BTreeMap<(String, String), u64> = BTreeMap::new();
 
             let jobs = jobs.max(1);
             let wave = CHUNK * jobs;
@@ -1349,6 +1928,9 @@ pub(crate) fn build(
                     }
                     if let Some(bad) = rows.bad {
                         bad_records.push(bad);
+                    }
+                    for skip in rows.skips {
+                        *skips.entry(skip).or_insert(0u64) += 1;
                     }
                     stats.records += 1;
                 }
@@ -1383,6 +1965,13 @@ pub(crate) fn build(
                 ]))?;
             }
             stats.bad_records = bad_records.len();
+            for ((area, reason), count) in &skips {
+                statements[T::DecodeSkips as usize].execute(params_from_iter([
+                    text(area.clone()),
+                    text(reason.clone()),
+                    int(i64::try_from(*count).unwrap_or(i64::MAX)),
+                ]))?;
+            }
         }
         for sql in INDEXES {
             tx.execute_batch(sql)?;

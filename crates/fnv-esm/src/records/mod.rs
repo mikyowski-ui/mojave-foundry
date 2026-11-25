@@ -39,8 +39,10 @@ mod actors;
 mod appearance;
 mod condition;
 mod dialogue;
+mod faction;
 mod land;
 mod leveled;
+mod message;
 mod navmesh;
 mod note;
 mod objects;
@@ -48,18 +50,27 @@ mod package;
 mod placed;
 mod quest;
 mod script;
+mod settings;
 mod terminal;
 mod world;
 
-pub use actors::{ActorBase, Creature, CreatureData, FactionRank, Npc, NpcSkills, NpcStats, Rgb};
+pub use actors::{
+    ActorBase, AiData, Creature, CreatureData, FactionRank, Npc, NpcSkills, NpcStats, Rgb,
+};
 pub use appearance::{Eyes, Hair, HeadPart, Race, RaceData, RacePart, RaceParts};
-pub use condition::{Comparison, Condition, ConditionValue};
-pub use dialogue::{Info, InfoData, Response, ResponseData, Topic, TopicData};
+pub use condition::{
+    Comparison, Condition, ConditionValue, REFERENCE_PARAMETER_FUNCTIONS, reference_parameter_slots,
+};
+pub use dialogue::{
+    Info, InfoData, Response, ResponseData, Topic, TopicData, speech_difficulty_name,
+};
+pub use faction::{CombatReaction, Faction, FactionData, FactionRelation};
 pub use land::{
     AlphaLayer, AlphaPoint, BaseLayer, LAND_GRID, LAND_VERTICES, Land, LandHavok, LandTexture,
     QUADRANT_GRID, TextureSet, decode_vhgt, encode_vhgt, quadrant_origin,
 };
 pub use leveled::{FormList, LeveledEntry, LeveledExtra, LeveledKind, LeveledList};
+pub use message::{Message, MessageButton};
 pub use navmesh::{NavDoorLink, NavEdge, NavExternalLink, NavTriangle, Navmesh};
 pub use note::Note;
 pub use objects::{
@@ -68,12 +79,13 @@ pub use objects::{
     MiscItem, Static, Weapon, WeaponCombat, WeaponCritical, WeaponData,
 };
 pub use package::{
-    Package, PackageData, PackageDialogue, PackageEvent, PackageLocation, PackageSchedule,
-    PackageTarget,
+    BEHAVIOUR_FLAG_NAMES, GENERAL_FLAG_NAMES, Package, PackageData, PackageDialogue, PackageEvent,
+    PackageLocation, PackageSchedule, PackageTarget, SANDBOX_FLAG_NAMES,
 };
 pub use placed::{EnableParent, Lock, PlacedKind, PlacedRef, Placement, Primitive, Teleport};
 pub use quest::{Quest, QuestData, QuestLogEntry, QuestObjective, QuestStage, QuestTarget};
 pub use script::{LocalVariable, Script, ScriptBody, ScriptHeader, ScriptReference};
+pub use settings::{GameSetting, GameSettingValue, Global, GlobalType};
 pub use terminal::{Terminal, TerminalData, TerminalMenuItem};
 pub use world::{
     Cell, CellGrid, CellLighting, LandDefaults, MapData, MapOffset, World, WorldBounds,
@@ -347,10 +359,12 @@ macro_rules! record_table {
             )+ )*
         ];
 
-        /// The second decoder table: terminals, notes and AI packages,
-        /// added for the logic a converter follows (what scripts, quests
-        /// and packages point at). Kept apart from [`DECODERS`], whose
-        /// rows the earlier decoders' tests enumerate.
+        /// The second decoder table: terminals, notes, AI packages,
+        /// global variables, game settings, messages and factions, added
+        /// for the logic a converter follows (what scripts, quests and
+        /// packages point at, and the numbers they use). Kept apart from
+        /// [`DECODERS`], whose rows the earlier decoders' tests
+        /// enumerate.
         pub static LOGIC_DECODERS: &[DecoderEntry] = &[
             $( $(
                 DecoderEntry {
@@ -474,6 +488,14 @@ record_table! {
     Note(Note): NOTE;
     /// `PACK`: an AI package.
     Package(Package): PACK;
+    /// `GLOB`: a global variable.
+    Global(Global): GLOB;
+    /// `GMST`: a game setting.
+    GameSetting(GameSetting): GMST;
+    /// `MESG`: a message.
+    Message(Message): MESG;
+    /// `FACT`: a faction.
+    Faction(Faction): FACT;
     }
 }
 
@@ -486,6 +508,46 @@ impl Record {
     /// The editor id, when the record is typed and has one.
     pub fn editor_id(&self) -> Option<&str> {
         self.common().and_then(|c| c.editor_id.as_deref())
+    }
+}
+
+impl Record {
+    /// Every script embedded in the record, as `(context, body)`, in file
+    /// order: `"script"` for a script record, `"stage <index> entry <n>"`
+    /// for a quest stage's log entry, `"result begin"` and `"result end"`
+    /// for a dialogue response, `"item <n>"` for a terminal menu item and
+    /// `"on begin"`, `"on end"` or `"on change"` for a package event.
+    /// A script that is blank ([`ScriptBody::is_blank`]: nothing but, at
+    /// most, its header) is left out.
+    pub fn script_bodies(&self) -> Vec<(String, &ScriptBody)> {
+        let mut out: Vec<(String, &ScriptBody)> = Vec::new();
+        match self {
+            Record::Script(s) => out.push(("script".to_owned(), &s.body)),
+            Record::Quest(q) => {
+                for stage in &q.stages {
+                    for (n, entry) in stage.entries.iter().enumerate() {
+                        out.push((format!("stage {} entry {n}", stage.index), &entry.script));
+                    }
+                }
+            }
+            Record::Info(i) => {
+                out.push(("result begin".to_owned(), &i.result_begin));
+                out.push(("result end".to_owned(), &i.result_end));
+            }
+            Record::Terminal(t) => {
+                for (n, item) in t.items.iter().enumerate() {
+                    out.push((format!("item {n}"), &item.script));
+                }
+            }
+            Record::Package(p) => {
+                for (name, event) in p.events() {
+                    out.push((name.to_owned(), &event.script));
+                }
+            }
+            _ => {}
+        }
+        out.retain(|(_, body)| !body.is_blank());
+        out
     }
 }
 

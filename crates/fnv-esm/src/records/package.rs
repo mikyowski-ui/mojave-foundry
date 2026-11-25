@@ -19,11 +19,32 @@ use crate::formid::FormId;
 use crate::subrecord::{Out, RawSubrecord, SubrecordRef};
 
 /// A package's `PKDT`: the general flags and the package type, then the
-/// remaining bytes as stored (3 in the 8-byte form, 7 in the 12-byte one;
-/// they hold more flags whose layout is not settled here).
+/// remaining bytes as stored.
+///
+/// # Layout
+///
+/// Measured on both retail masters (3,021 packages of Fallout 3 and 4,150
+/// of New Vegas have the 12-byte form, 245 and 13 the 8-byte one):
+///
+/// | Offset | Size | Field |
+/// |---:|---:|---|
+/// | 0 | 4 | general flags ([`PackageData::flags`]) |
+/// | 4 | 1 | the package type |
+/// | 5 | 1 | unused (0 or the uninitialised-memory fill `0xCD`) |
+/// | 6 | 2 | behaviour flags ([`PackageData::behaviour_flags`]) |
+/// | 8 | 2 | type-specific flags ([`PackageData::type_flags`]); 12-byte form only |
+/// | 10 | 2 | unused; 12-byte form only |
+///
+/// [`PackageData::rest`] holds the bytes from offset 5 on as stored, 3 in
+/// the 8-byte form and 7 in the 12-byte one; the accessors read it. Many
+/// packages have `0xCD` fill bytes (uninitialised memory of the editor that
+/// wrote them) in the unused places, and in the behaviour flags of some;
+/// [`PackageData::behaviour_flags`] reads that fill as "not set" instead
+/// of as flags.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PackageData {
-    /// General flags, as stored.
+    /// General flags, as stored; see the `OFFERS_SERVICES` family of
+    /// constants and [`PackageData::general_flag_names`].
     pub flags: u32,
     /// The package type; see [`PackageData::type_name`].
     pub package_type: u8,
@@ -31,7 +52,353 @@ pub struct PackageData {
     pub rest: Vec<u8>,
 }
 
+/// The general flags of a `PKDT`, by bit, with the editor's names.
+///
+/// The names are the check-box labels of the editor's package dialog,
+/// matched to bits by the public format documentation and checked for
+/// plausibility on the masters (travel and escort packages carry "must
+/// reach location" far more often than sleep packages, use-weapon packages
+/// all have "weapons drawn", guards often "no warn/attack"). Bits 11, 14,
+/// 15 and 16 are not named.
+pub const GENERAL_FLAG_NAMES: &[(u32, &str)] = &[
+    (PackageData::OFFERS_SERVICES, "offers services"),
+    (PackageData::MUST_REACH_LOCATION, "must reach location"),
+    (PackageData::MUST_COMPLETE, "must complete"),
+    (
+        PackageData::LOCK_DOORS_AT_START,
+        "lock doors at package start",
+    ),
+    (PackageData::LOCK_DOORS_AT_END, "lock doors at package end"),
+    (
+        PackageData::LOCK_DOORS_AT_LOCATION,
+        "lock doors at location",
+    ),
+    (
+        PackageData::UNLOCK_DOORS_AT_START,
+        "unlock doors at package start",
+    ),
+    (
+        PackageData::UNLOCK_DOORS_AT_END,
+        "unlock doors at package end",
+    ),
+    (
+        PackageData::UNLOCK_DOORS_AT_LOCATION,
+        "unlock doors at location",
+    ),
+    (PackageData::CONTINUE_IF_PC_NEAR, "continue if PC near"),
+    (PackageData::ONCE_PER_DAY, "once per day"),
+    (
+        PackageData::SKIP_FALLOUT_BEHAVIOUR,
+        "skip Fallout behaviour",
+    ),
+    (PackageData::ALWAYS_RUN, "always run"),
+    (PackageData::ALWAYS_SNEAK, "always sneak"),
+    (PackageData::ALLOW_SWIMMING, "allow swimming"),
+    (PackageData::ALLOW_FALLS, "allow falls"),
+    (PackageData::ARMOR_UNEQUIPPED, "armor unequipped"),
+    (PackageData::WEAPONS_UNEQUIPPED, "weapons unequipped"),
+    (PackageData::DEFENSIVE_COMBAT, "defensive combat"),
+    (PackageData::WEAPONS_DRAWN, "weapons drawn"),
+    (PackageData::NO_IDLE_ANIMS, "no idle animations"),
+    (PackageData::PRETEND_IN_COMBAT, "pretend in combat"),
+    (
+        PackageData::CONTINUE_DURING_COMBAT,
+        "continue during combat",
+    ),
+    (PackageData::NO_COMBAT_ALERT, "no combat alert"),
+    (PackageData::NO_WARN_ATTACK, "no warn/attack"),
+];
+
+/// The behaviour flags of a `PKDT` (offset 6), by bit, with the editor's
+/// names for the Fallout behaviour options.
+pub const BEHAVIOUR_FLAG_NAMES: &[(u16, &str)] = &[
+    (PackageData::HELLOS_TO_PLAYER, "hellos to player"),
+    (PackageData::RANDOM_CONVERSATIONS, "random conversations"),
+    (
+        PackageData::OBSERVE_COMBAT_BEHAVIOUR,
+        "observe combat behaviour",
+    ),
+    (
+        PackageData::GREET_CORPSE_BEHAVIOUR,
+        "greet corpse behaviour",
+    ),
+    (
+        PackageData::REACTION_TO_PLAYER_ACTIONS,
+        "reaction to player actions",
+    ),
+    (
+        PackageData::FRIENDLY_FIRE_COMMENTS,
+        "friendly fire comments",
+    ),
+    (
+        PackageData::AGGRO_RADIUS_BEHAVIOUR,
+        "aggro radius behaviour",
+    ),
+    (PackageData::ALLOW_IDLE_CHATTER, "allow idle chatter"),
+    (PackageData::AVOID_RADIATION, "avoid radiation"),
+];
+
+/// The type-specific flags of a sandbox or wander package (offset 8), by
+/// bit. Measured on the masters: sandbox packages use bits 0 to 5 (eating
+/// and sleeping and wandering most), wander packages the same; no other
+/// package type's bits are named here.
+pub const SANDBOX_FLAG_NAMES: &[(u16, &str)] = &[
+    (PackageData::SANDBOX_ALLOW_EATING, "allow eating"),
+    (PackageData::SANDBOX_ALLOW_SLEEPING, "allow sleeping"),
+    (
+        PackageData::SANDBOX_ALLOW_CONVERSATIONS,
+        "allow conversations",
+    ),
+    (
+        PackageData::SANDBOX_ALLOW_IDLE_MARKERS,
+        "allow idle markers",
+    ),
+    (
+        PackageData::SANDBOX_ALLOW_FURNITURE_USE,
+        "allow furniture use",
+    ),
+    (PackageData::SANDBOX_ALLOW_WANDERING, "allow wandering"),
+];
+
 impl PackageData {
+    /// General flag: the actor offers services (barter, repair, ...).
+    pub const OFFERS_SERVICES: u32 = 0x0000_0001;
+    /// General flag: the package ends only when the actor reaches its
+    /// location.
+    pub const MUST_REACH_LOCATION: u32 = 0x0000_0002;
+    /// General flag: the package cannot be interrupted by a later one.
+    pub const MUST_COMPLETE: u32 = 0x0000_0004;
+    /// General flag: lock doors at the package start.
+    pub const LOCK_DOORS_AT_START: u32 = 0x0000_0008;
+    /// General flag: lock doors at the package end.
+    pub const LOCK_DOORS_AT_END: u32 = 0x0000_0010;
+    /// General flag: lock doors at the location.
+    pub const LOCK_DOORS_AT_LOCATION: u32 = 0x0000_0020;
+    /// General flag: unlock doors at the package start.
+    pub const UNLOCK_DOORS_AT_START: u32 = 0x0000_0040;
+    /// General flag: unlock doors at the package end.
+    pub const UNLOCK_DOORS_AT_END: u32 = 0x0000_0080;
+    /// General flag: unlock doors at the location.
+    pub const UNLOCK_DOORS_AT_LOCATION: u32 = 0x0000_0100;
+    /// General flag: continue if the player is near.
+    pub const CONTINUE_IF_PC_NEAR: u32 = 0x0000_0200;
+    /// General flag: the package runs once a day.
+    pub const ONCE_PER_DAY: u32 = 0x0000_0400;
+    /// General flag: skip the Fallout-specific behaviour (greetings,
+    /// chatter).
+    pub const SKIP_FALLOUT_BEHAVIOUR: u32 = 0x0000_1000;
+    /// General flag: run instead of walking.
+    pub const ALWAYS_RUN: u32 = 0x0000_2000;
+    /// General flag: sneak.
+    pub const ALWAYS_SNEAK: u32 = 0x0002_0000;
+    /// General flag: allow swimming.
+    pub const ALLOW_SWIMMING: u32 = 0x0004_0000;
+    /// General flag: allow falls.
+    pub const ALLOW_FALLS: u32 = 0x0008_0000;
+    /// General flag: armour unequipped.
+    pub const ARMOR_UNEQUIPPED: u32 = 0x0010_0000;
+    /// General flag: weapons unequipped.
+    pub const WEAPONS_UNEQUIPPED: u32 = 0x0020_0000;
+    /// General flag: defensive combat.
+    pub const DEFENSIVE_COMBAT: u32 = 0x0040_0000;
+    /// General flag: weapons drawn.
+    pub const WEAPONS_DRAWN: u32 = 0x0080_0000;
+    /// General flag: no idle animations.
+    pub const NO_IDLE_ANIMS: u32 = 0x0100_0000;
+    /// General flag: pretend to be in combat.
+    pub const PRETEND_IN_COMBAT: u32 = 0x0200_0000;
+    /// General flag: continue during combat.
+    pub const CONTINUE_DURING_COMBAT: u32 = 0x0400_0000;
+    /// General flag: no combat alert.
+    pub const NO_COMBAT_ALERT: u32 = 0x0800_0000;
+    /// General flag: no warn or attack.
+    pub const NO_WARN_ATTACK: u32 = 0x1000_0000;
+
+    /// Behaviour flag: hellos to the player.
+    pub const HELLOS_TO_PLAYER: u16 = 0x0001;
+    /// Behaviour flag: random conversations.
+    pub const RANDOM_CONVERSATIONS: u16 = 0x0002;
+    /// Behaviour flag: observe combat behaviour.
+    pub const OBSERVE_COMBAT_BEHAVIOUR: u16 = 0x0004;
+    /// Behaviour flag: greet corpse behaviour.
+    pub const GREET_CORPSE_BEHAVIOUR: u16 = 0x0008;
+    /// Behaviour flag: reaction to player actions.
+    pub const REACTION_TO_PLAYER_ACTIONS: u16 = 0x0010;
+    /// Behaviour flag: friendly fire comments.
+    pub const FRIENDLY_FIRE_COMMENTS: u16 = 0x0020;
+    /// Behaviour flag: aggro radius behaviour.
+    pub const AGGRO_RADIUS_BEHAVIOUR: u16 = 0x0040;
+    /// Behaviour flag: allow idle chatter.
+    pub const ALLOW_IDLE_CHATTER: u16 = 0x0080;
+    /// Behaviour flag: avoid radiation.
+    pub const AVOID_RADIATION: u16 = 0x0100;
+
+    /// The behaviour flags' uninitialised-memory fill, which the older
+    /// packages store.
+    pub const BEHAVIOUR_FILL: u16 = 0xCDCD;
+
+    /// Sandbox and wander flag: allow eating.
+    pub const SANDBOX_ALLOW_EATING: u16 = 0x0001;
+    /// Sandbox and wander flag: allow sleeping.
+    pub const SANDBOX_ALLOW_SLEEPING: u16 = 0x0002;
+    /// Sandbox and wander flag: allow conversations.
+    pub const SANDBOX_ALLOW_CONVERSATIONS: u16 = 0x0004;
+    /// Sandbox and wander flag: allow idle markers.
+    pub const SANDBOX_ALLOW_IDLE_MARKERS: u16 = 0x0008;
+    /// Sandbox and wander flag: allow furniture use.
+    pub const SANDBOX_ALLOW_FURNITURE_USE: u16 = 0x0010;
+    /// Sandbox and wander flag: allow wandering.
+    pub const SANDBOX_ALLOW_WANDERING: u16 = 0x0020;
+
+    /// The package type of a sandbox package.
+    pub const TYPE_SANDBOX: u8 = 12;
+    /// The package type of a wander package.
+    pub const TYPE_WANDER: u8 = 5;
+
+    /// A `PKDT` of the 12-byte form: the type, general flags, behaviour
+    /// flags and type-specific flags.
+    pub fn new(package_type: u8, flags: u32, behaviour: u16, type_flags: u16) -> Self {
+        let rest = Wr::default()
+            .u8(0)
+            .u16(behaviour)
+            .u16(type_flags)
+            .zeros(2)
+            .done();
+        Self {
+            flags,
+            package_type,
+            rest,
+        }
+    }
+
+    /// A `PKDT` of the 8-byte form, which has no type-specific flags.
+    pub fn short(package_type: u8, flags: u32, behaviour: u16) -> Self {
+        let rest = Wr::default().u8(0).u16(behaviour).done();
+        Self {
+            flags,
+            package_type,
+            rest,
+        }
+    }
+
+    /// Whether this is the 8-byte form, which has no type-specific flags.
+    pub fn is_short_form(&self) -> bool {
+        self.rest.len() == 3
+    }
+
+    /// Whether every bit of `mask` is set in the general flags.
+    pub fn has_flags(&self, mask: u32) -> bool {
+        self.flags & mask == mask
+    }
+
+    /// The editor's names of the general flags that are set, in bit order.
+    pub fn general_flag_names(&self) -> Vec<&'static str> {
+        GENERAL_FLAG_NAMES
+            .iter()
+            .filter(|(mask, _)| self.flags & mask != 0)
+            .map(|&(_, name)| name)
+            .collect()
+    }
+
+    /// The general flag "offers services".
+    pub fn offers_services(&self) -> bool {
+        self.has_flags(Self::OFFERS_SERVICES)
+    }
+
+    /// The general flag "must reach location".
+    pub fn must_reach_location(&self) -> bool {
+        self.has_flags(Self::MUST_REACH_LOCATION)
+    }
+
+    /// The general flag "must complete".
+    pub fn must_complete(&self) -> bool {
+        self.has_flags(Self::MUST_COMPLETE)
+    }
+
+    /// The general flag "always run": the actor runs, else it walks.
+    pub fn always_run(&self) -> bool {
+        self.has_flags(Self::ALWAYS_RUN)
+    }
+
+    /// The general flag "always sneak".
+    pub fn always_sneak(&self) -> bool {
+        self.has_flags(Self::ALWAYS_SNEAK)
+    }
+
+    /// The general flag "once per day".
+    pub fn once_per_day(&self) -> bool {
+        self.has_flags(Self::ONCE_PER_DAY)
+    }
+
+    /// The general flag "continue if PC near".
+    pub fn continue_if_pc_near(&self) -> bool {
+        self.has_flags(Self::CONTINUE_IF_PC_NEAR)
+    }
+
+    /// The general flag "weapons drawn".
+    pub fn weapons_drawn(&self) -> bool {
+        self.has_flags(Self::WEAPONS_DRAWN)
+    }
+
+    /// The behaviour flags as stored, fill included; `None` when `PKDT`
+    /// has no bytes after the type.
+    pub fn behaviour_flags_raw(&self) -> Option<u16> {
+        let bytes: [u8; 2] = self.rest.get(1..3)?.try_into().ok()?;
+        Some(u16::from_le_bytes(bytes))
+    }
+
+    /// The behaviour flags, or `None` when the record stores the
+    /// uninitialised-memory fill [`PackageData::BEHAVIOUR_FILL`] (an
+    /// engine bug's leftover: those bits were never chosen).
+    pub fn behaviour_flags(&self) -> Option<u16> {
+        self.behaviour_flags_raw()
+            .filter(|&flags| flags != Self::BEHAVIOUR_FILL)
+    }
+
+    /// The editor's names of the behaviour flags that are set.
+    pub fn behaviour_flag_names(&self) -> Vec<&'static str> {
+        let flags = self.behaviour_flags().unwrap_or(0);
+        BEHAVIOUR_FLAG_NAMES
+            .iter()
+            .filter(|(mask, _)| flags & mask != 0)
+            .map(|&(_, name)| name)
+            .collect()
+    }
+
+    /// The type-specific flags; `None` in the 8-byte form, which has none.
+    pub fn type_flags(&self) -> Option<u16> {
+        let bytes: [u8; 2] = self.rest.get(3..5)?.try_into().ok()?;
+        Some(u16::from_le_bytes(bytes))
+    }
+
+    /// Whether the type-specific flags are the sandbox set (a sandbox or
+    /// wander package).
+    pub fn has_sandbox_flags(&self) -> bool {
+        matches!(self.package_type, Self::TYPE_SANDBOX | Self::TYPE_WANDER)
+    }
+
+    /// One sandbox or wander option: `None` for any other package type
+    /// and in the 8-byte form.
+    pub fn sandbox_flag(&self, mask: u16) -> Option<bool> {
+        if !self.has_sandbox_flags() {
+            return None;
+        }
+        self.type_flags().map(|flags| flags & mask != 0)
+    }
+
+    /// The editor's names of the sandbox options that are set, in bit
+    /// order; empty for any other package type.
+    pub fn sandbox_flag_names(&self) -> Vec<&'static str> {
+        match self.type_flags().filter(|_| self.has_sandbox_flags()) {
+            Some(flags) => SANDBOX_FLAG_NAMES
+                .iter()
+                .filter(|(mask, _)| flags & mask != 0)
+                .map(|&(_, name)| name)
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
     /// The package type's name in the editor's list, for the codes both
     /// games use: find, follow, escort, eat, sleep, wander, travel,
     /// accompany, use item at, ambush, flee not combat, sandbox, patrol,
@@ -272,6 +639,41 @@ pub struct PackageEvent {
     pub topic: Option<FormId>,
 }
 
+impl PackageEvent {
+    /// An event with nothing in it.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the idle.
+    #[must_use]
+    pub fn with_idle(mut self, idle: impl Into<FormId>) -> Self {
+        self.idle = Some(idle.into());
+        self
+    }
+
+    /// Sets the topic.
+    #[must_use]
+    pub fn with_topic(mut self, topic: impl Into<FormId>) -> Self {
+        self.topic = Some(topic.into());
+        self
+    }
+
+    /// Sets the script to one with source text.
+    #[must_use]
+    pub fn with_script_source(mut self, source: &str) -> Self {
+        self.script = ScriptBody::from_source(source);
+        self
+    }
+
+    /// Sets the whole script, for one with references and variables.
+    #[must_use]
+    pub fn with_script(mut self, script: ScriptBody) -> Self {
+        self.script = script;
+        self
+    }
+}
+
 /// An AI package (`PACK`).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Package {
@@ -333,6 +735,34 @@ impl Package {
             }),
             ..Self::default()
         }
+    }
+
+    /// Replaces the `PKDT`.
+    #[must_use]
+    pub fn with_data(mut self, data: PackageData) -> Self {
+        self.data = Some(data);
+        self
+    }
+
+    /// Sets the on-begin event.
+    #[must_use]
+    pub fn with_on_begin(mut self, event: PackageEvent) -> Self {
+        self.on_begin = Some(event);
+        self
+    }
+
+    /// Sets the on-end event.
+    #[must_use]
+    pub fn with_on_end(mut self, event: PackageEvent) -> Self {
+        self.on_end = Some(event);
+        self
+    }
+
+    /// Sets the on-change event.
+    #[must_use]
+    pub fn with_on_change(mut self, event: PackageEvent) -> Self {
+        self.on_change = Some(event);
+        self
     }
 
     /// The event blocks that are present, in file order, with their names:

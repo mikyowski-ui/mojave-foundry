@@ -1854,9 +1854,30 @@ fn packets(
         Some(bytes) => map_builder::critters::choose_ai_packet(bytes).map_err(stage)?,
         None => map_builder::critters::FALLBACK_AI_PACKET,
     };
-    let hostile = match by_name(&rules.hostile_packet) {
-        Some(found) => found,
-        None => {
+    let hostile = match (
+        input.inputs.slice.hostile_packet,
+        by_name(&rules.hostile_packet),
+    ) {
+        (Some(number), _) => {
+            let known = table
+                .as_ref()
+                .is_none_or(|t| t.packets.iter().any(|p| p.packet_num == number));
+            if !known {
+                return Err(ConvertError::Slice {
+                    name: input.inputs.slice.name.clone(),
+                    reason: format!("hostile_packet = {number} is not a packet of the base ai.txt"),
+                });
+            }
+            let named = table.as_ref().and_then(|t| {
+                t.packets
+                    .iter()
+                    .find(|p| p.packet_num == number)
+                    .map(|p| String::from_utf8_lossy(&p.name).into_owned())
+            });
+            (number, named.unwrap_or_else(|| format!("packet {number}")))
+        }
+        (None, Some(found)) => found,
+        (None, None) => {
             let number = rules.hostile_packet_number;
             let known = table
                 .as_ref()

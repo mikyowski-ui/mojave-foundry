@@ -529,5 +529,7 @@ pub fn critter(
         yaw,
         hit_points: 25,
         female: false,
+        hidden: false,
+        presence_of: None,
     }
 }

@@ -61,17 +61,18 @@ fn check_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Serialize `vars` under `section`'s marker. The parser reads back the
-/// values in order, `found` set.
-pub fn write_gam(section: GamSection, vars: &[GamVar]) -> Result<Vec<u8>, EmitError> {
-    if vars.len() > GAM_MAX_VARS {
+/// The lines of `vars` as variables numbered from `first_index` (which only
+/// names them in errors): `name = value;` and LF each, no marker.
+pub(crate) fn write_gam_rows(first_index: usize, vars: &[GamVar]) -> Result<Vec<u8>, EmitError> {
+    if first_index.saturating_add(vars.len()) > GAM_MAX_VARS {
         return Err(EmitError::Gam {
             index: GAM_MAX_VARS,
             message: format!("more than {GAM_MAX_VARS} variables"),
         });
     }
-    let mut out = marker_line(section).as_bytes().to_vec();
-    for (index, var) in vars.iter().enumerate() {
+    let mut out = Vec::new();
+    for (offset, var) in vars.iter().enumerate() {
+        let index = first_index + offset;
         let error = |message: String| EmitError::Gam { index, message };
         check_name(&var.name).map_err(error)?;
         let line = format!("{} = {};\n", var.name, var.value);
@@ -83,5 +84,13 @@ pub fn write_gam(section: GamSection, vars: &[GamVar]) -> Result<Vec<u8>, EmitEr
         }
         out.extend_from_slice(line.as_bytes());
     }
+    Ok(out)
+}
+
+/// Serialize `vars` under `section`'s marker. The parser reads back the
+/// values in order, `found` set.
+pub fn write_gam(section: GamSection, vars: &[GamVar]) -> Result<Vec<u8>, EmitError> {
+    let mut out = marker_line(section).as_bytes().to_vec();
+    out.extend_from_slice(&write_gam_rows(0, vars)?);
     Ok(out)
 }

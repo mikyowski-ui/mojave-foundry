@@ -241,6 +241,33 @@
 //! [`loot`] module notes give the rules. Without a catalogue nothing of
 //! this runs and the layer is byte for byte what it was.
 //!
+//! # Hidden objects and the object map
+//!
+//! [`BuildOptions::hidden`] names placements (by reference) that are
+//! written with the hidden flag `0x01`: the children of an enable group
+//! that start disabled, which a script shows later. A hidden placement
+//! keeps its prototype's blocking and light flags (the engine's movement
+//! rule skips hidden objects, `islands::stops_movement`), so the plan
+//! ignores it entirely: it blocks no hex, opens no door grid, covers no
+//! figure and counts for no readability or reach figure. Its objects are
+//! written after the visible placements of its elevation, and an item or
+//! container of it on a link's keep-clear hexes is moved off them like a
+//! visible one ([`BuildReport::hidden_objects`] lists them).
+//! A [`CritterPlacement::hidden`] critter (a disabled group child, or a
+//! presence copy with [`CritterPlacement::presence_of`]) is placed after
+//! the visible critters and everything that moves them, on the nearest
+//! walkable hex to its position within three times
+//! [`critters::CRITTER_RADIUS`] steps, clear of exit grids, doors, the
+//! entrance, arrivals, passages, the keep-clear hexes of links and every
+//! visible critter; it is a bare critter, written hidden, and listed in
+//! [`BuildReport::hidden_critters`] instead of [`BuildReport::critters`], so
+//! it is no perch, no critter lost to closing and no person of the map.
+//!
+//! [`BuiltMap::objects`] (and [`Built::objects`]) is the exact map from
+//! every placement and critter to the objects written for it
+//! ([`ObjectRef`]: reference, elevation, object id, hex, PID, hidden); the
+//! converter's placement index is made from it, not from positions.
+//!
 //! # Furniture footprints
 //!
 //! A placement blocks only its anchor hex, and the slicer's strips over
@@ -570,6 +597,16 @@ pub struct BuildOptions {
     /// reach, as [`LayerOptions::close_unreached`] does for a layer (a layer
     /// takes its own). Default `true`.
     pub close_unreached: bool,
+    /// Reference form keys ([`Placement::reference`]) whose objects are
+    /// written with the hidden flag (`0x01`): children of an enable group
+    /// that start disabled (crate notes, "Hidden objects"). A hidden
+    /// placement keeps its prototype's blocking and light flags, but it
+    /// takes no part in walkability, doors, cover, footprints, readability
+    /// or the reach (the engine's movement rule skips hidden objects, and
+    /// a script shows them later); it is still moved off link hexes, and
+    /// it is written after every other object of its elevation. Default
+    /// empty: nothing changes.
+    pub hidden: BTreeSet<String>,
 }
 
 /// One level of a multi-level exterior map ([`levels::LevelSplit::exterior_level`]):
@@ -701,6 +738,7 @@ impl Default for BuildOptions {
             navmesh_only: false,
             coverage_bridges: true,
             close_unreached: true,
+            hidden: BTreeSet::new(),
         }
     }
 }
@@ -732,6 +770,19 @@ pub struct CritterPlacement {
     pub yaw: f32,
     pub hit_points: i32,
     pub female: bool,
+    /// Written with the hidden flag, placed after the visible critters on
+    /// the nearest walkable hex to its position (within three times
+    /// [`critters::CRITTER_RADIUS`] steps), clear of every keep-clear hex
+    /// and every visible critter. A hidden critter is not a placed
+    /// critter: it is left out of [`BuildReport::critters`], of the perch
+    /// test, of closing and of the critter-reach report, and is listed in
+    /// [`BuildReport::hidden_critters`]. Its catalogue entry is ignored (it
+    /// is a bare critter). Default `false`.
+    pub hidden: bool,
+    /// A presence copy (spec 7.6): the form key of the reference this
+    /// critter copies; it is carried into [`HiddenCritter::presence_of`]
+    /// and the placement index. Only meaningful with `hidden`.
+    pub presence_of: Option<String>,
 }
 
 /// Everything one map is built from. The lead fills it from
@@ -778,6 +829,9 @@ pub struct Built {
     /// 40,000 entries, by hex; passages opened included.
     pub walkable: Vec<bool>,
     pub report: BuildReport,
+    /// Every object the placements and critters became, exactly
+    /// ([`BuiltMap::objects`]).
+    pub objects: Vec<ObjectRef>,
     /// What the catalogue ([`BuildOptions::catalogue`]) made; `None`
     /// without one.
     pub loot: Option<LootReport>,
@@ -1134,6 +1188,25 @@ pub struct BuildReport {
     pub readability: ReadabilityReport,
     /// What [`BuildOptions::interactive`] matched.
     pub interactive: InteractiveReport,
+    /// Hidden critters ([`CritterPlacement::hidden`]) placed, by elevation,
+    /// in input order.
+    pub hidden_critters: Vec<HiddenCritter>,
+    /// Objects written with the hidden flag other than critters
+    /// ([`BuildOptions::hidden`]): reference, elevation, hex, in write
+    /// order.
+    pub hidden_objects: Vec<(String, u8, i32)>,
+}
+
+/// A hidden critter that was placed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HiddenCritter {
+    /// The elevation it is on.
+    pub elevation: u8,
+    /// Its placement: reference, input index, hex, orientation, steps and
+    /// distance from its source position, prototype PID and sprite stem.
+    pub placed: PlacedCritter,
+    /// The reference it is a presence copy of.
+    pub presence_of: Option<String>,
 }
 
 /// A teleport door of an interior demo, which leads nowhere on it.
@@ -1620,6 +1693,20 @@ pub struct ElevationReport {
     pub moved_off_links: usize,
 }
 
+/// One object a placement or critter became, as written to its map.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectRef {
+    /// The source reference (a placement's or a critter's `reference`).
+    pub reference: String,
+    pub elevation: u8,
+    /// The object's id in the map file.
+    pub id: u32,
+    pub hex: i32,
+    pub pid: u32,
+    /// The object carries the hidden flag.
+    pub hidden: bool,
+}
+
 /// One map of a built layer.
 #[derive(Debug)]
 pub struct BuiltMap {
@@ -1634,6 +1721,13 @@ pub struct BuiltMap {
     pub links: Vec<LinkReport>,
     /// The elevation of each of `report.critters`.
     pub critter_elevations: Vec<u8>,
+    /// Every object the map's placements and critters became, exactly: the
+    /// source reference (a placement's [`Placement::reference`], a
+    /// critter's [`CritterPlacement::reference`]) and the object as
+    /// written, in write order. Exit grids, blockers and inventory records
+    /// are not listed. A reference that became several objects (a
+    /// landmark's pieces, ammunition packs) has an entry for each.
+    pub objects: Vec<ObjectRef>,
     /// The map's report. On a map of several elevations its `walk`,
     /// `entrance`, `components`, `passages`, `islands_left`,
     /// `opened_hexes`, `blockers` and `readability` describe the entrance

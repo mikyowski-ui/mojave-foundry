@@ -1,0 +1,567 @@
+{
+  "id": "script/testtown.esm:000900/0",
+  "editor_id": "TSTest",
+  "kind": "object",
+  "vars": [
+    {
+      "index": 1,
+      "name": "counter",
+      "ty": "int"
+    },
+    {
+      "index": 2,
+      "name": "asInt",
+      "ty": "int"
+    },
+    {
+      "index": 3,
+      "name": "asLong",
+      "ty": "int"
+    },
+    {
+      "index": 4,
+      "name": "rate",
+      "ty": "float"
+    },
+    {
+      "index": 5,
+      "name": "target",
+      "ty": "ref"
+    },
+    {
+      "index": 6,
+      "name": "other",
+      "ty": "ref"
+    }
+  ],
+  "blocks": [
+    {
+      "event": "game_mode",
+      "body": [
+        {
+          "set": [
+            {
+              "local": {
+                "script": "script/testtown.esm:000900/0",
+                "index": 1,
+                "ty": "int"
+              }
+            },
+            {
+              "binary": [
+                "add",
+                {
+                  "var": {
+                    "local": {
+                      "script": "script/testtown.esm:000900/0",
+                      "index": 1,
+                      "ty": "int"
+                    }
+                  }
+                },
+                {
+                  "int": 1
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "set": [
+            {
+              "local": {
+                "script": "script/testtown.esm:000900/0",
+                "index": 4,
+                "ty": "float"
+              }
+            },
+            {
+              "binary": [
+                "div",
+                {
+                  "binary": [
+                    "sub",
+                    {
+                      "binary": [
+                        "mul",
+                        {
+                          "var": {
+                            "local": {
+                              "script": "script/testtown.esm:000900/0",
+                              "index": 4,
+                              "ty": "float"
+                            }
+                          }
+                        },
+                        {
+                          "int": 2
+                        }
+                      ]
+                    },
+                    {
+                      "int": 1
+                    }
+                  ]
+                },
+                {
+                  "int": 4
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "set": [
+            {
+              "local": {
+                "script": "script/testtown.esm:000900/0",
+                "index": 2,
+                "ty": "int"
+              }
+            },
+            {
+              "unary": [
+                "neg",
+                {
+                  "var": {
+                    "local": {
+                      "script": "script/testtown.esm:000900/0",
+                      "index": 1,
+                      "ty": "int"
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "set": [
+            {
+              "local": {
+                "script": "script/testtown.esm:000900/0",
+                "index": 3,
+                "ty": "int"
+              }
+            },
+            {
+              "unary": [
+                "not",
+                {
+                  "var": {
+                    "local": {
+                      "script": "script/testtown.esm:000900/0",
+                      "index": 2,
+                      "ty": "int"
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "if": {
+            "arms": [
+              [
+                {
+                  "binary": [
+                    "or",
+                    {
+                      "binary": [
+                        "and",
+                        {
+                          "binary": [
+                            {
+                              "cmp": "ge"
+                            },
+                            {
+                              "var": {
+                                "local": {
+                                  "script": "script/testtown.esm:000900/0",
+                                  "index": 1,
+                                  "ty": "int"
+                                }
+                              }
+                            },
+                            {
+                              "int": 10
+                            }
+                          ]
+                        },
+                        {
+                          "binary": [
+                            {
+                              "cmp": "lt"
+                            },
+                            {
+                              "var": {
+                                "local": {
+                                  "script": "script/testtown.esm:000900/0",
+                                  "index": 4,
+                                  "ty": "float"
+                                }
+                              }
+                            },
+                            {
+                              "float": 0.5
+                            }
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "binary": [
+                        {
+                          "cmp": "eq"
+                        },
+                        {
+                          "var": {
+                            "local": {
+                              "script": "script/testtown.esm:000900/0",
+                              "index": 2,
+                              "ty": "int"
+                            }
+                          }
+                        },
+                        {
+                          "int": 3
+                        }
+                      ]
+                    }
+                  ]
+                },
+                [
+                  {
+                    "set": [
+                      {
+                        "local": {
+                          "script": "script/testtown.esm:000900/0",
+                          "index": 1,
+                          "ty": "int"
+                        }
+                      },
+                      {
+                        "int": 0
+                      }
+                    ]
+                  }
+                ]
+              ],
+              [
+                {
+                  "binary": [
+                    {
+                      "cmp": "ne"
+                    },
+                    {
+                      "var": {
+                        "local": {
+                          "script": "script/testtown.esm:000900/0",
+                          "index": 1,
+                          "ty": "int"
+                        }
+                      }
+                    },
+                    {
+                      "int": 5
+                    }
+                  ]
+                },
+                [
+                  {
+                    "set": [
+                      {
+                        "local": {
+                          "script": "script/testtown.esm:000900/0",
+                          "index": 5,
+                          "ty": "ref"
+                        }
+                      },
+                      {
+                        "ref": "player"
+                      }
+                    ]
+                  }
+                ]
+              ]
+            ],
+            "otherwise": [
+              "return"
+            ]
+          }
+        },
+        {
+          "if": {
+            "arms": [
+              [
+                {
+                  "binary": [
+                    {
+                      "cmp": "ge"
+                    },
+                    {
+                      "call": {
+                        "func": {
+                          "known": "GetStage"
+                        },
+                        "on": null,
+                        "args": [
+                          {
+                            "form": "testtown.esm:000100"
+                          }
+                        ]
+                      }
+                    },
+                    {
+                      "int": 20
+                    }
+                  ]
+                },
+                [
+                  {
+                    "call": {
+                      "func": {
+                        "known": "SetStage"
+                      },
+                      "on": null,
+                      "args": [
+                        {
+                          "form": "testtown.esm:000100"
+                        },
+                        {
+                          "int": 30
+                        }
+                      ]
+                    }
+                  }
+                ]
+              ]
+            ],
+            "otherwise": []
+          }
+        },
+        {
+          "call": {
+            "func": {
+              "known": "Lock"
+            },
+            "on": {
+              "placed": "testtown.esm:000200"
+            },
+            "args": [
+              {
+                "int": 50
+              }
+            ]
+          }
+        },
+        {
+          "call": {
+            "func": {
+              "known": "AddItem"
+            },
+            "on": "player",
+            "args": [
+              {
+                "form": "testtown.esm:000400"
+              },
+              {
+                "int": 1
+              }
+            ]
+          }
+        },
+        {
+          "set": [
+            {
+              "local": {
+                "script": "script/testtown.esm:000900/0",
+                "index": 1,
+                "ty": "int"
+              }
+            },
+            {
+              "binary": [
+                "add",
+                {
+                  "call": {
+                    "func": {
+                      "known": "GetItemCount"
+                    },
+                    "on": "player",
+                    "args": [
+                      {
+                        "form": "testtown.esm:000400"
+                      }
+                    ]
+                  }
+                },
+                {
+                  "int": 2
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "set": [
+            {
+              "local": {
+                "script": "script/testtown.esm:000900/0",
+                "index": 4,
+                "ty": "float"
+              }
+            },
+            {
+              "var": {
+                "quest": {
+                  "quest": "quest/testtown.esm:000100/0",
+                  "index": 2,
+                  "ty": "float"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "set": [
+            {
+              "quest": {
+                "quest": "quest/testtown.esm:000100/0",
+                "index": 1,
+                "ty": "int"
+              }
+            },
+            {
+              "int": 7
+            }
+          ]
+        },
+        {
+          "set": [
+            {
+              "local": {
+                "script": "script/testtown.esm:000900/0",
+                "index": 2,
+                "ty": "int"
+              }
+            },
+            {
+              "var": {
+                "hoisted": {
+                  "owner": "testtown.esm:000202",
+                  "script": "script/testtown.esm:000301/0",
+                  "index": 4,
+                  "ty": "int"
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "event": "on_activate",
+      "body": [
+        {
+          "if": {
+            "arms": [
+              [
+                {
+                  "binary": [
+                    {
+                      "cmp": "eq"
+                    },
+                    {
+                      "binary": [
+                        {
+                          "cmp": "eq"
+                        },
+                        {
+                          "ref": "action"
+                        },
+                        {
+                          "ref": "player"
+                        }
+                      ]
+                    },
+                    {
+                      "int": 1
+                    }
+                  ]
+                },
+                [
+                  {
+                    "call": {
+                      "func": {
+                        "known": "Activate"
+                      },
+                      "on": null,
+                      "args": []
+                    }
+                  }
+                ]
+              ]
+            ],
+            "otherwise": []
+          }
+        }
+      ]
+    },
+    {
+      "event": {
+        "on_trigger_enter": {
+          "by": "player"
+        }
+      },
+      "body": [
+        {
+          "call": {
+            "func": {
+              "known": "ShowMessage"
+            },
+            "on": null,
+            "args": [
+              {
+                "form": "testtown.esm:000401"
+              },
+              {
+                "var": {
+                  "local": {
+                    "script": "script/testtown.esm:000900/0",
+                    "index": 1,
+                    "ty": "int"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "event": {
+        "on_death": {
+          "killer": null
+        }
+      },
+      "body": [
+        {
+          "call": {
+            "func": {
+              "known": "RewardXP"
+            },
+            "on": null,
+            "args": [
+              {
+                "int": 10
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "diagnostics": []
+}

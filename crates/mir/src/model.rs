@@ -28,7 +28,18 @@ pub const SCHEMA_VERSION: u32 = 2;
 /// 1: the game (`meta.game`), terminals, notes, packages, actor packages,
 /// script and quest-target references, and the weapon combat columns.
 /// A manifest without the field is revision 0.
-pub const RECORDS_REVISION: u32 = 1;
+///
+/// 2: the simulation tables (`docs/simulation-layer-spec.md`, appendix A):
+/// `globals`, `game_settings`, `messages`, `message_buttons`, `factions`,
+/// `faction_relations`, `actor_ai` and `actor_factions` (resolved through
+/// templates), `info_links`, `package_events`, `script_contexts`,
+/// `script_ref_list`, `script_locals` and `decode_skips`; new columns on
+/// `infos` (`flag_bytes`, `knam`, `knam_sig`, `speech_challenge`),
+/// `packages` (`pkdt_size`, `behaviour_flags`, `behaviour_raw`,
+/// `type_flags`) and `conditions` (`param1_ref`, `param2_ref`); and the
+/// reasons `ConditionParam` and `TeleportDestination` of
+/// `Records::ref_referrals`. No JSON document changed.
+pub const RECORDS_REVISION: u32 = 2;
 
 /// The game a directory written before [`Manifest::game`] existed came
 /// from: every such directory was extracted from New Vegas.

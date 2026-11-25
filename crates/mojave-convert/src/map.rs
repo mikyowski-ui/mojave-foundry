@@ -356,6 +356,14 @@ pub(crate) fn critter_inputs_into(
 ) -> Result<(Vec<map_builder::CritterPlacement>, Vec<PersonSkip>), ConvertError> {
     let interior = inputs.slice.is_interior();
     let place_disabled = interior && inputs.slice.place_disabled;
+    // With `enable_groups`, an actor of an enable group follows its group:
+    // placed hidden when the group starts it disabled, placed as usual
+    // when the group starts it enabled whatever its own flag says.
+    let members = if inputs.enable_groups_on() {
+        group_members_of(cells.iter().flat_map(|cell| cell.references.iter()))
+    } else {
+        BTreeMap::new()
+    };
     let mut skipped: Vec<PersonSkip> = Vec::new();
     let index = crate::critters::read_index(inputs)?;
     let by_actor: BTreeMap<&str, &crate::critters::CritterEntry> =
@@ -395,11 +403,13 @@ pub(crate) fn critter_inputs_into(
         if reference.base_kind.as_deref() != Some("NPC_") || reference.flags.deleted {
             continue;
         }
-        if reference.flags.initially_disabled && !place_disabled {
+        let member = members.get(&reference.form.to_string());
+        if member.is_none() && reference.flags.initially_disabled && !place_disabled {
             skip("starts disabled in the data (place_disabled is off)".to_owned());
             continue;
         }
-        if let Some(parent) = &reference.enable_parent
+        if member.is_none()
+            && let Some(parent) = &reference.enable_parent
             && !place_disabled
         {
             let parent_on = enabled
@@ -451,17 +461,19 @@ pub(crate) fn critter_inputs_into(
             yaw: reference.transform.rotation[2],
             hit_points: entry.health.max(1),
             female: entry.female,
+            hidden: member.is_some_and(|m| m.starts_disabled),
+            presence_of: None,
         });
     }
     if interior {
         // A name several people share is not a proper name: "You see a
         // Powder Ganger." (An exterior keeps its descriptions as they were.)
         let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-        for placement in &placements {
+        for placement in placements.iter().filter(|p| !p.hidden) {
             *counts.entry(placement.name.clone()).or_default() += 1;
         }
         for placement in &mut placements {
-            if counts[&placement.name] > 1 {
+            if counts.get(&placement.name).copied().unwrap_or(0) > 1 {
                 placement.description = format!("You see {}.", with_article(&placement.name));
             }
         }
@@ -593,6 +605,8 @@ pub(crate) struct Scene {
     pub(crate) open: OpenHexes,
     /// What an interior slice chose; `None` for an exterior window.
     pub(crate) interior: Option<InteriorScene>,
+    /// What the enable-group pass did (`enable_groups`); empty when off.
+    pub(crate) groups: GroupsReport,
 }
 
 /// Where an interior slice's numbers came from, for the report.
@@ -716,6 +730,7 @@ pub(crate) fn scene(inputs: &Inputs, mir: &Mir) -> Result<Scene, ConvertError> {
         slicer_config,
         open,
         interior: None,
+        groups: GroupsReport::default(),
     })
 }
 
@@ -837,6 +852,7 @@ pub(crate) fn interior_scene(inputs: &Inputs, mir: &Mir, id: &str) -> Result<Sce
         slicer_config,
         open,
         interior: Some(interior),
+        groups: GroupsReport::default(),
     })
 }
 
@@ -973,6 +989,221 @@ pub(crate) fn wire_rule() -> map_slicer::WireRule {
         patterns: vec![CART_PATTERN.to_owned(), "*wirebasket".to_owned()],
         ..map_slicer::WireRule::default()
     }
+}
+
+/// What the enable-group pass (`enable_groups`) did to one map's
+/// references.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct GroupsReport {
+    /// References of the map's cells that belong to an enable group.
+    pub(crate) members: usize,
+    /// Non-actor children and parents that start disabled and were handed
+    /// to the slicer enabled, to be written hidden, with the class the
+    /// slicer gave them.
+    pub(crate) hidden: Vec<(String, String)>,
+    /// Members whose group starts them enabled although their own flag
+    /// said disabled, handed on enabled.
+    pub(crate) enabled_by_group: usize,
+    /// Members that start disabled and stay off the map, with the reason.
+    pub(crate) left: Vec<(String, String)>,
+    /// What the source says about every reference the pass changed.
+    pub(crate) originals: BTreeMap<String, crate::placements::Original>,
+}
+
+/// The enable groups among `references` (`placements::group_members`),
+/// by form key.
+pub(crate) fn group_members_of<'a>(
+    references: impl IntoIterator<Item = &'a mir::Reference>,
+) -> BTreeMap<String, crate::placements::Member> {
+    let mut seen = BTreeSet::new();
+    type Owned = (String, Option<(String, bool)>, bool);
+    let owned: Vec<Owned> = references
+        .into_iter()
+        .filter(|r| !r.flags.deleted && seen.insert(r.form.to_string()))
+        .map(|r| {
+            (
+                r.form.to_string(),
+                r.enable_parent
+                    .as_ref()
+                    .map(|p| (p.reference.to_string(), p.opposite)),
+                r.flags.initially_disabled,
+            )
+        })
+        .collect();
+    let sources: Vec<crate::placements::GroupSource<'_>> = owned
+        .iter()
+        .map(|(form, parent, own)| crate::placements::GroupSource {
+            form,
+            parent: parent.as_ref().map(|(p, o)| (p.as_str(), *o)),
+            own_disabled: *own,
+        })
+        .collect();
+    crate::placements::group_members(&sources)
+}
+
+/// Whether a reference is an actor (placed by the critter pass).
+fn is_actor(reference: &mir::Reference) -> bool {
+    !matches!(reference.kind, mir::RefKind::Object)
+        || matches!(reference.base_kind.as_deref(), Some("NPC_" | "CREA"))
+}
+
+/// `enable_groups = true` (spec 8.3): for every non-actor member of an
+/// enable group of the scene's cells, the references handed to the slicer
+/// follow the group's initial state instead of their own flag and parent:
+/// a member that starts enabled is handed on enabled; one that starts
+/// disabled is handed on enabled too and written hidden
+/// ([`map_builder::BuildOptions::hidden`]), when the slicer would draw it
+/// as an object (a sprite, strips or a landmark). A member the slicer
+/// would bake into the ground, or skip (a marker, a light), stays off and
+/// is listed. Actors are the critter pass's. Off, nothing changes.
+pub(crate) fn apply_enable_groups(
+    inputs: &Inputs,
+    mir: &Mir,
+    scene: &mut Scene,
+) -> Result<(), ConvertError> {
+    if !inputs.enable_groups_on() {
+        return Ok(());
+    }
+    let members = group_members_of(scene.cells.iter().flat_map(|cell| cell.references.iter()));
+    let tile_units = scene.projection.tile_units();
+    let mut report = GroupsReport::default();
+    let mut hidden: BTreeSet<String> = BTreeSet::new();
+    for reference in &mut scene.references {
+        let key = reference.form.to_string();
+        let Some(member) = members.get(&key) else {
+            continue;
+        };
+        report.members += 1;
+        if reference.flags.deleted || is_actor(reference) {
+            continue;
+        }
+        let original = crate::placements::Original {
+            initially_disabled: reference.flags.initially_disabled,
+            enable_parent: reference.enable_parent.clone(),
+        };
+        let mut handed = reference.clone();
+        handed.flags.initially_disabled = false;
+        handed.enable_parent = None;
+        if member.starts_disabled {
+            let facts = reference
+                .mesh
+                .as_deref()
+                .and_then(|hash| mir.mesh(hash).ok())
+                .map(|mesh| map_slicer::MeshFacts::of(&mesh));
+            let class =
+                map_slicer::classify(&handed, facts.as_ref(), tile_units, &scene.slicer_config);
+            match class {
+                map_slicer::Class::Sprite(_)
+                | map_slicer::Class::Sliced
+                | map_slicer::Class::Landmark => {
+                    report
+                        .hidden
+                        .push((key.clone(), class.kind().name().to_owned()));
+                    hidden.insert(key.clone());
+                }
+                map_slicer::Class::Skip(why) => {
+                    report.left.push((
+                        key.clone(),
+                        format!("starts disabled; the slicer skips it: {why}"),
+                    ));
+                    continue;
+                }
+                other => {
+                    report.left.push((
+                        key.clone(),
+                        format!(
+                            "starts disabled; the slicer would bake it into the ground ({}),                              where a script could not hide it",
+                            other.kind().name()
+                        ),
+                    ));
+                    continue;
+                }
+            }
+        } else if original.initially_disabled {
+            report.enabled_by_group += 1;
+        } else if original.enable_parent.is_none() {
+            continue;
+        }
+        report.originals.insert(key, original);
+        *reference = handed;
+    }
+    scene.build_options.hidden.extend(hidden);
+    scene.groups = report;
+    Ok(())
+}
+
+/// `## Enable groups`: what the pass did and the hidden objects the
+/// builder wrote, per map.
+pub(crate) fn write_groups_section(
+    text: &mut String,
+    on: bool,
+    maps: &[(&str, &GroupsReport, &map_builder::BuildReport)],
+) {
+    let _ = writeln!(
+        text,
+        "## Enable groups
+"
+    );
+    if !on {
+        let _ = writeln!(
+            text,
+            "- off: references that start disabled are left off (slice key `enable_groups = true`)
+"
+        );
+        return;
+    }
+    for (stem, groups, report) in maps {
+        let hidden_people = report
+            .hidden_critters
+            .iter()
+            .filter(|c| c.presence_of.is_none());
+        let copies = report
+            .hidden_critters
+            .iter()
+            .filter(|c| c.presence_of.is_some());
+        let _ = writeln!(
+            text,
+            "- {stem}: {} group members; {} hidden objects written, {} hidden people, {} presence copies; {} enabled by their group despite their own flag; {} left off",
+            groups.members,
+            report.hidden_objects.len(),
+            hidden_people.count(),
+            copies.count(),
+            groups.enabled_by_group,
+            groups.left.len()
+        );
+        for (reference, class) in &groups.hidden {
+            let placed = report
+                .hidden_objects
+                .iter()
+                .filter(|(r, _, _)| r == reference)
+                .map(|(_, e, h)| format!("elevation {e} hex {h}"))
+                .next();
+            let _ = writeln!(
+                text,
+                "  - hidden {reference} ({class}): {}",
+                placed.unwrap_or_else(|| "no object written".to_owned())
+            );
+        }
+        for critter in &report.hidden_critters {
+            let _ = writeln!(
+                text,
+                "  - hidden person {}{}: elevation {} hex {}, {} steps from its position",
+                critter.placed.reference,
+                critter
+                    .presence_of
+                    .as_ref()
+                    .map(|o| format!(" (presence copy of {o})"))
+                    .unwrap_or_default(),
+                critter.elevation,
+                critter.placed.hex,
+                critter.placed.steps
+            );
+        }
+        for (reference, why) in &groups.left {
+            let _ = writeln!(text, "  - left off {reference}: {why}");
+        }
+    }
+    let _ = writeln!(text);
 }
 
 /// The slice keys of the layers pass that the single-map path honours as
@@ -1148,6 +1379,7 @@ pub fn estimate(inputs: &Inputs) -> Result<EstimateSummary, ConvertError> {
     let budgets = budgets(&base, inputs.standalone)?;
     let mut scene = scene(inputs, &mir)?;
     apply_declutter(inputs, &mir, &mut scene)?;
+    apply_enable_groups(inputs, &mir, &mut scene)?;
     let report = map_slicer::estimate(
         &mir,
         &scene.references,
@@ -1549,6 +1781,7 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
         scene.slicer_config.furniture = Some(map_slicer::FurnitureRule::default());
     }
     apply_slice_keys(&inputs.slice, &mut scene);
+    apply_enable_groups(inputs, &mir, &mut scene)?;
     let ground_tone = terrain_tone(&inputs.slice, &scene.slicer_config);
     let Scene {
         projection,
@@ -1561,6 +1794,7 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
         slicer_config,
         open,
         interior,
+        groups,
     } = scene;
 
     // Interiors the window's doors open on, for the exits. An interior
@@ -1741,6 +1975,9 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
     // Items, loot, armed and sided people (`crate::catalogue`), when on.
     let catalogue = if inputs.loot_on() {
         let rebalance = inputs.rebalance()?;
+        // Hidden people are bare critters: no kit, no side.
+        let visible: Vec<map_builder::CritterPlacement> =
+            critters.iter().filter(|c| !c.hidden).cloned().collect();
         let built = crate::catalogue::build(&crate::catalogue::CatalogueInput {
             inputs,
             mir: &mir,
@@ -1748,7 +1985,7 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
             references: &references,
             art: &sliced.art,
             placements: &sliced.placements,
-            critters: &critters,
+            critters: &visible,
             base: &base,
             palette_map: &palette_map,
             palette_bytes: &palette_bytes,
@@ -1760,8 +1997,6 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
     };
     drop(people_time);
     let build_time = crate::timings::span("build the map");
-    // Kept for the placement index (how many objects each item becomes).
-    let catalogue_used = build_options.catalogue.clone();
     let mut builder_cells = cells.clone();
     builder_cells.extend(interiors.into_values());
     let stem = inputs.slice.map_stem();
@@ -1876,6 +2111,11 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
         let _ = writeln!(text, "- {line}");
     }
     let _ = writeln!(text);
+    write_groups_section(
+        &mut text,
+        inputs.enable_groups_on(),
+        &[(inputs.slice.map_stem().as_str(), &groups, report)],
+    );
     write_loot_section(&mut text, built.loot.as_ref(), catalogue.as_ref());
     let _ = writeln!(text, "## Furniture\n");
     if !footprints_on {
@@ -1991,18 +2231,22 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
         if let Some(why) = why {
             crate::timings::note(format!("no referenced set: {why}"));
         }
+        let frame = map_builder::walk::Frame::new(&window, &projection).map_err(stage)?;
         let stage_map = crate::placements::StageMap {
             stem: &stem,
             references: &references,
-            elevations: vec![(0, placements.as_slice())],
-            report,
-            critter_elevations: &[],
-            catalogue: catalogue_used.as_deref(),
+            objects: &built.objects,
+            skipped_critters: &report.skipped_critters,
             skipped: people_skipped
                 .iter()
                 .map(|p| (p.reference.clone(), p.reason.clone()))
                 .chain(crate::placements::slicer_skips(&sliced))
+                .chain(groups.left.iter().cloned())
                 .collect(),
+            copies: Vec::new(),
+            triggers: crate::placements::trigger_spots(&references, &frame, |_| 0),
+            hostile: crate::placements::hostile_of(catalogue.as_ref()),
+            originals: groups.originals.clone(),
         };
         crate::placements::write_for_stage(
             &inputs.out,

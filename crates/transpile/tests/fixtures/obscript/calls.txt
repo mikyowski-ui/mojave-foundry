@@ -1,0 +1,35 @@
+; Calls: statements, on references, with commas and negative numbers,
+; inside expressions by the signature table's arity, folded, dropped and
+; unknown ones.
+scn TSCallsScript
+short n
+ref r
+
+begin GameMode
+	MoveTo TSMarkerRef 0, 0, -100
+	player.RemoveItem TSKey 1
+	set n to GetItemCount TSKey
+	set n to GetDistance player * 2
+	set n to GetSecondsPassed
+	set r to GetSelf
+	set r to GetActionRef
+	set r to GetLinkedRef
+	set n to GetGlobalValue TSGlobalCount
+	set n to GetQuestVariable TSQuest qCount
+	if GetDead == 0 && GetDisabled == 0
+		Disable
+	endif
+	r.Enable
+	PlaySound TSSound
+	FrobnicateWidget TSKey 3
+	set n to FrobnicateWidget TSKey + 1
+	set n to TSMayorRef.FrobnicateLevel
+	set n to player.GetCombatThing
+	set n to GetSomethingNew
+	set n to TSGlobalCount + TSGlobalRate
+	EVP
+	Kill
+	KillActor player
+	PlayGroup Forward 1
+	set n to GetIsSex Female
+end

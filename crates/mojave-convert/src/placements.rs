@@ -3,42 +3,57 @@
 //! stage needs to find, on the written maps, the references the source
 //! plugins talk about (`docs/simulation-layer-spec.md`, section 10.4).
 //!
-//! # Schema (version 1)
+//! # Schema (version 2)
 //!
 //! ```text
 //! { schema_version, origin ("stage" | "reconstructed"), layer, game,
 //!   maps:     [ { stem, file, number } ],
 //!   placed:   [ PlacedRef ],
 //!   unplaced: [ UnplacedRef ],
+//!   triggers: [ TriggerRef ],
 //!   notes:    [ text ] }
 //! ```
 //!
 //! A [`PlacedRef`] is one reference that became an object of a written
 //! map: its `map` (stem), `map_number`, `elevation`, `hex`, `object_id`
-//! and `pid` as the map file has them; `kind` and `critter`; and, when the
-//! source is known, the `reference` (form key), `editor_id`, `base`,
-//! `base_kind` (record signature), `base_editor_id`, `enable_parent`
-//! (`reference`, `opposite`), `initially_disabled`, `hidden` (the written
-//! object carries the hidden flag) and, for critters, `team` and
-//! `ai_packet`. A field the writer cannot know is left out of the JSON.
+//! and `pid` as the map file has them (the builder returns the exact
+//! reference-to-object map, `map_builder::BuiltMap::objects`; nothing is
+//! guessed from positions); `kind` and `critter`; and, when the source is
+//! known, the `reference` (form key), `editor_id`, `base`, `base_kind`
+//! (record signature), `base_editor_id`, `enable_parent` (`reference`,
+//! `opposite`), `group` (the enable group: its root, the opposite flag
+//! multiplied along the chain, and whether the group starts enabled),
+//! `initially_disabled` (the source's own flag), `hidden` (the written
+//! object carries the hidden flag), `lock` (what the source locks, and
+//! whether the written object is locked), `linked_ref` (`XLKR`), and for
+//! critters `team`, `ai_packet`, `hostile` and, for a presence copy,
+//! `presence_of`. A field the writer cannot know is left out of the JSON;
+//! optional fields are omitted, never `null`.
 //!
 //! An [`UnplacedRef`] is a reference of a map's cells that is not on the
 //! map, with the `reason` (`disabled`, `deleted`, `skipped`, `not_placed`)
 //! and an optional `detail`: enable-parent state needs to know them too.
 //!
+//! A [`TriggerRef`] is a trigger volume (a primitive on an activator): no
+//! object stands for it, the `sim` stage attaches a spatial script at its
+//! `hex` with its `radius` (hexes), when the MIR carries the primitive's
+//! bounds.
+//!
 //! Both lists hold the references the simulation can use: critters, doors,
 //! containers, items and terminals, and any other reference that is an
-//! enable parent or child, or that the caller names (referenced by a
-//! script, a quest or a package). Plain scenery is not listed. Both are
-//! sorted (map, elevation, object id; map, reference), and nothing in the
-//! file depends on the time, the host or a path, so two builds from the
-//! same inputs are byte-identical.
+//! enable parent or child, is linked (`XLKR`, either end), or that the
+//! caller names (referenced by a script, a quest or a package). Plain
+//! scenery is not listed. All lists are sorted, and nothing in the file
+//! depends on the time, the host or a path, so two builds from the same
+//! inputs are byte-identical.
 //!
 //! # Two ways to make it
 //!
 //! - [`write_for_stage`] is the map stage's call: it joins the stage's own
-//!   references, placements and critters with the objects read back from
-//!   the written maps (`build`, a pure function of plain inputs).
+//!   references and the builder's exact object map with the objects read
+//!   back from the written maps (`build`, a pure function of plain
+//!   inputs). An id the map file does not bear out (a different hex or
+//!   PID) is counted in the notes.
 //! - [`reconstruct`] makes what it can from the written maps alone, for a
 //!   run whose map stage did not write the file: no references, bases or
 //!   enable parents, only positions, PIDs, object ids and the kinds the
@@ -52,7 +67,7 @@ use serde::{Deserialize, Serialize};
 use vault_formats::GameProfile;
 use vault_formats::map::{MapFile, ObjectDetail, ObjectState};
 use vault_formats::mod_manifest::{MANIFEST, ModManifest};
-use vault_formats::pro::BasicFlags;
+use vault_formats::pro::{BasicFlags, LockFlags};
 use vault_formats::pro_catalog::LocalPrototypeCatalog;
 use vault_formats::vfs::{ByteSource, MemoryDir, MemoryMount};
 
@@ -60,7 +75,7 @@ use vault_formats::vfs::{ByteSource, MemoryDir, MemoryMount};
 pub const FILE_NAME: &str = "map-placements.json";
 
 /// The schema version [`PlacementIndex::schema_version`] carries.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// A failure reading or writing the index or the maps it is made from.
 #[derive(Debug, thiserror::Error)]
@@ -80,7 +95,9 @@ fn fail(what: impl Into<String>, message: impl ToString) -> PlacementError {
 }
 
 /// What a placed reference is, for the simulation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum PlacedKind {
     /// An NPC or a creature.
@@ -95,6 +112,7 @@ pub enum PlacedKind {
     Terminal,
     /// Anything else (listed only when it is an enable parent or child, or
     /// the caller names it).
+    #[default]
     Scenery,
 }
 
@@ -139,10 +157,11 @@ impl PlacedKind {
 }
 
 /// Where the index came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Origin {
     /// Written by the map stage, from its own records.
+    #[default]
     Stage,
     /// Made from the written maps alone ([`reconstruct`]).
     Reconstructed,
@@ -168,6 +187,35 @@ pub struct EnableParent {
     pub opposite: bool,
 }
 
+/// The enable group a reference belongs to (spec 8.1): a parent with at
+/// least one child, or a child; a chain is flattened to its root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupInfo {
+    /// The root's form key: the group's state is the root's.
+    pub root: String,
+    /// The opposite flags multiplied along the chain to the root: the
+    /// reference is enabled when the root is disabled.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub opposite: bool,
+    /// Whether the reference starts enabled: the root's own flag, flipped
+    /// by `opposite` for a child (a child follows its parent, not its own
+    /// flag).
+    pub initially_enabled: bool,
+}
+
+/// A lock on a door or container.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockInfo {
+    /// The written object carries the lock bit (the lock is written with
+    /// the catalogue, `loot = true`).
+    pub locked: bool,
+    /// The source's lock level, as stored (0 very easy to 255 key only).
+    pub level: u8,
+    /// The key's base record (a form key), when the lock names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+}
+
 fn one() -> u32 {
     1
 }
@@ -181,7 +229,7 @@ fn is_false(value: &bool) -> bool {
 }
 
 /// A reference that became an object of a written map.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlacedRef {
     /// The map's file stem.
     pub map: String,
@@ -191,8 +239,8 @@ pub struct PlacedRef {
     pub elevation: u8,
     /// The hex, 0 to 39,999.
     pub hex: i32,
-    /// The object's id in the written map; absent when the join found no
-    /// object (the note says how many).
+    /// The object's id in the written map; absent when no object was found
+    /// (the note says how many).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_id: Option<u32>,
     /// The object's PID, from the same object.
@@ -206,6 +254,10 @@ pub struct PlacedRef {
     /// pieces, ammunition several packs); the entry describes the first.
     #[serde(default = "one", skip_serializing_if = "is_one")]
     pub pieces: u32,
+    /// Every object id of a reference that became several objects, the
+    /// first included, in write order; left out for one object.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub piece_ids: Vec<u32>,
     /// The reference's form key, as the MIR names it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reference: Option<String>,
@@ -224,18 +276,35 @@ pub struct PlacedRef {
     /// The enable parent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enable_parent: Option<EnableParent>,
-    /// The source starts the reference disabled.
+    /// The enable group, for a parent or a child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<GroupInfo>,
+    /// The source starts the reference disabled (its own flag).
     #[serde(default, skip_serializing_if = "is_false")]
     pub initially_disabled: bool,
     /// The written object carries the hidden flag.
     #[serde(default, skip_serializing_if = "is_false")]
     pub hidden: bool,
+    /// The source's lock, on a door or container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock: Option<LockInfo>,
+    /// The linked reference (`XLKR`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_ref: Option<String>,
     /// A critter's team in the written map.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team: Option<i32>,
     /// A critter's AI packet number in the written map.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_packet: Option<i32>,
+    /// The catalogue marks the critter hostile (its packet is the hostile
+    /// packet).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hostile: bool,
+    /// A presence copy (spec 7.6): the reference of the actor it copies.
+    /// Its `reference` is that one, `@`, and the map's stem.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_of: Option<String>,
 }
 
 /// Why a reference of a map's cells is not on the map.
@@ -298,9 +367,18 @@ pub struct UnplacedRef {
     /// The enable parent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enable_parent: Option<EnableParent>,
+    /// The enable group, for a parent or a child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<GroupInfo>,
     /// The source starts the reference disabled.
     #[serde(default, skip_serializing_if = "is_false")]
     pub initially_disabled: bool,
+    /// The source's lock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock: Option<LockInfo>,
+    /// The linked reference (`XLKR`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_ref: Option<String>,
     /// Why.
     pub reason: UnplacedReason,
     /// The stage's own words, when it gave a reason.
@@ -308,8 +386,46 @@ pub struct UnplacedRef {
     pub detail: Option<String>,
 }
 
+/// A trigger volume: a primitive on an activator. No object stands for it;
+/// the `sim` stage attaches a spatial script there (spec 5.7).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TriggerRef {
+    /// The map holding the volume's cell (file stem) and its number.
+    pub map: String,
+    pub map_number: u32,
+    /// The elevation, and the hex under the volume's centre.
+    pub elevation: u8,
+    pub hex: i32,
+    /// The reference's form key.
+    pub reference: String,
+    /// `box` or `sphere`; absent when the MIR does not carry the
+    /// primitive's shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<String>,
+    /// The smallest hex radius around `hex` that covers the volume's
+    /// footprint; absent when the MIR does not carry the primitive's
+    /// bounds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radius: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_editor_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_parent: Option<EnableParent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<GroupInfo>,
+    /// The linked reference (`XLKR`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_ref: Option<String>,
+}
+
 /// The whole file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PlacementIndex {
     /// [`SCHEMA_VERSION`].
     pub schema_version: u32,
@@ -325,6 +441,9 @@ pub struct PlacementIndex {
     pub placed: Vec<PlacedRef>,
     /// The references of the maps' cells that are not on them.
     pub unplaced: Vec<UnplacedRef>,
+    /// The trigger volumes of the maps' cells.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub triggers: Vec<TriggerRef>,
     /// Things worth knowing about how it was made.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
@@ -379,6 +498,14 @@ impl PlacementIndex {
         });
         self.unplaced
             .sort_by(|a, b| (&a.map, &a.reference).cmp(&(&b.map, &b.reference)));
+        self.triggers.sort_by(|a, b| {
+            (&a.map, a.elevation, a.hex, &a.reference).cmp(&(
+                &b.map,
+                b.elevation,
+                b.hex,
+                &b.reference,
+            ))
+        });
     }
 }
 
@@ -399,10 +526,103 @@ pub fn read(out: &Path) -> Result<Option<PlacementIndex>, PlacementError> {
     PlacementIndex::from_text(&text).map(Some)
 }
 
+// ---- Enable groups -----------------------------------------------------------
+
+/// What [`group_members`] needs to know about one reference.
+#[derive(Debug, Clone, Copy)]
+pub struct GroupSource<'a> {
+    /// The reference's form key.
+    pub form: &'a str,
+    /// Its enable parent's form key and the opposite flag.
+    pub parent: Option<(&'a str, bool)>,
+    /// The reference's own initially-disabled flag.
+    pub own_disabled: bool,
+}
+
+/// A member of an enable group (spec 8.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Member {
+    /// The root of its chain (a parent that is not itself a child, or one
+    /// outside the references given).
+    pub root: String,
+    /// The opposite flags multiplied along the chain.
+    pub opposite: bool,
+    /// The reference has an enable parent.
+    pub has_parent: bool,
+    /// Whether it starts disabled: for a child, its parent's state flipped
+    /// by the opposite flag (a child follows its parent; its own flag is
+    /// not read), for a parent its own flag. A parent outside the
+    /// references given counts as enabled.
+    pub starts_disabled: bool,
+}
+
+/// The enable groups among `refs`: every reference with an enable parent,
+/// and every reference that is some reference's parent. A chain is
+/// flattened to its root; a cycle is cut (its members count as enabled).
+pub fn group_members(refs: &[GroupSource<'_>]) -> BTreeMap<String, Member> {
+    const DEPTH: usize = 64;
+    let by: BTreeMap<&str, &GroupSource<'_>> = refs.iter().map(|r| (r.form, r)).collect();
+    let parents: BTreeSet<&str> = refs
+        .iter()
+        .filter_map(|r| r.parent.map(|(parent, _)| parent))
+        .collect();
+    let enabled = |form: &str| -> bool {
+        let mut flips = false;
+        let mut current = form;
+        for _ in 0..DEPTH {
+            let Some(r) = by.get(current) else {
+                return !flips;
+            };
+            match r.parent {
+                Some((parent, opposite)) => {
+                    flips ^= opposite;
+                    current = parent;
+                }
+                None => return !r.own_disabled ^ flips,
+            }
+        }
+        true
+    };
+    let mut out = BTreeMap::new();
+    for r in refs {
+        let has_parent = r.parent.is_some();
+        if !has_parent && !parents.contains(r.form) {
+            continue;
+        }
+        let mut opposite = false;
+        let mut root = r.form;
+        for _ in 0..DEPTH {
+            let Some((parent, o)) = by.get(root).and_then(|r| r.parent) else {
+                break;
+            };
+            opposite ^= o;
+            root = parent;
+        }
+        out.insert(
+            r.form.to_owned(),
+            Member {
+                root: root.to_owned(),
+                opposite,
+                has_parent,
+                starts_disabled: !enabled(r.form),
+            },
+        );
+    }
+    out
+}
+
+fn group_info(member: &Member) -> GroupInfo {
+    GroupInfo {
+        root: member.root.clone(),
+        opposite: member.opposite,
+        initially_enabled: !member.starts_disabled,
+    }
+}
+
 // ---- The pure builder ----------------------------------------------------
 
 /// What the join needs to know about a reference of a map's cells.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourceRef {
     /// The reference's form key.
     pub reference: String,
@@ -422,38 +642,39 @@ pub struct SourceRef {
     pub initially_disabled: bool,
     /// Deleted by the winning plugin.
     pub deleted: bool,
+    /// The source's lock: level and key base.
+    pub lock: Option<(u8, Option<String>)>,
+    /// The linked reference (`XLKR`).
+    pub linked_ref: Option<String>,
 }
 
-/// What the stage made of a reference, which decides what object the join
-/// looks for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SpotClass {
-    /// A critter.
-    Critter,
-    /// A door.
-    Door,
-    /// A container.
-    Container,
-    /// An item.
-    Item,
-    /// Scenery of any kind.
-    Scenery,
-}
-
-/// One placement the stage made, in the order it made them.
+/// One object a reference became, as the builder reports it
+/// (`map_builder::ObjectRef`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Spot {
-    /// The placed reference's form key.
+pub struct ObjectSpot {
+    /// The reference (a presence copy's own key).
     pub reference: String,
     /// Its elevation.
     pub elevation: u8,
-    /// Its hex.
+    /// The object id in the map file.
+    pub id: u32,
+    /// The hex and PID the builder wrote it with.
     pub hex: i32,
-    /// What the stage made it.
-    pub class: SpotClass,
-    /// How many objects the builder writes for it: 1, or for an item
-    /// the catalogue's count (ammunition in packs; 0 writes none).
-    pub objects: u32,
+    pub pid: u32,
+}
+
+/// A trigger volume of a map, placed by the stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TriggerSpot {
+    /// The reference's form key.
+    pub reference: String,
+    pub elevation: u8,
+    /// The hex under its centre.
+    pub hex: i32,
+    /// `box` or `sphere`, when known.
+    pub shape: Option<String>,
+    /// The hex radius that covers its footprint, when known.
+    pub radius: Option<u32>,
 }
 
 /// One top-level object of a written map.
@@ -477,6 +698,8 @@ pub struct WrittenObject {
     pub holds_items: bool,
     /// The hidden flag is set.
     pub hidden: bool,
+    /// The lock bit is set (a door's state word, a container's item word).
+    pub locked: bool,
     /// A critter's team.
     pub team: Option<i32>,
     /// A critter's AI packet.
@@ -492,180 +715,90 @@ pub struct MapInput<'a> {
     pub number: u32,
     /// Every reference of the map's cells the stage considered.
     pub references: &'a [SourceRef],
-    /// The placements the stage made, in order.
-    pub spots: &'a [Spot],
+    /// What the builder made of the stage's placements and critters, in
+    /// write order.
+    pub objects: &'a [ObjectSpot],
     /// References the stage skipped and its reason for each.
     pub skipped: &'a [(String, String)],
     /// The objects of the written map.
     pub written: &'a [WrittenObject],
+    /// Presence copies on this map: the copy's reference and the original's.
+    pub copies: &'a [(String, String)],
+    /// The map's trigger volumes.
+    pub triggers: &'a [TriggerSpot],
+    /// Critter references the catalogue marks hostile.
+    pub hostile: &'a BTreeSet<String>,
 }
 
-fn kind_of(base_kind: Option<&str>, critter: bool, class: Option<SpotClass>) -> PlacedKind {
+fn kind_of(base_kind: Option<&str>, critter: bool, written: Option<&WrittenObject>) -> PlacedKind {
     if critter {
         return PlacedKind::Critter;
     }
     if let Some(kind) = base_kind.and_then(PlacedKind::from_signature) {
         return kind;
     }
-    match class {
-        Some(SpotClass::Critter) => PlacedKind::Critter,
-        Some(SpotClass::Door) => PlacedKind::Door,
-        Some(SpotClass::Container) => PlacedKind::Container,
-        Some(SpotClass::Item) => PlacedKind::Item,
-        Some(SpotClass::Scenery) | None => PlacedKind::Scenery,
+    match written {
+        Some(w) if w.critter => PlacedKind::Critter,
+        Some(w) if w.door => PlacedKind::Door,
+        Some(w) if w.pid >> 24 == 0 && w.holds_items => PlacedKind::Container,
+        Some(w) if w.pid >> 24 == 0 => PlacedKind::Item,
+        _ => PlacedKind::Scenery,
     }
 }
-
-/// Written objects still unclaimed, by elevation and hex, in file order.
-struct Pool<'a> {
-    written: &'a [WrittenObject],
-    free: BTreeMap<(u8, i32), Vec<usize>>,
-}
-
-impl<'a> Pool<'a> {
-    fn new(written: &'a [WrittenObject]) -> Self {
-        let mut free: BTreeMap<(u8, i32), Vec<usize>> = BTreeMap::new();
-        for (i, object) in written.iter().enumerate() {
-            free.entry((object.elevation, object.hex))
-                .or_default()
-                .push(i);
-        }
-        for list in free.values_mut() {
-            list.sort_by_key(|i| written[*i].id);
-        }
-        Self { written, free }
-    }
-
-    /// The first unclaimed object at the spot that fits its class, by its
-    /// index in `written`, and the further objects an item became (its
-    /// packs: the next unclaimed objects at the hex with its PID). A
-    /// placement that finds nothing leaves the pool as it was.
-    fn claim(&mut self, spot: &Spot) -> Option<(usize, u32)> {
-        if spot.objects == 0 {
-            return None;
-        }
-        let list = self.free.get_mut(&(spot.elevation, spot.hex))?;
-        let fits = |o: &WrittenObject, strict: bool| match spot.class {
-            SpotClass::Critter => o.critter,
-            SpotClass::Door if strict => o.door,
-            SpotClass::Door => !o.critter && !o.exit_grid,
-            // Items and containers are item prototypes, everything else
-            // scenery or walls.
-            SpotClass::Item | SpotClass::Container => {
-                o.pid >> 24 == 0 && !o.critter && !o.exit_grid && !o.door
-            }
-            SpotClass::Scenery => o.pid >> 24 != 0 && !o.critter && !o.exit_grid && !o.door,
-        };
-        let strict = matches!(spot.class, SpotClass::Door);
-        let at = list
-            .iter()
-            .position(|i| fits(&self.written[*i], strict))
-            .or_else(|| {
-                strict
-                    .then(|| list.iter().position(|i| fits(&self.written[*i], false)))
-                    .flatten()
-            })?;
-        let index = list.remove(at);
-        Some((index, self.take_packs(spot, index)))
-    }
-
-    /// Claims the further objects a spot became after its first (an
-    /// item's packs: the next ids at the hex, with its PID); returns how
-    /// many it found.
-    fn take_packs(&mut self, spot: &Spot, first: usize) -> u32 {
-        let object = &self.written[first];
-        let Some(list) = self.free.get_mut(&(object.elevation, object.hex)) else {
-            return 0;
-        };
-        let mut packs = 0;
-        let mut id = object.id;
-        while packs + 1 < spot.objects
-            && let Some(at) = list
-                .iter()
-                .position(|i| self.written[*i].pid == object.pid && self.written[*i].id == id + 1)
-        {
-            id = self.written[list.remove(at)].id;
-            packs += 1;
-        }
-        packs
-    }
-
-    /// For an item or container the builder moved off a link's grid (to
-    /// the nearest free walkable hex, where no other placement stands):
-    /// the nearest unclaimed item-category object within
-    /// [`MOVED_RADIUS`] steps at a hex no placement names, ties to the
-    /// lower object id.
-    fn claim_moved(&mut self, spot: &Spot, named: &BTreeSet<(u8, i32)>) -> Option<(usize, u32)> {
-        if spot.objects == 0 || !matches!(spot.class, SpotClass::Item | SpotClass::Container) {
-            return None;
-        }
-        let written = self.written;
-        let best = self
-            .free
-            .iter()
-            .filter(|((e, hex), _)| *e == spot.elevation && !named.contains(&(*e, *hex)))
-            .flat_map(|(_, list)| list.iter().copied())
-            .filter(|i| {
-                let o = &written[*i];
-                o.pid >> 24 == 0 && !o.door && !o.exit_grid && !o.critter
-            })
-            .filter_map(|i| {
-                let d =
-                    vault_formats::geometry::HexGrid::lattice_distance(spot.hex, written[i].hex)
-                        .ok()?;
-                (d <= MOVED_RADIUS).then_some((d, written[i].id, i))
-            })
-            .min()?;
-        let (_, _, index) = best;
-        let object = &written[index];
-        if let Some(list) = self.free.get_mut(&(object.elevation, object.hex)) {
-            list.retain(|i| *i != index);
-        }
-        Some((index, self.take_packs(spot, index)))
-    }
-}
-
-/// How far (hex steps) the join looks for an item or container the builder
-/// moved off a link (`map_builder`'s link clearance moves them to the
-/// nearest free walkable hex).
-pub const MOVED_RADIUS: i32 = 12;
 
 /// Builds the index from plain inputs.
 ///
 /// `referenced` names references that are listed whatever their kind
 /// (those a script, quest or package points at: `mir::Records::referenced_refs`).
 ///
-/// The join of a placement to its object takes the objects of the written
-/// map at the placement's elevation and hex in file order, and gives each
-/// placement, in the stage's order, the first that fits its class (a
-/// critter is a critter, a door a door when one is there, anything else a
-/// non-critter, non-door, non-exit-grid). The stage writes objects in
-/// placement order, so the n-th placement at a hex gets the n-th object;
-/// an item also takes the packs written after it (same hex, same PID,
-/// the next ids), counted in `pieces`. The builder moves a ground item or
-/// a container that stands on a link's keep-clear hexes to the nearest
-/// free walkable hex, where no other placement stands: a placement left
-/// without an object then takes the nearest unclaimed item-category object
-/// within [`MOVED_RADIUS`] steps at a hex no placement names (counted in
-/// the notes), and its `hex` is that object's. Placements that find none
-/// are listed without an object id, and counted in the notes.
+/// Each reference's objects are the builder's exact list: the first gives
+/// the entry's `object_id`, `pid` and `hex` (read from `written`, which
+/// must bear out the builder's hex and PID, else the notes count the
+/// disagreement), the count its `pieces`. Presence copies are placed
+/// entries of their own, described as their original with the
+/// original's enable and lock data left off.
 pub fn build(
     layer: &str,
     game: &str,
     maps: &[MapInput<'_>],
     referenced: &BTreeSet<String>,
 ) -> PlacementIndex {
-    let parents: BTreeSet<&str> = maps
+    let all: BTreeMap<&str, &SourceRef> = maps
         .iter()
         .flat_map(|m| m.references.iter())
-        .filter_map(|r| r.enable_parent.as_ref())
-        .map(|p| p.reference.as_str())
+        .map(|r| (r.reference.as_str(), r))
+        .collect();
+    let group_sources: Vec<GroupSource<'_>> = all
+        .values()
+        .map(|r| GroupSource {
+            form: &r.reference,
+            parent: r
+                .enable_parent
+                .as_ref()
+                .map(|p| (p.reference.as_str(), p.opposite)),
+            own_disabled: r.initially_disabled,
+        })
+        .collect();
+    let groups = group_members(&group_sources);
+    let linked: BTreeSet<&str> = all
+        .values()
+        .filter_map(|r| r.linked_ref.as_deref())
         .collect();
     let relevant = |kind: PlacedKind, source: Option<&SourceRef>, reference: &str| {
         kind != PlacedKind::Scenery
-            || source.is_some_and(|s| s.enable_parent.is_some())
-            || parents.contains(reference)
+            || groups.contains_key(reference)
+            || source.is_some_and(|s| s.linked_ref.is_some())
+            || linked.contains(reference)
             || referenced.contains(reference)
+    };
+    let lock_of = |source: Option<&SourceRef>, written: Option<&WrittenObject>| {
+        source
+            .and_then(|s| s.lock.as_ref())
+            .map(|(level, key)| LockInfo {
+                locked: written.is_some_and(|w| w.locked),
+                level: *level,
+                key: key.clone(),
+            })
     };
     let mut index = PlacementIndex {
         schema_version: SCHEMA_VERSION,
@@ -675,6 +808,7 @@ pub fn build(
         maps: Vec::new(),
         placed: Vec::new(),
         unplaced: Vec::new(),
+        triggers: Vec::new(),
         notes: Vec::new(),
     };
     for map in maps {
@@ -688,97 +822,113 @@ pub fn build(
             .iter()
             .map(|r| (r.reference.as_str(), r))
             .collect();
+        let copies: BTreeMap<&str, &str> = map
+            .copies
+            .iter()
+            .map(|(copy, original)| (copy.as_str(), original.as_str()))
+            .collect();
         // The first reason given for a reference.
         let mut skipped: BTreeMap<&str, &str> = BTreeMap::new();
         for (r, why) in map.skipped {
             skipped.entry(r.as_str()).or_insert(why.as_str());
         }
+        let written: BTreeMap<(u8, u32), &WrittenObject> = map
+            .written
+            .iter()
+            .map(|o| ((o.elevation, o.id), o))
+            .collect();
 
-        // Every placement claims its object, in order, so that one the
-        // index leaves out does not hand its object to a later one; then
-        // the items and containers the builder moved off a link take the
-        // nearest object left at a hex no placement names.
-        let mut pool = Pool::new(map.written);
-        let mut claims: Vec<Option<(usize, u32)>> =
-            map.spots.iter().map(|spot| pool.claim(spot)).collect();
-        let named: BTreeSet<(u8, i32)> = map.spots.iter().map(|s| (s.elevation, s.hex)).collect();
-        let mut moved = 0usize;
-        for (spot, claim) in map.spots.iter().zip(claims.iter_mut()) {
-            if claim.is_none() {
-                *claim = pool.claim_moved(spot, &named);
-                moved += usize::from(claim.is_some());
+        // The builder's objects, by reference, in write order.
+        let mut order: Vec<&str> = Vec::new();
+        let mut spots: BTreeMap<&str, Vec<&ObjectSpot>> = BTreeMap::new();
+        for spot in map.objects {
+            let list = spots.entry(spot.reference.as_str()).or_default();
+            if list.is_empty() {
+                order.push(spot.reference.as_str());
             }
+            list.push(spot);
         }
-        let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
         let mut unmatched = 0usize;
-        let mut empty = 0usize;
-        for (spot, claim) in map.spots.iter().zip(&claims) {
-            let object = claim.map(|(i, _)| &map.written[i]);
-            let packs = claim.map_or(0, |(_, packs)| packs);
-            if let Some(&at) = seen.get(spot.reference.as_str()) {
-                index.placed[at].pieces += 1 + packs;
-                continue;
+        let mut disagree = 0usize;
+        let mut placed_refs: BTreeSet<&str> = BTreeSet::new();
+        for reference in order {
+            let list = &spots[reference];
+            let first = list[0];
+            let object = written.get(&(first.elevation, first.id)).copied();
+            match object {
+                None => unmatched += 1,
+                Some(w) if w.hex != first.hex || w.pid != first.pid => disagree += 1,
+                Some(_) => {}
             }
-            let source = sources.get(spot.reference.as_str()).copied();
+            let original = copies.get(reference).copied();
+            let source = match original {
+                Some(original) => all.get(original).copied(),
+                None => sources
+                    .get(reference)
+                    .copied()
+                    .or_else(|| all.get(reference).copied()),
+            };
             let base_kind = source.and_then(|s| s.base_kind.as_deref());
-            let critter = source.is_some_and(|s| s.critter) || spot.class == SpotClass::Critter;
-            let kind = kind_of(base_kind, critter, Some(spot.class));
-            if object.is_none() {
-                if spot.objects == 0 {
-                    empty += 1;
-                } else {
-                    unmatched += 1;
-                }
-            }
-            if !relevant(kind, source, &spot.reference) {
+            let critter = source.is_some_and(|s| s.critter) || object.is_some_and(|w| w.critter);
+            let kind = kind_of(base_kind, critter, object);
+            placed_refs.insert(reference);
+            if original.is_none() && !relevant(kind, source, reference) {
                 continue;
             }
-            seen.insert(spot.reference.as_str(), index.placed.len());
+            // A copy is its original's twin, without the original's
+            // enable, lock or link data.
+            let own = original.is_none();
             index.placed.push(PlacedRef {
                 map: map.stem.to_owned(),
                 map_number: map.number,
-                elevation: spot.elevation,
-                hex: object.map_or(spot.hex, |o| o.hex),
-                object_id: object.map(|o| o.id),
-                pid: object.map(|o| o.pid),
+                elevation: first.elevation,
+                hex: object.map_or(first.hex, |o| o.hex),
+                object_id: Some(first.id),
+                pid: Some(object.map_or(first.pid, |o| o.pid)),
                 kind,
                 critter: kind == PlacedKind::Critter,
-                pieces: 1 + packs,
-                reference: Some(spot.reference.clone()),
+                pieces: list.len() as u32,
+                piece_ids: if list.len() > 1 {
+                    list.iter().map(|s| s.id).collect()
+                } else {
+                    Vec::new()
+                },
+                reference: Some(reference.to_owned()),
                 editor_id: source.and_then(|s| s.editor_id.clone()),
                 base: source.and_then(|s| s.base.clone()),
                 base_kind: source.and_then(|s| s.base_kind.clone()),
                 base_editor_id: source.and_then(|s| s.base_editor_id.clone()),
-                enable_parent: source.and_then(|s| s.enable_parent.clone()),
-                initially_disabled: source.is_some_and(|s| s.initially_disabled),
+                enable_parent: source.filter(|_| own).and_then(|s| s.enable_parent.clone()),
+                group: source
+                    .filter(|_| own)
+                    .and_then(|s| groups.get(&s.reference))
+                    .map(group_info),
+                initially_disabled: own && source.is_some_and(|s| s.initially_disabled),
                 hidden: object.is_some_and(|o| o.hidden),
+                lock: lock_of(source.filter(|_| own), object),
+                linked_ref: source.filter(|_| own).and_then(|s| s.linked_ref.clone()),
                 team: object.and_then(|o| o.team),
                 ai_packet: object.and_then(|o| o.ai_packet),
+                hostile: map.hostile.contains(reference),
+                presence_of: original.map(str::to_owned),
             });
-        }
-        if moved > 0 {
-            index.notes.push(format!(
-                "{}: {moved} items or containers the builder moved off a link matched to the \
-                 nearest free object within {MOVED_RADIUS} steps",
-                map.stem
-            ));
         }
         if unmatched > 0 {
             index.notes.push(format!(
-                "{}: {unmatched} placements found no object at their hex in the written map",
+                "{}: {unmatched} references name an object id the written map does not hold",
                 map.stem
             ));
         }
-        if empty > 0 {
+        if disagree > 0 {
             index.notes.push(format!(
-                "{}: {empty} items the catalogue gives no object (a count of 0)",
+                "{}: {disagree} references name an object whose hex or PID the written map \
+                 does not bear out",
                 map.stem
             ));
         }
 
-        let placed: BTreeSet<&str> = map.spots.iter().map(|s| s.reference.as_str()).collect();
         for source in map.references {
-            if placed.contains(source.reference.as_str()) {
+            if placed_refs.contains(source.reference.as_str()) {
                 continue;
             }
             let kind = kind_of(source.base_kind.as_deref(), source.critter, None);
@@ -803,9 +953,32 @@ pub fn build(
                 base_kind: source.base_kind.clone(),
                 base_editor_id: source.base_editor_id.clone(),
                 enable_parent: source.enable_parent.clone(),
+                group: groups.get(&source.reference).map(group_info),
                 initially_disabled: source.initially_disabled,
+                lock: lock_of(Some(source), None),
+                linked_ref: source.linked_ref.clone(),
                 reason,
                 detail,
+            });
+        }
+
+        for trigger in map.triggers {
+            let source = sources.get(trigger.reference.as_str()).copied();
+            index.triggers.push(TriggerRef {
+                map: map.stem.to_owned(),
+                map_number: map.number,
+                elevation: trigger.elevation,
+                hex: trigger.hex,
+                reference: trigger.reference.clone(),
+                shape: trigger.shape.clone(),
+                radius: trigger.radius,
+                editor_id: source.and_then(|s| s.editor_id.clone()),
+                base: source.and_then(|s| s.base.clone()),
+                base_kind: source.and_then(|s| s.base_kind.clone()),
+                base_editor_id: source.and_then(|s| s.base_editor_id.clone()),
+                enable_parent: source.and_then(|s| s.enable_parent.clone()),
+                group: groups.get(&trigger.reference).map(group_info),
+                linked_ref: source.and_then(|s| s.linked_ref.clone()),
             });
         }
     }
@@ -880,11 +1053,17 @@ pub fn read_written_maps(layer_dir: &Path) -> Result<(String, Vec<WrittenMap>), 
         for (elevation, list) in parsed.objects.elevations.iter().enumerate() {
             for object in list {
                 let Some(hex) = object.hex else { continue };
-                let (door, exit_grid, team, ai_packet) = match &object.state {
-                    ObjectState::Critter(state) => (false, false, Some(state.team), Some(state.ai)),
-                    ObjectState::Other { detail, .. } => (
+                let (door, exit_grid, locked, team, ai_packet) = match &object.state {
+                    ObjectState::Critter(state) => {
+                        (false, false, false, Some(state.team), Some(state.ai))
+                    }
+                    ObjectState::Other { word, detail } => (
                         matches!(detail, ObjectDetail::Door(_)),
                         matches!(detail, ObjectDetail::ExitGrid { .. }),
+                        match detail {
+                            ObjectDetail::Door(state) => state.0 & LockFlags::LOCKED.0 != 0,
+                            _ => object.pid >> 24 == 0 && word & LockFlags::LOCKED.0 != 0,
+                        },
                         None,
                         None,
                     ),
@@ -900,6 +1079,7 @@ pub fn read_written_maps(layer_dir: &Path) -> Result<(String, Vec<WrittenMap>), 
                     holds_items: object.pid >> 24 == 0
                         && (!object.inventory.is_empty() || object.inventory_capacity > 0),
                     hidden: object.flags.contains(BasicFlags::HIDDEN),
+                    locked,
                     team,
                     ai_packet,
                 });
@@ -921,6 +1101,17 @@ pub fn read_written_maps(layer_dir: &Path) -> Result<(String, Vec<WrittenMap>), 
 
 // ---- The stage's call ------------------------------------------------------
 
+/// What the stage changed on a reference before it reached the slicer
+/// (`enable_groups`, `crate::map::apply_enable_groups`): the source's own
+/// flag and enable parent, which the index keeps describing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Original {
+    /// The reference's own initially-disabled flag.
+    pub initially_disabled: bool,
+    /// Its enable parent.
+    pub enable_parent: Option<mir::EnableParentDoc>,
+}
+
 /// What the map stage holds for one map when it writes its output.
 pub struct StageMap<'a> {
     /// The map's file stem (`MapRun::stem`; `SliceSpec::map_stem` on the
@@ -930,27 +1121,27 @@ pub struct StageMap<'a> {
     /// (`plan.maps[m].references`, the scene's references on the one-map
     /// path), disabled and deleted ones included.
     pub references: &'a [mir::Reference],
-    /// Per elevation, the placements the slicer made, as handed to the
-    /// builder (`(run.elevation, run.placements.as_slice())` of each run;
-    /// `(0, placements)` on the one-map path).
-    pub elevations: Vec<(u8, &'a [map_builder::Placement])>,
-    /// The map's build report: its critters and the skipped critters
-    /// (`BuiltMap::report`, `Built::report`). The map's number is read
-    /// from the written layer.
-    pub report: &'a map_builder::BuildReport,
-    /// The elevation of each of `report.critters`
-    /// (`BuiltMap::critter_elevations`); empty: every critter is on
-    /// elevation 0 (the one-map path).
-    pub critter_elevations: &'a [u8],
-    /// The catalogue handed to the builder (loot on): how many objects
-    /// each ground item becomes.
-    pub catalogue: Option<&'a map_builder::Catalogue>,
+    /// Every object the builder made of the map's placements and critters
+    /// (`BuiltMap::objects`, `Built::objects`).
+    pub objects: &'a [map_builder::ObjectRef],
+    /// The critters the builder did not place (`BuildReport::skipped_critters`).
+    pub skipped_critters: &'a [map_builder::SkippedCritter],
     /// References the stage itself left out, with its words: the slicer's
-    /// skips (`Sliced::skipped`, every elevation's) and the people the map
-    /// stage did not hand to the builder (`map::PersonSkip`). The first
-    /// reason given for a reference is kept; one placed elsewhere is not
-    /// listed.
+    /// skips (`Sliced::skipped`, every elevation's), the people the map
+    /// stage did not hand to the builder (`map::PersonSkip`) and the
+    /// enable-group children it could not place. The first reason given
+    /// for a reference is kept; one placed elsewhere is not listed.
     pub skipped: Vec<(String, String)>,
+    /// Presence copies on this map: the copy's reference and the
+    /// original's.
+    pub copies: Vec<(String, String)>,
+    /// The map's trigger volumes ([`trigger_spots`]).
+    pub triggers: Vec<TriggerSpot>,
+    /// Critter references the catalogue marks hostile.
+    pub hostile: BTreeSet<String>,
+    /// References whose flag and enable parent the stage changed for the
+    /// slicer: what the source says.
+    pub originals: BTreeMap<String, Original>,
 }
 
 /// A slicer run's skips as [`StageMap::skipped`] takes them.
@@ -961,51 +1152,149 @@ pub fn slicer_skips(sliced: &map_slicer::Sliced) -> impl Iterator<Item = (String
         .map(|s| (s.reference.clone(), format!("slicer: {}", s.reason)))
 }
 
+/// The hostile critters of a catalogue report, by reference.
+pub fn hostile_of(report: Option<&crate::catalogue::CatalogueReport>) -> BTreeSet<String> {
+    report
+        .map(|r| {
+            r.people
+                .iter()
+                .filter(|p| p.side.hostile)
+                .map(|p| p.reference.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A trigger volume's primitive: the shape and the extent along the
+/// reference's local X, Y and Z, as stored (`fnv_esm::Primitive`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TriggerBounds {
+    /// `box` or `sphere`.
+    pub shape: &'static str,
+    /// The extents; a box reaches from `-half` to `+half` along each axis
+    /// (public documentation reads the stored bounds as half-extents; the
+    /// reading is not verified), a sphere's first is its radius.
+    pub half: [f32; 3],
+}
+
+/// The primitive of a trigger reference. The MIR's `Reference` carries
+/// only `trigger_volume` today (the primitive's bounds stay in the ESM
+/// reader), so this finds none: a trigger is listed with its hex and no
+/// radius until the MIR adds the field.
+pub fn trigger_bounds(_reference: &mir::Reference) -> Option<TriggerBounds> {
+    None
+}
+
+/// The hex radius around the hex under a volume's centre that covers its
+/// footprint: the largest hex distance from the centre's hex to a corner
+/// of the box (rotated by `yaw`, scaled), or to the four points a sphere's
+/// radius reaches. `None` when the centre or a corner is off the map.
+pub fn project_trigger(
+    frame: &map_builder::walk::Frame,
+    centre: [f32; 2],
+    yaw: f32,
+    scale: f32,
+    bounds: TriggerBounds,
+) -> Option<u32> {
+    let from = frame.hex_of_source(f64::from(centre[0]), f64::from(centre[1]))?;
+    let (sin, cos) = (f64::from(yaw).sin(), f64::from(yaw).cos());
+    let [hx, hy, _] = bounds.half.map(|h| f64::from(h) * f64::from(scale));
+    let corners: Vec<[f64; 2]> = if bounds.shape == "sphere" {
+        vec![[hx, 0.0], [-hx, 0.0], [0.0, hx], [0.0, -hx]]
+    } else {
+        vec![[hx, hy], [hx, -hy], [-hx, hy], [-hx, -hy]]
+    };
+    let mut radius = 0;
+    for [dx, dy] in corners {
+        let x = f64::from(centre[0]) + dx * cos - dy * sin;
+        let y = f64::from(centre[1]) + dx * sin + dy * cos;
+        let to = frame.hex_of_source(x, y)?;
+        radius = radius.max(vault_formats::HexGrid::lattice_distance(from, to).ok()?);
+    }
+    u32::try_from(radius).ok()
+}
+
+/// The trigger volumes among `references` as the index lists them: the
+/// hex under each one's centre, on the elevation `elevation_of` names,
+/// with the radius and shape when [`trigger_bounds`] knows them. A deleted
+/// reference or one off the map is left out.
+pub fn trigger_spots(
+    references: &[mir::Reference],
+    frame: &map_builder::walk::Frame,
+    elevation_of: impl Fn(&mir::Reference) -> u8,
+) -> Vec<TriggerSpot> {
+    let mut out: Vec<TriggerSpot> = references
+        .iter()
+        .filter(|r| r.trigger_volume && !r.flags.deleted && r.transform.is_finite())
+        .filter_map(|r| {
+            let [x, y, _] = r.transform.position;
+            let hex = frame.hex_of_source(f64::from(x), f64::from(y))?;
+            let bounds = trigger_bounds(r);
+            Some(TriggerSpot {
+                reference: r.form.to_string(),
+                elevation: elevation_of(r),
+                hex,
+                shape: bounds.map(|b| b.shape.to_owned()),
+                radius: bounds.and_then(|b| {
+                    project_trigger(frame, [x, y], r.transform.rotation[2], r.transform.scale, b)
+                }),
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.reference.cmp(&b.reference));
+    out.dedup_by(|a, b| a.reference == b.reference);
+    out
+}
+
 impl<'a> StageMap<'a> {
     /// One map of a layer, from its built map.
     pub fn of_layer(
         stem: &'a str,
         references: &'a [mir::Reference],
-        elevations: Vec<(u8, &'a [map_builder::Placement])>,
         built: &'a map_builder::BuiltMap,
-        catalogue: Option<&'a map_builder::Catalogue>,
         skipped: Vec<(String, String)>,
     ) -> Self {
         StageMap {
             stem,
             references,
-            elevations,
-            report: &built.report,
-            critter_elevations: &built.critter_elevations,
-            catalogue,
+            objects: &built.objects,
+            skipped_critters: &built.report.skipped_critters,
             skipped,
+            copies: Vec::new(),
+            triggers: Vec::new(),
+            hostile: BTreeSet::new(),
+            originals: BTreeMap::new(),
         }
     }
 }
 
-fn source_of(reference: &mir::Reference) -> SourceRef {
+fn source_of(reference: &mir::Reference, originals: &BTreeMap<String, Original>) -> SourceRef {
+    let key = reference.form.to_string();
+    let (initially_disabled, parent) = match originals.get(&key) {
+        Some(o) => (o.initially_disabled, o.enable_parent.as_ref()),
+        None => (
+            reference.flags.initially_disabled,
+            reference.enable_parent.as_ref(),
+        ),
+    };
     SourceRef {
-        reference: reference.form.to_string(),
+        reference: key,
         editor_id: reference.editor_id.clone(),
         base: Some(reference.base.to_string()),
         base_kind: reference.base_kind.clone(),
         base_editor_id: reference.base_editor_id.clone(),
         critter: !matches!(reference.kind, mir::RefKind::Object),
-        enable_parent: reference.enable_parent.as_ref().map(|p| EnableParent {
+        enable_parent: parent.map(|p| EnableParent {
             reference: p.reference.to_string(),
             opposite: p.opposite,
         }),
-        initially_disabled: reference.flags.initially_disabled,
+        initially_disabled,
         deleted: reference.flags.deleted,
-    }
-}
-
-fn class_of(role: map_builder::Role) -> SpotClass {
-    match role {
-        map_builder::Role::Door => SpotClass::Door,
-        map_builder::Role::Container => SpotClass::Container,
-        map_builder::Role::Item => SpotClass::Item,
-        _ => SpotClass::Scenery,
+        lock: reference
+            .lock
+            .as_ref()
+            .map(|l| (l.level, l.key.as_ref().map(ToString::to_string))),
+        linked_ref: reference.linked_ref.as_ref().map(ToString::to_string),
     }
 }
 
@@ -1014,14 +1303,18 @@ struct Owned {
     stem: String,
     number: u32,
     references: Vec<SourceRef>,
-    spots: Vec<Spot>,
+    objects: Vec<ObjectSpot>,
     skipped: Vec<(String, String)>,
     written: Vec<WrittenObject>,
+    copies: Vec<(String, String)>,
+    triggers: Vec<TriggerSpot>,
+    hostile: BTreeSet<String>,
 }
 
 /// The map stage's one call, after it has written the layer to
-/// `layer_dir`: joins its references, placements and critters with the
-/// objects of the written maps and writes `<out>/map-placements.json`.
+/// `layer_dir`: joins its references and the builder's exact object map
+/// with the objects of the written maps and writes
+/// `<out>/map-placements.json`.
 ///
 /// `referenced` is `mir::Records::referenced_refs()` (references that a
 /// script, quest or package points at); an empty set is fine.
@@ -1044,40 +1337,7 @@ pub fn write_for_stage(
             .iter()
             .find(|w| w.stem == map.stem)
             .ok_or_else(|| fail(map.stem, "the map is not in the written layer"))?;
-        let mut spots = Vec::new();
-        for (elevation, placements) in &map.elevations {
-            for placement in *placements {
-                let objects = match map
-                    .catalogue
-                    .and_then(|c| c.placed.get(&placement.reference))
-                {
-                    Some(map_builder::PlacedLoot::Item { count, .. })
-                        if placement.role == map_builder::Role::Item =>
-                    {
-                        *count
-                    }
-                    _ => 1,
-                };
-                spots.push(Spot {
-                    reference: placement.reference.clone(),
-                    elevation: *elevation,
-                    hex: placement.hex,
-                    class: class_of(placement.role),
-                    objects,
-                });
-            }
-        }
-        for (n, critter) in map.report.critters.iter().enumerate() {
-            spots.push(Spot {
-                reference: critter.reference.clone(),
-                elevation: map.critter_elevations.get(n).copied().unwrap_or(0),
-                hex: critter.hex,
-                class: SpotClass::Critter,
-                objects: 1,
-            });
-        }
         let mut skipped: Vec<(String, String)> = map
-            .report
             .skipped_critters
             .iter()
             .map(|s| (s.reference.clone(), s.reason.clone()))
@@ -1086,10 +1346,27 @@ pub fn write_for_stage(
         owned.push(Owned {
             stem: map.stem.to_owned(),
             number: found.number,
-            references: map.references.iter().map(source_of).collect(),
-            spots,
+            references: map
+                .references
+                .iter()
+                .map(|r| source_of(r, &map.originals))
+                .collect(),
+            objects: map
+                .objects
+                .iter()
+                .map(|o| ObjectSpot {
+                    reference: o.reference.clone(),
+                    elevation: o.elevation,
+                    id: o.id,
+                    hex: o.hex,
+                    pid: o.pid,
+                })
+                .collect(),
             skipped,
             written: found.objects.clone(),
+            copies: map.copies.clone(),
+            triggers: map.triggers.clone(),
+            hostile: map.hostile.clone(),
         });
     }
     let inputs: Vec<MapInput<'_>> = owned
@@ -1098,9 +1375,12 @@ pub fn write_for_stage(
             stem: &o.stem,
             number: o.number,
             references: &o.references,
-            spots: &o.spots,
+            objects: &o.objects,
             skipped: &o.skipped,
             written: &o.written,
+            copies: &o.copies,
+            triggers: &o.triggers,
+            hostile: &o.hostile,
         })
         .collect();
     let mut index = build(&layer_name, game.id(), &inputs, &referenced);
@@ -1175,6 +1455,7 @@ pub fn reconstruct(
         maps: Vec::new(),
         placed: Vec::new(),
         unplaced: Vec::new(),
+        triggers: Vec::new(),
         notes: vec![
             "reconstructed from the written maps: no references, bases or enable parents, and \
              the kinds are read off the objects"
@@ -1218,17 +1499,11 @@ pub fn reconstruct(
                 pid: Some(object.pid),
                 kind,
                 critter: object.critter,
-                pieces: 1,
                 reference,
-                editor_id: None,
-                base: None,
-                base_kind: None,
-                base_editor_id: None,
-                enable_parent: None,
-                initially_disabled: false,
                 hidden: object.hidden,
                 team: object.team,
                 ai_packet: object.ai_packet,
+                ..PlacedRef::default()
             });
         }
     }
@@ -1261,392 +1536,4 @@ fn people_of(out: &Path, stem: &str) -> Vec<(i32, String)> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn source(reference: &str, base_kind: &str) -> SourceRef {
-        SourceRef {
-            reference: reference.to_owned(),
-            editor_id: Some(format!("ed{reference}")),
-            base: Some(format!("base:{reference}")),
-            base_kind: Some(base_kind.to_owned()),
-            base_editor_id: None,
-            critter: matches!(base_kind, "NPC_" | "CREA"),
-            enable_parent: None,
-            initially_disabled: false,
-            deleted: false,
-        }
-    }
-
-    fn spot(reference: &str, elevation: u8, hex: i32, class: SpotClass) -> Spot {
-        Spot {
-            reference: reference.to_owned(),
-            elevation,
-            hex,
-            class,
-            objects: 1,
-        }
-    }
-
-    fn object(elevation: u8, hex: i32, id: u32) -> WrittenObject {
-        WrittenObject {
-            elevation,
-            hex,
-            id,
-            pid: 0x0200_0000 + id,
-            critter: false,
-            door: false,
-            exit_grid: false,
-            holds_items: false,
-            hidden: false,
-            team: None,
-            ai_packet: None,
-        }
-    }
-
-    fn critter(elevation: u8, hex: i32, id: u32, team: i32) -> WrittenObject {
-        WrittenObject {
-            pid: 0x0100_0000 + id,
-            critter: true,
-            team: Some(team),
-            ai_packet: Some(3),
-            ..object(elevation, hex, id)
-        }
-    }
-
-    fn door(elevation: u8, hex: i32, id: u32) -> WrittenObject {
-        WrittenObject {
-            door: true,
-            ..object(elevation, hex, id)
-        }
-    }
-
-    struct Data {
-        references: Vec<SourceRef>,
-        spots: Vec<Spot>,
-        skipped: Vec<(String, String)>,
-        written: Vec<WrittenObject>,
-    }
-
-    fn data() -> Data {
-        let mut child = source("p:000007", "STAT");
-        child.enable_parent = Some(EnableParent {
-            reference: "p:000006".to_owned(),
-            opposite: true,
-        });
-        let mut disabled_npc = source("p:000008", "NPC_");
-        disabled_npc.initially_disabled = true;
-        let mut deleted_door = source("p:000009", "DOOR");
-        deleted_door.deleted = true;
-        let mut parent = source("p:000006", "ACTI");
-        parent.initially_disabled = true;
-        Data {
-            references: vec![
-                source("p:000001", "DOOR"),
-                source("p:000002", "NPC_"),
-                source("p:000003", "CONT"),
-                source("p:000004", "WEAP"),
-                source("p:000005", "STAT"),
-                parent,
-                child,
-                disabled_npc,
-                deleted_door,
-                source("p:00000a", "CREA"),
-                source("p:00000b", "TERM"),
-                source("p:00000c", "MISC"),
-            ],
-            spots: vec![
-                spot("p:000005", 0, 100, SpotClass::Scenery),
-                spot("p:000001", 0, 100, SpotClass::Door),
-                spot("p:000003", 0, 205, SpotClass::Container),
-                spot("p:000004", 0, 205, SpotClass::Item),
-                spot("p:000007", 1, 300, SpotClass::Scenery),
-                spot("p:000007", 1, 301, SpotClass::Scenery),
-                spot("p:000002", 0, 150, SpotClass::Critter),
-                spot("p:00000b", 0, 400, SpotClass::Scenery),
-            ],
-            skipped: vec![("p:00000a".to_owned(), "no sprite set".to_owned())],
-            written: vec![
-                object(0, 100, 1),
-                door(0, 100, 2),
-                WrittenObject {
-                    pid: 0x0000_0103,
-                    ..object(0, 205, 3)
-                },
-                WrittenObject {
-                    pid: 0x0000_0104,
-                    ..object(0, 205, 4)
-                },
-                object(1, 300, 5),
-                object(1, 301, 6),
-                critter(0, 150, 7, 4),
-                WrittenObject {
-                    exit_grid: true,
-                    ..object(0, 400, 8)
-                },
-                object(0, 400, 9),
-            ],
-        }
-    }
-
-    fn built(d: &Data) -> PlacementIndex {
-        let maps = [MapInput {
-            stem: "town",
-            number: 151,
-            references: &d.references,
-            spots: &d.spots,
-            skipped: &d.skipped,
-            written: &d.written,
-        }];
-        build("Test layer", "fo3", &maps, &BTreeSet::new())
-    }
-
-    #[test]
-    fn the_join_gives_each_placement_its_own_object() {
-        let index = built(&data());
-        let find = |r: &str| {
-            index
-                .placed
-                .iter()
-                .find(|p| p.reference.as_deref() == Some(r))
-                .unwrap_or_else(|| panic!("{r} missing"))
-        };
-        // The plain static at hex 100 is not listed, but it took object 1:
-        // the door gets object 2.
-        assert_eq!(find("p:000001").object_id, Some(2));
-        assert_eq!(find("p:000001").kind, PlacedKind::Door);
-        assert_eq!(find("p:000003").object_id, Some(3));
-        assert_eq!(find("p:000004").object_id, Some(4));
-        assert_eq!(find("p:000004").kind, PlacedKind::Item);
-        let npc = find("p:000002");
-        assert_eq!(
-            (npc.object_id, npc.team, npc.ai_packet),
-            (Some(7), Some(4), Some(3))
-        );
-        assert!(npc.critter);
-        // The terminal skips the exit grid and takes the object after it.
-        assert_eq!(find("p:00000b").object_id, Some(9));
-        assert_eq!(find("p:00000b").kind, PlacedKind::Terminal);
-        assert!(index.notes.is_empty(), "{:?}", index.notes);
-    }
-
-    #[test]
-    fn scenery_is_listed_only_when_enable_state_needs_it() {
-        let index = built(&data());
-        let refs: Vec<&str> = index
-            .placed
-            .iter()
-            .filter_map(|p| p.reference.as_deref())
-            .collect();
-        assert!(!refs.contains(&"p:000005"), "{refs:?}");
-        let child = index
-            .placed
-            .iter()
-            .find(|p| p.reference.as_deref() == Some("p:000007"))
-            .expect("the enable child");
-        assert_eq!(child.kind, PlacedKind::Scenery);
-        assert_eq!(child.pieces, 2);
-        assert_eq!(
-            (child.elevation, child.hex, child.object_id),
-            (1, 300, Some(5))
-        );
-        assert_eq!(child.enable_parent.as_ref().map(|p| p.opposite), Some(true));
-        // A caller may name more.
-        let d = data();
-        let maps = [MapInput {
-            stem: "town",
-            number: 151,
-            references: &d.references,
-            spots: &d.spots,
-            skipped: &d.skipped,
-            written: &d.written,
-        }];
-        let named: BTreeSet<String> = ["p:000005".to_owned()].into();
-        let index = build("Test layer", "fo3", &maps, &named);
-        assert!(
-            index
-                .placed
-                .iter()
-                .any(|p| p.reference.as_deref() == Some("p:000005"))
-        );
-    }
-
-    #[test]
-    fn what_is_left_off_is_listed_with_its_reason() {
-        let index = built(&data());
-        let reason = |r: &str| {
-            index
-                .unplaced
-                .iter()
-                .find(|u| u.reference == r)
-                .map(|u| (u.reason, u.detail.clone()))
-        };
-        assert_eq!(reason("p:000008"), Some((UnplacedReason::Disabled, None)));
-        assert_eq!(reason("p:000009"), Some((UnplacedReason::Deleted, None)));
-        assert_eq!(
-            reason("p:00000a"),
-            Some((UnplacedReason::Skipped, Some("no sprite set".to_owned())))
-        );
-        assert_eq!(reason("p:00000c"), Some((UnplacedReason::NotPlaced, None)));
-        // The disabled enable parent is a scenery reference that matters.
-        assert_eq!(reason("p:000006"), Some((UnplacedReason::Disabled, None)));
-        // Placed or irrelevant references are not there.
-        assert_eq!(reason("p:000001"), None);
-        assert_eq!(reason("p:000005"), None);
-    }
-
-    #[test]
-    fn the_lists_are_sorted_by_map_elevation_and_object_id() {
-        let index = built(&data());
-        let keys: Vec<(String, u8, Option<u32>)> = index
-            .placed
-            .iter()
-            .map(|p| (p.map.clone(), p.elevation, p.object_id))
-            .collect();
-        let mut sorted = keys.clone();
-        sorted.sort();
-        assert_eq!(keys, sorted);
-        assert_eq!(keys.first().map(|k| k.2), Some(Some(2)));
-        let unplaced: Vec<&str> = index
-            .unplaced
-            .iter()
-            .map(|u| u.reference.as_str())
-            .collect();
-        let mut sorted = unplaced.clone();
-        sorted.sort_unstable();
-        assert_eq!(unplaced, sorted);
-    }
-
-    #[test]
-    fn two_builds_are_byte_identical_whatever_the_input_order() {
-        let a = data();
-        let mut b = data();
-        b.references.reverse();
-        b.skipped.reverse();
-        assert_eq!(built(&a).to_text(), built(&a).to_text());
-        assert_eq!(built(&a).to_text(), built(&b).to_text());
-        let text = built(&a).to_text();
-        assert!(text.ends_with("}\n"));
-        assert!(!text.contains('\\'), "no path separators: {text}");
-    }
-
-    #[test]
-    fn the_file_round_trips_and_checks_its_version() {
-        let index = built(&data());
-        let again = PlacementIndex::from_text(&index.to_text()).expect("parses");
-        assert_eq!(again, index);
-        assert_eq!(again.to_text(), index.to_text());
-
-        let dir = tempfile::tempdir().expect("temp dir");
-        assert!(read(dir.path()).expect("absent is fine").is_none());
-        let path = write(dir.path(), &index).expect("writes");
-        assert_eq!(path.file_name().and_then(|n| n.to_str()), Some(FILE_NAME));
-        assert_eq!(read(dir.path()).expect("reads"), Some(index.clone()));
-
-        let stale = index
-            .to_text()
-            .replace("\"schema_version\": 1", "\"schema_version\": 9");
-        let error = PlacementIndex::from_text(&stale).expect_err("stale");
-        assert!(error.to_string().contains("schema version 9"), "{error}");
-    }
-
-    #[test]
-    fn unknown_fields_are_absent_not_null() {
-        let index = built(&data());
-        let text = index.to_text();
-        assert!(!text.contains("null"), "{text}");
-        let value: serde_json::Value = serde_json::from_str(&text).expect("json");
-        let first = &value["placed"][0];
-        assert_eq!(first["kind"], "door");
-        assert!(first.get("team").is_none());
-        assert_eq!(value["origin"], "stage");
-    }
-
-    #[test]
-    fn packs_and_items_moved_off_a_link_find_their_objects() {
-        let mut d = data();
-        // Rounds at 800 are three packs (consecutive ids 20 to 22, one
-        // PID); rounds placed at 500 the builder moved to 702, where
-        // nothing else was placed; an object at 9000 is too far.
-        let item = |hex: i32, id: u32, pid: u32| WrittenObject {
-            pid,
-            ..object(0, hex, id)
-        };
-        d.references.push(source("p:00000e", "AMMO"));
-        d.spots.push(Spot {
-            objects: 3,
-            ..spot("p:00000e", 0, 800, SpotClass::Item)
-        });
-        d.written.extend([
-            item(800, 20, 0x77),
-            item(800, 21, 0x77),
-            item(800, 22, 0x77),
-        ]);
-        d.references.push(source("p:00000d", "AMMO"));
-        d.spots.push(spot("p:00000d", 0, 500, SpotClass::Item));
-        d.written
-            .extend([item(702, 23, 0x78), item(9000, 24, 0x79)]);
-        let index = built(&d);
-        let find = |r: &str| {
-            index
-                .placed
-                .iter()
-                .find(|p| p.reference.as_deref() == Some(r))
-                .unwrap_or_else(|| panic!("{r} missing"))
-        };
-        assert_eq!(
-            (find("p:00000e").object_id, find("p:00000e").pieces),
-            (Some(20), 3)
-        );
-        assert_eq!(find("p:000004").pieces, 1);
-        let moved = find("p:00000d");
-        assert_eq!((moved.object_id, moved.hex), (Some(23), 702));
-        assert!(
-            index.notes.iter().any(|n| n.contains("moved off a link")),
-            "{:?}",
-            index.notes
-        );
-        // Without the count, two placements of one item at a hex take one
-        // object each.
-        let mut d = data();
-        d.references.push(source("p:00000f", "AMMO"));
-        d.references.push(source("p:000010", "AMMO"));
-        d.spots.push(spot("p:00000f", 0, 800, SpotClass::Item));
-        d.spots.push(spot("p:000010", 0, 800, SpotClass::Item));
-        d.written.extend([item(800, 20, 0x77), item(800, 21, 0x77)]);
-        let index = built(&d);
-        let id = |r: &str| {
-            index
-                .placed
-                .iter()
-                .find(|p| p.reference.as_deref() == Some(r))
-                .and_then(|p| p.object_id)
-        };
-        assert_eq!((id("p:00000f"), id("p:000010")), (Some(20), Some(21)));
-    }
-
-    #[test]
-    fn a_placement_without_an_object_is_counted_not_dropped() {
-        let mut d = data();
-        d.written.retain(|o| o.id != 3);
-        let index = built(&d);
-        let container = index
-            .placed
-            .iter()
-            .find(|p| p.reference.as_deref() == Some("p:000003"))
-            .expect("listed");
-        // Object 4 is the only one left at the hex and it goes to the
-        // container, the first placement there.
-        assert_eq!(container.object_id, Some(4));
-        let item = index
-            .placed
-            .iter()
-            .find(|p| p.reference.as_deref() == Some("p:000004"))
-            .expect("listed");
-        assert_eq!(item.object_id, None);
-        assert!(index.notes.iter().any(|n| n.contains("1 placements")));
-    }
 }

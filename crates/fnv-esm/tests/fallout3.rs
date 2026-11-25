@@ -407,6 +407,10 @@ fn terminals_notes_and_packages_round_trip() {
         (sigs::TERM, "Terminal"),
         (sigs::NOTE, "Note"),
         (sigs::PACK, "Package"),
+        (sigs::GLOB, "Global"),
+        (sigs::GMST, "GameSetting"),
+        (sigs::MESG, "Message"),
+        (sigs::FACT, "Faction"),
     ] {
         assert_eq!(decoder_for(sig).map(|d| d.type_name), Some(name));
         assert!(LOGIC_DECODERS.iter().any(|d| d.sig == sig));
@@ -626,7 +630,7 @@ fn the_logic_decoders_take_any_bytes() {
         b"EDID", b"FULL", b"DESC", b"SNAM", b"PNAM", b"DNAM", b"ITXT", b"RNAM", b"ANAM", b"INAM",
         b"TNAM", b"SCHR", b"SCDA", b"SCTX", b"SLSD", b"SCVR", b"SCRO", b"SCRV", b"CTDA", b"DATA",
         b"ONAM", b"XNAM", b"ICON", b"PKDT", b"PLDT", b"PLD2", b"PSDT", b"PTDT", b"PTD2", b"PKDD",
-        b"CNAM", b"POBA", b"POEA", b"POCA",
+        b"CNAM", b"POBA", b"POEA", b"POCA", b"FLTV", b"FNAM", b"KNAM", b"AIDT", b"VTCK",
     ];
     let mut rng = Lcg(0xF03);
     for entry in LOGIC_DECODERS {

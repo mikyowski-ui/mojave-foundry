@@ -91,6 +91,11 @@ pub struct LayerSpec {
     /// (`map_builder::LayerOptions::close_unreached`), except a component a
     /// person stands on. Default on.
     pub close_unreached: bool,
+    /// `presence_copies = true` (spec 7.6): a named actor whose AI packages
+    /// take it to another map of the layer gets a hidden copy there, on
+    /// the walkable hex nearest the package's location, marked in the
+    /// placement index as a copy of the original. Default off.
+    pub presence_copies: bool,
     pub maps: Vec<LayerMap>,
     /// The first exterior's slice as a table, and the `[all_maps]` keys:
     /// what an automatic interior is made from.
@@ -115,6 +120,8 @@ struct LayerFile {
     with_interiors: bool,
     #[serde(default = "on")]
     close_unreached: bool,
+    #[serde(default)]
+    presence_copies: bool,
     #[serde(default)]
     all_maps: toml::Table,
     #[serde(default)]
@@ -271,6 +278,7 @@ impl LayerSpec {
             start: file.start,
             with_interiors: file.with_interiors,
             close_unreached: file.close_unreached,
+            presence_copies: file.presence_copies,
             maps,
             base,
             all_maps: file.all_maps,
@@ -287,6 +295,7 @@ impl LayerSpec {
             start: None,
             with_interiors: true,
             close_unreached: slice.close_unreached.unwrap_or(true),
+            presence_copies: false,
             maps: vec![LayerMap {
                 slice: slice.clone(),
                 automatic: false,
@@ -304,6 +313,7 @@ impl LayerSpec {
             start: None,
             with_interiors: false,
             close_unreached: slice.close_unreached.unwrap_or(true),
+            presence_copies: false,
             maps: vec![LayerMap {
                 slice: slice.clone(),
                 automatic: false,
@@ -386,6 +396,7 @@ impl LayerSpec {
             deaths: first.deaths.clone(),
             stride: first.stride.clone(),
             figure_look: first.figure_look.clone(),
+            hostile_packet: self.maps.iter().find_map(|m| m.slice.hostile_packet),
             ..SliceSpec::default()
         }
     }
@@ -608,6 +619,8 @@ struct MapRun {
     runs: Vec<Run>,
     critters: Vec<map_builder::CritterPlacement>,
     people_skipped: Vec<PersonSkip>,
+    /// What the enable-group pass did (`enable_groups`).
+    groups: map::GroupsReport,
     /// For a building spilled over several maps: the z band of its
     /// storeys, to give each map only its own people.
     critter_band: Option<[f32; 2]>,
@@ -859,6 +872,7 @@ fn plan_exterior(
         scene.slicer_config.furniture = Some(map_slicer::FurnitureRule::default());
     }
     map::apply_slice_keys(&inputs.slice, &mut scene);
+    map::apply_enable_groups(inputs, mir, &mut scene)?;
     let frame = map_builder::walk::Frame::new(&scene.window, &scene.projection).map_err(stage)?;
     let mut runs = Vec::new();
     let mut split_lines = Vec::new();
@@ -1030,6 +1044,7 @@ fn plan_exterior(
         runs,
         critters: Vec::new(),
         people_skipped: Vec::new(),
+        groups: scene.groups,
         critter_band: None,
     })
 }
@@ -1051,6 +1066,7 @@ fn plan_interior(
         scene.slicer_config.furniture = Some(map_slicer::FurnitureRule::default());
     }
     map::apply_slice_keys(slice, &mut scene);
+    map::apply_enable_groups(inputs, mir, &mut scene)?;
     let stem = slice.map_stem();
     let frame = map_builder::walk::Frame::new(&scene.window, &scene.projection).map_err(stage)?;
     let base_build = scene
@@ -1085,6 +1101,7 @@ fn plan_interior(
         runs,
         critters: Vec::new(),
         people_skipped: Vec::new(),
+        groups: scene.groups.clone(),
         critter_band: band,
     };
 
@@ -1508,6 +1525,9 @@ fn layer_key(
     hasher.update(LAYER_VERSION.as_bytes());
     hasher.update(layer.source.as_bytes());
     hasher.update(format!("start={:?} interiors={}", layer.start, layer.with_interiors).as_bytes());
+    if layer.presence_copies {
+        hasher.update(b"presence_copies");
+    }
     if inputs.standalone {
         hasher.update(b"standalone");
     }
@@ -1985,6 +2005,12 @@ pub fn map_layer(inputs: &Inputs, layer: &LayerSpec) -> Result<MapSummary, Conve
         map.critters = critters;
         map.people_skipped = skipped;
     }
+    // Hidden copies of named actors on the maps their packages lead to.
+    let presence_notes = if layer.presence_copies {
+        add_presence_copies(inputs, &mir, &mut plan)?
+    } else {
+        Vec::new()
+    };
 
     // Loot: one catalogue over every map's references and placements.
     let catalogue = if inputs.loot_on() {
@@ -2009,7 +2035,8 @@ pub fn map_layer(inputs: &Inputs, layer: &LayerSpec) -> Result<MapSummary, Conve
                     ..p.clone()
                 }));
             }
-            critters.extend(map.critters.iter().cloned());
+            // Hidden people are bare critters: no kit, no side.
+            critters.extend(map.critters.iter().filter(|c| !c.hidden).cloned());
         }
         let built = crate::catalogue::build(&crate::catalogue::CatalogueInput {
             inputs,
@@ -2216,23 +2243,38 @@ pub fn map_layer(inputs: &Inputs, layer: &LayerSpec) -> Result<MapSummary, Conve
             .iter()
             .zip(&built.maps)
             .map(|(map, built_map)| {
-                crate::placements::StageMap::of_layer(
+                let mut stage = crate::placements::StageMap::of_layer(
                     &map.stem,
                     &map.references,
-                    map.runs
-                        .iter()
-                        .map(|run| (run.elevation, run.placements.as_slice()))
-                        .collect(),
                     built_map,
-                    catalogue.as_ref().map(|c| &c.catalogue),
                     map.people_skipped
                         .iter()
                         .map(|p| (p.reference.clone(), p.reason.clone()))
                         .chain(map.runs.iter().flat_map(|run| {
                             run.sliced.iter().flat_map(crate::placements::slicer_skips)
                         }))
+                        .chain(map.groups.left.iter().cloned())
                         .collect(),
-                )
+                );
+                stage.copies = map
+                    .critters
+                    .iter()
+                    .filter_map(|c| {
+                        c.presence_of
+                            .as_ref()
+                            .map(|original| (c.reference.clone(), original.clone()))
+                    })
+                    .collect();
+                stage.hostile =
+                    crate::placements::hostile_of(catalogue.as_ref().map(|c| &c.report));
+                stage.originals = map.groups.originals.clone();
+                if let Ok(frame) = map_builder::walk::Frame::new(&map.window, &map.projection) {
+                    stage.triggers =
+                        crate::placements::trigger_spots(&map.references, &frame, |r| {
+                            trigger_elevation(map, r)
+                        });
+                }
+                stage
             })
             .collect();
         crate::placements::write_for_stage(
@@ -2255,6 +2297,7 @@ pub fn map_layer(inputs: &Inputs, layer: &LayerSpec) -> Result<MapSummary, Conve
         &links,
         catalogue.as_ref().map(|c| &c.report),
         &critter_art,
+        &presence_notes,
         redirected,
         started.elapsed().as_secs_f64(),
     );
@@ -2504,6 +2547,192 @@ fn elevation_reach(text: &mut String, e: &map_builder::ElevationReport) {
     let _ = writeln!(text, "- people here: {}", e.critters.len());
 }
 
+/// The elevation of the run of `map` whose interior band holds the
+/// trigger volume `reference` (an interior with storeys); 0 elsewhere.
+fn trigger_elevation(map: &MapRun, reference: &mir::Reference) -> u8 {
+    let z = reference.transform.position[2];
+    map.runs
+        .iter()
+        .find(|run| run.interior.as_ref().is_some_and(|band| band.in_band(z)))
+        .map_or(0, |run| run.elevation)
+}
+
+/// Spec 7.6: a hidden copy of every named actor on each other map of the
+/// layer one of its AI packages has a location on. The actor's packages
+/// come from the MIR (`Records::actor_packages`, `Records::package`); a
+/// package location is understood when it is a reference (type 0, the
+/// copy stands near it), a cell (type 1, the copy stands near the centre
+/// of the map built from that cell) or the actor's own linked reference
+/// (type 6, near that reference); "near the editor location" (3) is the
+/// actor's own place, so it leads nowhere. One copy per actor and map,
+/// from the first package in the actor's list that leads there, and none
+/// on a map that already places a reference to the actor. The copy shares
+/// the original's sprite set, name and figures, is hidden
+/// (`CritterPlacement::hidden`) and is placed by the builder on the
+/// nearest walkable hex to the location, clear of every link's keep-clear
+/// hexes. Returns the notes for the report.
+fn add_presence_copies(
+    inputs: &Inputs,
+    mir: &Mir,
+    plan: &mut Plan,
+) -> Result<Vec<String>, ConvertError> {
+    let mut notes = Vec::new();
+    let records = match mir.records() {
+        Ok(records) => records,
+        Err(e) => {
+            notes.push(format!("no records in the MIR, so no copies ({e})"));
+            return Ok(notes);
+        }
+    };
+    let index = crate::critters::read_index(inputs)?;
+    let named: BTreeSet<&str> = index
+        .iter()
+        .filter(|e| e.name.as_ref().is_some_and(|n| !n.trim().is_empty()))
+        .map(|e| e.actor.as_str())
+        .collect();
+    // Where a location can be found: a reference's map and position, a
+    // cell's map.
+    let mut ref_at: BTreeMap<String, (usize, [f32; 3])> = BTreeMap::new();
+    let mut cell_at: BTreeMap<String, usize> = BTreeMap::new();
+    for (m, map) in plan.maps.iter().enumerate() {
+        for cell in &map.cells {
+            cell_at.entry(cell.form.to_string()).or_insert(m);
+            for r in &cell.references {
+                ref_at
+                    .entry(r.form.to_string())
+                    .or_insert((m, r.transform.position));
+            }
+        }
+    }
+    let centre = |m: usize| {
+        let w = &plan.maps[m].window;
+        [w.x_west + w.size / 2.0, w.y_north - w.size / 2.0]
+    };
+    // The actors each map already places (by base).
+    let base_of = |m: usize, reference: &str| -> Option<String> {
+        plan.maps[m]
+            .references
+            .iter()
+            .find(|r| r.form.to_string() == reference)
+            .map(|r| r.base.to_string())
+    };
+    let mut present: Vec<BTreeSet<String>> = plan
+        .maps
+        .iter()
+        .enumerate()
+        .map(|(m, map)| {
+            map.critters
+                .iter()
+                .filter(|c| !c.hidden)
+                .filter_map(|c| base_of(m, &c.reference))
+                .collect()
+        })
+        .collect();
+    let mut packages: BTreeMap<String, Option<mir::PackageRow>> = BTreeMap::new();
+    let mut additions: Vec<(usize, map_builder::CritterPlacement)> = Vec::new();
+    let mut wanted: BTreeSet<(String, usize)> = BTreeSet::new();
+    // What the packages of the named actors came to, for the report:
+    // actors, locations by stored type, and what became of those on a
+    // reference or a cell.
+    let mut actors = 0usize;
+    let mut kinds: BTreeMap<i32, usize> = BTreeMap::new();
+    let (mut elsewhere, mut here, mut unknown) = (0usize, 0usize, 0usize);
+    for m in 0..plan.maps.len() {
+        for critter in plan.maps[m].critters.iter().filter(|c| !c.hidden) {
+            let Some(base) = base_of(m, &critter.reference) else {
+                continue;
+            };
+            if !named.contains(base.as_str()) {
+                continue;
+            }
+            actors += 1;
+            let Some(source) = plan.maps[m]
+                .references
+                .iter()
+                .find(|r| r.form.to_string() == critter.reference)
+            else {
+                continue;
+            };
+            let actor = source.base.clone();
+            let linked = source.linked_ref.as_ref().map(ToString::to_string);
+            let keys = records.actor_packages(&actor).map_err(stage)?;
+            for key in keys {
+                let row = match packages.get(&key.to_string()) {
+                    Some(row) => row.clone(),
+                    None => {
+                        let row = records.package(&key).map_err(stage)?;
+                        packages.insert(key.to_string(), row.clone());
+                        row
+                    }
+                };
+                let Some(row) = row else { continue };
+                for location in [&row.location, &row.location2].into_iter().flatten() {
+                    *kinds.entry(location.location_type).or_default() += 1;
+                    // A reference (type 0), a cell (1), or the actor's own
+                    // linked reference (6).
+                    let form = match location.location_type {
+                        6 => linked.clone(),
+                        _ => location.form.as_ref().map(ToString::to_string),
+                    };
+                    let Some(form) = form else {
+                        unknown += 1;
+                        continue;
+                    };
+                    let target = match location.location_type {
+                        0 | 6 => ref_at.get(&form).map(|(dest, at)| (*dest, [at[0], at[1]])),
+                        1 => cell_at.get(&form).map(|dest| (*dest, centre(*dest))),
+                        _ => None,
+                    };
+                    let Some((dest, at)) = target else {
+                        unknown += 1;
+                        continue;
+                    };
+                    if dest == m {
+                        here += 1;
+                        continue;
+                    }
+                    elsewhere += 1;
+                    if present[dest].contains(&base) || !wanted.insert((base.clone(), dest)) {
+                        continue;
+                    }
+                    let mut copy = critter.clone();
+                    copy.reference = format!("{}@{}", critter.reference, plan.maps[dest].stem);
+                    copy.position = at;
+                    copy.hidden = true;
+                    copy.presence_of = Some(critter.reference.clone());
+                    additions.push((dest, copy));
+                }
+            }
+            present[m].insert(base);
+        }
+    }
+    let count = additions.len();
+    for (dest, copy) in additions {
+        notes.push(format!(
+            "{} ({}) on map {}",
+            copy.reference, copy.name, plan.maps[dest].stem
+        ));
+        plan.maps[dest].critters.push(copy);
+    }
+    let kinds: Vec<String> = kinds
+        .iter()
+        .map(|(kind, n)| format!("type {kind} x{n}"))
+        .collect();
+    notes.push(format!(
+        "{count} copies; {actors} named actors placed, {} packages read; locations with a form: \
+         {} ({} on a map of the layer, {here} of them on the actor's own map, {elsewhere} on \
+         another; {unknown} not on any map of the layer)",
+        packages.len(),
+        if kinds.is_empty() {
+            "none".to_owned()
+        } else {
+            kinds.join(", ")
+        },
+        here + elsewhere,
+    ));
+    Ok(notes)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn report_text(
     inputs: &Inputs,
@@ -2515,6 +2744,7 @@ fn report_text(
     links: &map_builder::LinkCheck,
     catalogue: Option<&crate::catalogue::CatalogueReport>,
     critter_art: &[map_builder::CritterArt],
+    presence_notes: &[String],
     redirected: usize,
     seconds: f64,
 ) -> String {
@@ -2638,6 +2868,25 @@ fn report_text(
     if let Some(map) = built.maps.first() {
         let report = &map.report;
         map::write_list_section(&mut text, budgets, report, verified);
+    }
+    {
+        let groups: Vec<(&str, &map::GroupsReport, &map_builder::BuildReport)> = plan
+            .maps
+            .iter()
+            .zip(&built.maps)
+            .map(|(map, built)| (map.stem.as_str(), &map.groups, &built.report))
+            .collect();
+        map::write_groups_section(
+            &mut text,
+            inputs.enable_groups_on() || layer.presence_copies,
+            &groups,
+        );
+        for note in presence_notes {
+            let _ = writeln!(text, "- presence copies: {note}");
+        }
+        if !presence_notes.is_empty() {
+            let _ = writeln!(text);
+        }
     }
     map::write_loot_section(&mut text, built.loot.as_ref(), catalogue);
     let _ = writeln!(text, "## Characters\n");

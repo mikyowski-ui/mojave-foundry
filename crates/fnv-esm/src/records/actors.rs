@@ -129,9 +129,107 @@ pub struct Rgb {
     pub b: u8,
 }
 
-/// A non-player character (`NPC_`).
+/// An actor's AI data (`AIDT`, 20 bytes in every actor of both masters).
 ///
-/// The AI data (`AIDT`) is not decoded and stays in `unknown`.
+/// Measured layout: aggression, confidence, energy level, responsibility
+/// and mood (one byte each), three bytes that hold stack garbage (not
+/// kept), the services bit set (4 bytes), the trained skill and the
+/// trainer level (a byte each), assistance, the aggro-radius behaviour
+/// flags (a byte each) and the aggro radius (4 bytes). Checked on the
+/// masters: aggression only 0 to 2, confidence 0 to 4, assistance 0 to 2,
+/// the behaviour byte 0 or 1, and radii such as 500 and 1000.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct AiData {
+    /// Aggression: 0 unaggressive, 1 aggressive, 2 very aggressive (3
+    /// frenzied exists in the editor).
+    pub aggression: u8,
+    /// Confidence: 0 cowardly, 1 cautious, 2 average, 3 brave, 4
+    /// foolhardy.
+    pub confidence: u8,
+    /// Energy level, 0 to 100.
+    pub energy_level: u8,
+    /// Responsibility, 0 to 100.
+    pub responsibility: u8,
+    /// Mood, as stored: 0 neutral, 1 afraid, 2 annoyed, 3 cocky, 4
+    /// drugged, 5 pleasant, 6 angry, 7 sad.
+    pub mood: u8,
+    /// The services the actor offers, as a bit set as stored.
+    pub services: u32,
+    /// The skill the actor trains, as stored.
+    pub trained_skill: i8,
+    /// The level the actor trains up to.
+    pub trainer_level: u8,
+    /// Assistance: 0 helps nobody, 1 helps allies, 2 helps friends and
+    /// allies.
+    pub assistance: u8,
+    /// Aggro-radius behaviour: 1 when the radius is used, as stored.
+    pub aggro_radius_behaviour: u8,
+    /// The aggro radius, game units.
+    pub aggro_radius: i32,
+}
+
+impl AiData {
+    /// Aggression value: unaggressive.
+    pub const UNAGGRESSIVE: u8 = 0;
+    /// Aggression value: aggressive (attacks enemies on sight).
+    pub const AGGRESSIVE: u8 = 1;
+    /// Aggression value: very aggressive (attacks anyone not a friend).
+    pub const VERY_AGGRESSIVE: u8 = 2;
+
+    /// The aggression's name: `"unaggressive"`, `"aggressive"`, `"very
+    /// aggressive"` or `"frenzied"`.
+    pub fn aggression_name(&self) -> Option<&'static str> {
+        Some(match self.aggression {
+            0 => "unaggressive",
+            1 => "aggressive",
+            2 => "very aggressive",
+            3 => "frenzied",
+            _ => return None,
+        })
+    }
+
+    fn parse(data: &[u8]) -> Option<Self> {
+        let mut rd = Rd::exact(data, 20)?;
+        let aggression = rd.u8()?;
+        let confidence = rd.u8()?;
+        let energy_level = rd.u8()?;
+        let responsibility = rd.u8()?;
+        let mood = rd.u8()?;
+        rd.skip(3)?;
+        Some(Self {
+            aggression,
+            confidence,
+            energy_level,
+            responsibility,
+            mood,
+            services: rd.u32()?,
+            trained_skill: rd.u8()? as i8,
+            trainer_level: rd.u8()?,
+            assistance: rd.u8()?,
+            aggro_radius_behaviour: rd.u8()?,
+            aggro_radius: rd.i32()?,
+        })
+    }
+
+    fn bytes(&self) -> Vec<u8> {
+        Wr::default()
+            .u8(self.aggression)
+            .u8(self.confidence)
+            .u8(self.energy_level)
+            .u8(self.responsibility)
+            .u8(self.mood)
+            .zeros(3)
+            .u32(self.services)
+            .u8(self.trained_skill as u8)
+            .u8(self.trainer_level)
+            .u8(self.assistance)
+            .u8(self.aggro_radius_behaviour)
+            .i32(self.aggro_radius)
+            .done()
+    }
+}
+
+/// A non-player character (`NPC_`).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Npc {
     /// The common fields.
@@ -142,6 +240,8 @@ pub struct Npc {
     pub factions: Vec<FactionRank>,
     /// The death item (`INAM`).
     pub death_item: Option<FormId>,
+    /// The AI data (`AIDT`).
+    pub ai: Option<AiData>,
     /// The voice type (`VTCK`).
     pub voice: Option<FormId>,
     /// The template actor (`TPLT`).
@@ -213,6 +313,7 @@ impl Npc {
                 b"ACBS" => set(&mut self.base, ActorBase::parse(d)),
                 b"SNAM" => push(&mut self.factions, FactionRank::parse(d)),
                 b"INAM" => set(&mut self.death_item, one_form(d)),
+                b"AIDT" => set(&mut self.ai, AiData::parse(d)),
                 b"VTCK" => set(&mut self.voice, one_form(d)),
                 b"TPLT" => set(&mut self.template, one_form(d)),
                 b"RNAM" => set(&mut self.race, one_form(d)),
@@ -295,6 +396,7 @@ impl Npc {
             out.raw(b"SNAM", faction.bytes());
         }
         out.form(b"INAM", self.death_item);
+        out.opt(b"AIDT", self.ai.map(|a| a.bytes()));
         out.form(b"VTCK", self.voice);
         out.form(b"TPLT", self.template);
         out.form(b"RNAM", self.race);
@@ -354,8 +456,8 @@ pub struct CreatureData {
 
 /// A creature (`CREA`).
 ///
-/// The AI data (`AIDT`), sounds, body-part data and the other subrecords
-/// not listed here are not decoded and stay in `unknown`.
+/// Sounds, body-part data and the other subrecords not listed here are
+/// not decoded and stay in `unknown`.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Creature {
     /// The common fields. `model` is the skeleton.
@@ -371,6 +473,8 @@ pub struct Creature {
     pub factions: Vec<FactionRank>,
     /// The death item (`INAM`).
     pub death_item: Option<FormId>,
+    /// The AI data (`AIDT`).
+    pub ai: Option<AiData>,
     /// The voice type (`VTCK`).
     pub voice: Option<FormId>,
     /// The template actor (`TPLT`).
@@ -447,6 +551,7 @@ impl Creature {
                 b"KFFZ" => fill(&mut self.animations, string_list(d)),
                 b"SNAM" => push(&mut self.factions, FactionRank::parse(d)),
                 b"INAM" => set(&mut self.death_item, one_form(d)),
+                b"AIDT" => set(&mut self.ai, AiData::parse(d)),
                 b"VTCK" => set(&mut self.voice, one_form(d)),
                 b"TPLT" => set(&mut self.template, one_form(d)),
                 b"SPLO" => push(&mut self.actor_effects, one_form(d)),
@@ -468,6 +573,7 @@ impl Creature {
             out.raw(b"SNAM", faction.bytes());
         }
         out.form(b"INAM", self.death_item);
+        out.opt(b"AIDT", self.ai.map(|a| a.bytes()));
         out.form(b"VTCK", self.voice);
         out.form(b"TPLT", self.template);
         for item in &self.inventory {

@@ -31,7 +31,10 @@ license = "Apache-2.0"
 [workspace.dependencies]
 # One-way dependency on vault-engine, pinned. Never patch it from here; a
 # feature this pipeline needs upstream goes in docs/vault-engine-briefs/.
-vault-formats = { git = "https://github.com/mikyowski-ui/vault-engine.git", rev = "3adeac9c0a14bbfbb56a5439155743d401e1bb69" }
+vault-formats = { git = "https://github.com/mikyowski-ui/vault-engine.git", rev = "2e632c294129229b630b6d9c06bb83352de664d7" }
+# Tests only (a dev-dependency of `transpile`): generated programs are parsed
+# and stack-checked by the engine's own VM. Same pinned revision.
+vault-vm = { git = "https://github.com/mikyowski-ui/vault-engine.git", rev = "2e632c294129229b630b6d9c06bb83352de664d7" }
 
 fnv-bsa = { path = "crates/fnv-bsa" }
 fnv-esm = { path = "crates/fnv-esm" }
@@ -41,6 +44,7 @@ mir = { path = "crates/mir" }
 foundry-render = { path = "crates/foundry-render" }
 quantize = { path = "crates/quantize" }
 emit = { path = "crates/emit" }
+transpile = { path = "crates/transpile" }
 foundry-gallery = { path = "crates/foundry-gallery" }
 map-terrain = { path = "crates/map-terrain" }
 map-slicer = { path = "crates/map-slicer" }

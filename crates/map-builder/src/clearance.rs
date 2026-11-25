@@ -179,6 +179,70 @@ pub(crate) fn move_off_links(plan: &mut MapPlan) {
     }
 }
 
+/// [`move_off_links`] for the hidden placements ([`crate::BuildOptions::hidden`]):
+/// a hidden item or container (blocking or not: hidden objects block
+/// nothing) that stands in the keep-clear set moves to the nearest free
+/// walkable hex outside it, as a visible one does, because the layer's
+/// check ([`crate::verify_clearance`]) reads every written object. It
+/// avoids the hexes of visible placements, doors, grids, arrivals and the
+/// entrance, and those other hidden placements already took. Not counted
+/// in [`ElevationPlan::moved_off_links`].
+pub(crate) fn move_hidden_off_links(plan: &mut MapPlan) {
+    for elevation in &mut plan.elevations {
+        if elevation.hidden_placements.is_empty() {
+            continue;
+        }
+        let clear = elevation_keep_clear(elevation);
+        if clear.is_empty() {
+            continue;
+        }
+        let stuck: Vec<usize> = (0..elevation.hidden_placements.len())
+            .filter(|i| {
+                let p = &elevation.hidden_placements[*i];
+                clear.contains(&p.hex) && matches!(p.role, Role::Item | Role::Container)
+            })
+            .collect();
+        if stuck.is_empty() {
+            continue;
+        }
+        let walkable = &elevation.walkable;
+        let comps = islands::components(|h| walkable[h as usize]);
+        let mut occupied: BTreeSet<i32> = elevation.placements.iter().map(|p| p.hex).collect();
+        occupied.extend(elevation.hidden_placements.iter().map(|p| p.hex));
+        occupied.extend(&elevation.door_hexes);
+        occupied.extend(elevation.grid_hexes());
+        occupied.extend(elevation.arrival_hexes());
+        occupied.extend(elevation.entrance.map(|e| e.hex));
+        let mut moves: Vec<(usize, i32)> = Vec::new();
+        for index in stuck {
+            let from = elevation.hidden_placements[index].hex;
+            let usable = |hex: i32, occupied: &BTreeSet<i32>| {
+                hex > 0
+                    && (hex as usize) < HEXES
+                    && walkable[hex as usize]
+                    && !on_border(hex)
+                    && !clear.contains(&hex)
+                    && !occupied.contains(&hex)
+            };
+            let home = comps.of(from).or_else(|| {
+                nearest(from, &comps, None, |h| {
+                    h > 0 && (h as usize) < HEXES && walkable[h as usize]
+                })
+                .and_then(|h| comps.of(h))
+            });
+            let to = nearest(from, &comps, home, |h| usable(h, &occupied))
+                .or_else(|| nearest(from, &comps, None, |h| usable(h, &occupied)));
+            if let Some(to) = to {
+                occupied.insert(to);
+                moves.push((index, to));
+            }
+        }
+        for (index, to) in moves {
+            elevation.hidden_placements[index].hex = to;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

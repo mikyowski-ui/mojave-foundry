@@ -7,9 +7,14 @@
 # Run with --standalone; see docs/running.md ("Layers").
 name = "megaton"
 start = "megaton"
+# Pass 2: a named actor whose packages lead to another map of the layer gets
+# a hidden copy there (presence copies).
+presence_copies = true
 
 [all_maps]
 loot = true
+# Pass 2: children of enable groups that start disabled are placed hidden.
+enable_groups = true
 animations = "combat"
 wire = true
 sight = "visible"

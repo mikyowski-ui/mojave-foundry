@@ -1,11 +1,11 @@
 # Copy to .cargo/config.toml (which is gitignored) to resolve the pinned
 # vault-engine dependency from a local checkout instead of the network.
 # Replace the path below with your own absolute path.
-[source."git+https://github.com/mikyowski-ui/vault-engine.git?rev=3adeac9c0a14bbfbb56a5439155743d401e1bb69"]
+[source."git+https://github.com/mikyowski-ui/vault-engine.git?rev=2e632c294129229b630b6d9c06bb83352de664d7"]
 git = "https://github.com/mikyowski-ui/vault-engine.git"
-rev = "3adeac9c0a14bbfbb56a5439155743d401e1bb69"
+rev = "2e632c294129229b630b6d9c06bb83352de664d7"
 replace-with = "vault-engine-local"
 
 [source.vault-engine-local]
 git = "file:///absolute/path/to/vault-engine"
-rev = "3adeac9c0a14bbfbb56a5439155743d401e1bb69"
+rev = "2e632c294129229b630b6d9c06bb83352de664d7"

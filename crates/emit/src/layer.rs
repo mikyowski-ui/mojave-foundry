@@ -16,8 +16,10 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use vault_formats::VfsPath;
 use vault_formats::mod_manifest::{
-    MANIFEST, MAP_NUMBERS, MOD_API, MapRegistration, ModManifest, README, write_mod_folder,
+    GlobalScriptRegistration, HookRegistration, MANIFEST, MAP_NUMBERS, MOD_API, MapRegistration,
+    ModManifest, ModRegistry, README, ScriptRegistration, write_mod_folder,
 };
+use vault_formats::{LstKind, LstTable};
 
 /// A mod layer in memory.
 #[derive(Debug, Clone)]
@@ -86,11 +88,7 @@ impl ModLayer {
             });
         }
         // A path that is also another path's folder cannot be written.
-        let clash = self.files.keys().find(|other| {
-            other.starts_with(&format!("{canonical}/"))
-                || canonical.starts_with(&format!("{other}/"))
-        });
-        if let Some(other) = clash {
+        if let Some(other) = self.folder_clash(&canonical) {
             return Err(EmitError::Path {
                 path: path.into(),
                 message: format!("{other} needs it as a file and a folder"),
@@ -98,6 +96,27 @@ impl ModLayer {
         }
         self.files.insert(canonical, bytes);
         Ok(())
+    }
+
+    /// The first file, in path order, that is a folder of `canonical` or
+    /// that `canonical` is a folder of. Both kinds are found by lookup, not
+    /// by scanning every file: a folder of `canonical` is one of its
+    /// prefixes cut at a `/` (shortest first, which is also path order),
+    /// and a file inside `canonical` is the first key from `canonical/` on,
+    /// if it starts with it. Folders sort before files inside them, so the
+    /// first folder found is the first clash in path order.
+    fn folder_clash(&self, canonical: &str) -> Option<&str> {
+        for (at, _) in canonical.match_indices('/') {
+            if let Some((key, _)) = self.files.get_key_value(&canonical[..at]) {
+                return Some(key);
+            }
+        }
+        let inside = format!("{canonical}/");
+        self.files
+            .range(inside.clone()..)
+            .next()
+            .map(|(key, _)| key.as_str())
+            .filter(|key| key.starts_with(&inside))
     }
 
     /// The layer's files, by canonical path.
@@ -137,6 +156,136 @@ impl ModLayer {
         Ok(())
     }
 
+    /// Replace the manifest with `manifest` extended by `change`, kept only
+    /// if the result writes and parses back (`ModManifest::to_toml` does
+    /// that) and its registrations do not conflict
+    /// (`ModRegistry::build`).
+    fn amend(&mut self, change: impl FnOnce(&mut ModManifest)) -> Result<(), EmitError> {
+        let mut manifest = self.manifest.clone();
+        change(&mut manifest);
+        manifest
+            .to_toml()
+            .map_err(|error| EmitError::Manifest(error.to_string()))?;
+        ModRegistry::build([&manifest]).map_err(EmitError::Manifest)?;
+        self.manifest = manifest;
+        Ok(())
+    }
+
+    /// Register `scripts/<file>` as script list row `index` (`[[scripts]]`)
+    /// with `local_vars` local variables, without replacing `scripts.lst`.
+    /// **The engine refuses an index that is also a row of the
+    /// `scripts.lst` it reads**, so [`ModLayer::write`] checks the layer's
+    /// own `scripts/scripts.lst`, when it has one, and refuses such an
+    /// index; a layer that ships a whole list needs no `[[scripts]]` rows.
+    /// The file must be in the layer when it is written.
+    pub fn register_script(
+        &mut self,
+        file: &str,
+        index: u32,
+        local_vars: u32,
+    ) -> Result<(), EmitError> {
+        let file = file.to_ascii_lowercase();
+        self.amend(|manifest| {
+            manifest.scripts.push(ScriptRegistration {
+                file,
+                index,
+                local_vars,
+            });
+        })
+    }
+
+    /// Register `scripts/<file>` as a global script (`[[global_scripts]]`,
+    /// SPEC-024a): its `start` runs once at setup and then every `repeat`
+    /// steps (0 never again), and its `map_enter_p_proc`, `map_exit_p_proc`
+    /// and `map_update_p_proc` run at those events. `kind` is 0 to 3. The
+    /// manifest needs an `id` and an `api` (which [`ModLayer::new`] sets);
+    /// the file must be in the layer when it is written.
+    pub fn add_global_script(
+        &mut self,
+        file: &str,
+        repeat: u32,
+        kind: u32,
+    ) -> Result<(), EmitError> {
+        let file = file.to_ascii_lowercase();
+        self.amend(|manifest| {
+            manifest
+                .global_scripts
+                .push(GlobalScriptRegistration { file, repeat, kind });
+        })
+    }
+
+    /// Attach `procedure` of `scripts/<file>` to the engine hook `point`
+    /// (`[[hooks]]`, a public hook name such as `HOOK_CALCAPCOST`). The
+    /// program must be in the layer when it is written, with a readable
+    /// identifier table that holds the procedure (compared without case).
+    pub fn add_hook(&mut self, point: &str, file: &str, procedure: &str) -> Result<(), EmitError> {
+        let (point, file, procedure) = (
+            point.to_owned(),
+            file.to_ascii_lowercase(),
+            procedure.to_owned(),
+        );
+        self.amend(|manifest| {
+            manifest.hooks.push(HookRegistration {
+                point,
+                file,
+                procedure,
+            });
+        })
+    }
+
+    /// What [`ModLayer::write`] checks about scripts: every registered file
+    /// is in the layer, no registered index is a row of the layer's own
+    /// `scripts/scripts.lst`, and every hook's procedure is in its program.
+    fn check_scripts(&self) -> Result<(), EmitError> {
+        let bad = |message: String| Err(EmitError::Manifest(message));
+        let manifest = &self.manifest;
+        let files = manifest
+            .scripts
+            .iter()
+            .map(|script| &script.file)
+            .chain(manifest.global_scripts.iter().map(|script| &script.file))
+            .chain(manifest.hooks.iter().map(|hook| &hook.file));
+        for file in files {
+            let path = format!("scripts/{file}");
+            if !self.files.contains_key(&path) {
+                return bad(format!("{path} is registered and is not in the layer"));
+            }
+        }
+        if !manifest.scripts.is_empty()
+            && let Some(list) = self.files.get("scripts/scripts.lst")
+        {
+            let rows = LstTable::parse(list, LstKind::Script)?.entries().len();
+            for script in &manifest.scripts {
+                if (script.index as usize) < rows {
+                    return bad(format!(
+                        "script index {} is a row of the layer's scripts.lst ({rows} rows); \
+                         the engine refuses it",
+                        script.index
+                    ));
+                }
+            }
+        }
+        for hook in &manifest.hooks {
+            let program = &self.files[&format!("scripts/{}", hook.file)];
+            let names = crate::int::procedure_names(program).map_err(|error| {
+                EmitError::Manifest(format!(
+                    "hook {}: scripts/{} is not a readable program: {}",
+                    hook.point, hook.file, error.message
+                ))
+            })?;
+            if !names
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(hook.procedure.as_bytes()))
+            {
+                return bad(format!(
+                    "hook {} names procedure {} and scripts/{} has no such procedure",
+                    hook.point, hook.procedure, hook.file
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// The manifest text `write` stores.
     pub fn manifest_text(&self) -> Result<String, EmitError> {
         self.manifest
@@ -162,6 +311,7 @@ impl ModLayer {
             .iter()
             .map(|(path, bytes)| (path.clone(), bytes.clone()))
             .collect();
+        self.check_scripts()?;
         self.prepare(dir)?;
         write_mod_folder(dir, &self.manifest, &files).map_err(|error| EmitError::io(dir, error))
     }

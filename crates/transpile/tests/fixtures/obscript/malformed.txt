@@ -1,0 +1,46 @@
+; Malformed input: every line below the header has one fault, and each
+; must cost only its own line.
+scn TSMalformedScript
+short ok
+short
+short trailing 0 comment without a semicolon
+
+set ok to 1
+
+begin GameMode
+	set ok to
+	set ok 5
+	set to 5
+	set ok to ( 1 + 2
+	set ok to 1 2
+	set ok to 1 # 2
+	MessageBox "unterminated
+	elseif ok == 1
+	else
+	endif
+	set ok to 2
+	if ok == 1
+		set ok to 3
+	else
+		set ok to 4
+	else
+		set ok to 5
+	endif
+	set nothing to 1
+	set ok to TSQuest.noSuchVar
+	set ok to TSMarkerRef.noVar + 1
+	==== a divider line
+	if
+		set ok to 6
+	if ok == 2
+		set ok to 6
+end
+endif
+end
+
+begin
+	set ok to 7
+end
+
+begin OnLoad
+	set ok to 8

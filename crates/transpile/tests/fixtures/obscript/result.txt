@@ -1,0 +1,10 @@
+; A result script: statements only, as a dialogue or stage result holds.
+SetStage TSQuest 10
+set TSQuest.qCount to TSQuest.qCount + 1
+if GetStageDone TSQuest 20 == 0
+	SetObjectiveDisplayed TSQuest 10 1
+endif
+TSDoorRef.Unlock
+AddNote TSNote
+RewardKarma -5
+ShowMessage TSMessage

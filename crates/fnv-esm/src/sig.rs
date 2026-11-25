@@ -129,5 +129,9 @@ pub mod sigs {
         TERM = b"TERM";
         NOTE = b"NOTE";
         PACK = b"PACK";
+        GLOB = b"GLOB";
+        GMST = b"GMST";
+        MESG = b"MESG";
+        FACT = b"FACT";
     }
 }

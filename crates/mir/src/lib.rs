@@ -64,6 +64,19 @@
 //!   `quest_targets(quest, objective, seq, target, flags)`; `weapons` has
 //!   the combat columns of `fnv_esm::WeaponCombat`; terminal items and
 //!   packages add rows to `conditions` and `embedded_scripts`.
+//! - Since [`RECORDS_REVISION`] 2 (the simulation tables, typed queries in
+//!   `Records`): `globals`, `game_settings`, `messages` and
+//!   `message_buttons`, `factions` and `faction_relations`, `actor_ai` and
+//!   `actor_factions` (the AI data, voice type and factions of every NPC
+//!   and creature, read from the template its flags name), `info_links`
+//!   (`TCLT`, `TCLF`, `TCFU`, `NAME`), `package_events` (idle, topic and
+//!   script of each event), `script_contexts`, `script_ref_list` and
+//!   `script_locals` (every embedded script's header, whole reference list
+//!   and variables, by owner and context), `decode_skips` (what a decoder
+//!   could not use, counted by name); `infos` has the flag byte count,
+//!   `KNAM` and the speech-challenge level, `packages` the behaviour and
+//!   type-specific flags, `conditions` the resolved placed reference of a
+//!   parameter (`param1_ref`, `param2_ref`).
 //!
 //! # Two games
 //!
@@ -91,13 +104,15 @@ mod model;
 mod paths;
 mod reader;
 mod report;
+mod simlogic;
 mod source;
 pub mod storeys;
 
 pub use actors::{
     ARMED_FAMILIES, DEFAULT_FAMILIES, DEFAULT_WEAPONS, HUMAN_ANIMATIONS, HUMAN_SKELETON,
-    HUMAN_STAND, HUMAN_WALK_FEMALE, HUMAN_WALK_MALE, MAX_CHAIN, USE_BASE_DATA, USE_INVENTORY,
-    USE_MODEL, USE_STATS, USE_TRAITS, human_animation_slots, weapon_family,
+    HUMAN_STAND, HUMAN_WALK_FEMALE, HUMAN_WALK_MALE, MAX_CHAIN, USE_AI_DATA, USE_BASE_DATA,
+    USE_FACTIONS, USE_INVENTORY, USE_MODEL, USE_STATS, USE_TRAITS, human_animation_slots,
+    weapon_family,
 };
 pub use assets::AssetCounts;
 pub use error::MirError;
@@ -107,8 +122,8 @@ pub use ground::{GroundSampler, MAP_SIDE_SQUARES, MapWindow};
 pub use index::content_hash;
 pub use landscape::{DEFAULT_LAND_TEXTURE, DefaultLandTexture, default_land_texture};
 pub use logic::{
-    ConditionRow, NoteRow, PackageLocationRow, PackageRow, PackageTargetRow, QuestTargetRow,
-    RefReason, Referral, TerminalItemRow, TerminalRow,
+    ConditionRow, NoteRow, PackageEventRow, PackageLocationRow, PackageRow, PackageTargetRow,
+    QuestTargetRow, RefReason, Referral, TerminalItemRow, TerminalRow,
 };
 pub use model::{
     ActorAnimations, ActorDoc, ActorEntry, ActorKind, ActorPart, ActorTint, ActorWeapon,
@@ -128,5 +143,10 @@ pub use reader::{
     QuestStageRow, RecordRow, Records, ScriptRow,
 };
 pub use report::{ART_LIST_LIMIT, MAP_SQUARES, ReportParams, SCENERY_KINDS, report};
+pub use simlogic::{
+    ActorAiRow, ActorFactionRow, DecodeSkipRow, FactionRelationRow, FactionRow, GameSettingRow,
+    GlobalRow, InfoResponseRow, InfoRow, MessageButtonRow, MessageRow, ScriptContextRow,
+    ScriptLocalRow, ScriptRefKind, ScriptRefRow,
+};
 pub use source::DataSource;
 pub use storeys::{DEFAULT_STOREY_GAP, Storey, navmesh_storeys, storeys, storeys_with_gap};

@@ -1,0 +1,48 @@
+; One of every block type the spec's section 5.3 lists, with arguments
+; where the type takes one. Written for the transpiler's tests.
+scn TSBlocksScript
+
+begin GameMode
+end
+begin MenuMode
+end
+begin OnActivate
+end
+begin OnLoad
+end
+begin OnDeath player
+end
+begin OnHit player
+end
+begin OnTrigger player
+end
+begin OnTriggerEnter player
+end
+begin OnTriggerLeave player
+end
+begin OnStartCombat
+end
+begin OnCombatEnd
+end
+begin SayToDone
+end
+begin OnPackageStart TSSandbox
+end
+begin OnPackageEnd TSSandbox
+end
+begin OnPackageChange
+end
+begin OnAdd
+end
+begin OnEquip
+end
+begin OnUnequip
+end
+begin ScriptEffectStart
+end
+begin ScriptEffectUpdate
+end
+begin ScriptEffectFinish
+end
+begin OnSomethingNew
+end

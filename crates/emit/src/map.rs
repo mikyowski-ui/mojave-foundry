@@ -4,12 +4,17 @@
 
 use crate::EmitError;
 use crate::proto::stat::MAX_HIT_POINTS;
+use std::collections::{BTreeMap, BTreeSet};
 use vault_formats::fid::CRITTER_CATEGORY;
 use vault_formats::map::{
-    CritterState, MapFile, MapHeader, MapObject, MapObjects, ObjectDetail, ObjectState,
-    ScriptCategory,
+    CritterState, MapFile, MapHeader, MapObject, MapObjects, MapScript, ObjectDetail, ObjectState,
+    ScriptBlock, ScriptCategory, ScriptPrefix,
 };
-use vault_formats::pro::{BasicFlags, Category, CombatFlags, Light, MapFlags, PrototypeData};
+use vault_formats::mod_manifest::{MAX_LOCALS, SCRIPT_INDEXES};
+use vault_formats::pro::{
+    BasicFlags, Category, CombatFlags, Light, MapFlags, PackedLocation, PrototypeData,
+    PrototypeLookup, ScriptFlags,
+};
 use vault_formats::{Fid, GameProfile, Prototype};
 
 /// A map name is stored in 16 bytes; this writer keeps a terminating NUL.
@@ -345,4 +350,402 @@ pub fn plain_object(
         owner: None,
         file_offset: 0,
     }
+}
+
+// ---- Attaching scripts (simulation layer, spec 10.4) -----------------------------
+
+/// What an object-bound script record is for: SPEC-003 section 2.9's
+/// category 3 (every object but a critter) or 4 (a critter).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectScript {
+    /// A scenery, item, wall or miscellaneous object's script.
+    Item,
+    /// A critter's script.
+    Critter,
+}
+
+/// Where a script record attaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptSite {
+    /// The object with this unique id (top level or in an inventory); its
+    /// PID must be a critter's for [`ObjectScript::Critter`] and any other
+    /// category's for [`ObjectScript::Item`].
+    Object { id: u32, kind: ObjectScript },
+    /// A spatial script (category 1): fires on a hex within `radius`.
+    Spatial {
+        hex: i32,
+        elevation: u8,
+        radius: i32,
+    },
+}
+
+/// One script to attach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScriptAttachment {
+    pub site: ScriptSite,
+    /// The script's row in `scripts.lst` (or a manifest `[[scripts]]`
+    /// index): 0 to `0x00FF_FFFF`.
+    pub script_index: u32,
+    /// The record's local variable count, validated and kept in memory. A
+    /// map that is not a saved game does not store it (a record reads back
+    /// with 0, and the engine takes the count from the script list row at
+    /// load); a saved map's record keeps it.
+    pub local_vars: u32,
+}
+
+const SPATIAL_STREAM: usize = 1;
+const ITEM_STREAM: usize = 3;
+const CRITTER_STREAM: usize = 4;
+
+/// Where an object is: elevation, index in that elevation, then inventory
+/// indexes down to it.
+type ObjectPath = (usize, Vec<usize>);
+
+fn index_objects(
+    objects: &[MapObject],
+    path: &mut Vec<usize>,
+    elevation: usize,
+    found: &mut BTreeMap<u32, Vec<ObjectPath>>,
+) {
+    for (index, object) in objects.iter().enumerate() {
+        path.push(index);
+        found
+            .entry(object.id)
+            .or_default()
+            .push((elevation, path.clone()));
+        for (child_index, child) in object.inventory.iter().enumerate() {
+            path.push(child_index);
+            index_inventory(&child.object, path, elevation, found);
+            path.pop();
+        }
+        path.pop();
+    }
+}
+
+fn index_inventory(
+    object: &MapObject,
+    path: &mut Vec<usize>,
+    elevation: usize,
+    found: &mut BTreeMap<u32, Vec<ObjectPath>>,
+) {
+    found
+        .entry(object.id)
+        .or_default()
+        .push((elevation, path.clone()));
+    for (index, child) in object.inventory.iter().enumerate() {
+        path.push(index);
+        index_inventory(&child.object, path, elevation, found);
+        path.pop();
+    }
+}
+
+fn object_at<'a>(map: &'a mut MapFile, (elevation, path): &ObjectPath) -> &'a mut MapObject {
+    let mut object = &mut map.objects.elevations[*elevation][path[0]];
+    for index in &path[1..] {
+        object = &mut object.inventory[*index].object;
+    }
+    object
+}
+
+fn blank_script_slot() -> MapScript {
+    MapScript {
+        id: 0,
+        link: 0,
+        prefix: ScriptPrefix::None,
+        stored_flags: ScriptFlags(0),
+        flags: ScriptFlags(0),
+        file_index: 0,
+        object_id: 0,
+        local_base: 0,
+        stored_local_count: 0,
+        local_count: 0,
+        result: 0,
+        event: 0,
+        parameter: 0,
+        action: 0,
+        override_default: 0,
+        execution_state: 0,
+        quantity: 0,
+        annotations: 0,
+        file_offset: 0,
+    }
+}
+
+/// `records` laid out as `MapFile::write` and the parser expect: blocks of
+/// 16 slots, the last padded.
+fn category_of(records: Vec<MapScript>) -> ScriptCategory {
+    let declared_count = records.len();
+    let blocks = records
+        .chunks(16)
+        .map(|chunk| {
+            let mut slots = chunk.to_vec();
+            slots.resize_with(16, blank_script_slot);
+            ScriptBlock {
+                slots,
+                active: chunk.len(),
+            }
+        })
+        .collect();
+    ScriptCategory {
+        declared_count,
+        blocks,
+    }
+}
+
+/// Add script records to a parsed map, bind objects to them, and set the
+/// header's map script (SPEC-003 sections 2.7, 2.9 and 3.3).
+///
+/// - Each object attachment adds one record to the item (3) or critter (4)
+///   category, with the lowest free serial from 1 in its category, and sets
+///   the object's script id and cached script file. Each spatial
+///   attachment adds a category-1 record. Records are appended after the
+///   map's existing ones in a fixed order, by object id (spatial ones by
+///   place), so the order of `attachments` does not matter.
+/// - **Re-runs.** An object that already has a record of the same script
+///   index keeps it, and a spatial record that already matches (same hex,
+///   elevation, radius and script) is not added again, so applying the
+///   same attachments to the result changes nothing. An object that
+///   already has another script is refused.
+/// - `map_script` is a script index; the header stores it plus one
+///   (SPEC-003 section 3.3). The engine creates the map script from the
+///   header alone, so no system-category record is written.
+/// - Objects not named are untouched.
+///
+/// Refused, and the map left as it was: an id that is on no object (named
+/// in the error), an id on several objects, a critter category on a
+/// non-critter or the reverse, a script index over `0x00FF_FFFF`, more than
+/// 1,000,000 local variables, a spatial hex outside 0 to 39,999, elevation
+/// above 2 or negative radius, and an object that already has a different
+/// script.
+pub fn attach_scripts_to(
+    map: &mut MapFile,
+    attachments: &[ScriptAttachment],
+    map_script: Option<u32>,
+) -> Result<(), EmitError> {
+    let bad = |message: String| Err(EmitError::Map(message));
+    for attachment in attachments {
+        if !SCRIPT_INDEXES.contains(&attachment.script_index) {
+            return bad(format!(
+                "script index {} is outside 0 to {}",
+                attachment.script_index,
+                SCRIPT_INDEXES.end()
+            ));
+        }
+        if attachment.local_vars > MAX_LOCALS {
+            return bad(format!(
+                "{} local variables; the limit is {MAX_LOCALS}",
+                attachment.local_vars
+            ));
+        }
+        if let ScriptSite::Spatial {
+            hex,
+            elevation,
+            radius,
+        } = attachment.site
+            && (!(0..40_000).contains(&hex) || elevation > 2 || radius < 0)
+        {
+            return bad(format!(
+                "spatial script at hex {hex}, elevation {elevation}, radius {radius} is outside the map"
+            ));
+        }
+    }
+    if let Some(index) = map_script
+        && !SCRIPT_INDEXES.contains(&index)
+    {
+        return bad(format!(
+            "map script index {index} is outside 0 to {}",
+            SCRIPT_INDEXES.end()
+        ));
+    }
+
+    // The local count a record keeps in the file. A fresh (not saved) map's
+    // records are read back with 0 here, and the count comes from the
+    // script list row at load (SPEC-003 section 2.9), so 0 is what a second
+    // run would find and write; a saved map keeps the count.
+    let saved = map.header.flags.contains(MapFlags::SAVED);
+    let written_locals = |count: u32| if saved { count as i32 } else { 0 };
+    // Records are added in a fixed order whatever the order of the input:
+    // by object id, spatial ones by place.
+    let mut attachments = attachments.to_vec();
+    attachments.sort_by_key(|attachment| match attachment.site {
+        ScriptSite::Object { id, kind } => (
+            0,
+            u32::from(kind == ObjectScript::Critter),
+            id,
+            0,
+            0,
+            attachment.script_index,
+        ),
+        ScriptSite::Spatial {
+            hex,
+            elevation,
+            radius,
+        } => (
+            1,
+            0,
+            hex as u32,
+            u32::from(elevation),
+            radius as u32,
+            attachment.script_index,
+        ),
+    });
+    let mut found: BTreeMap<u32, Vec<ObjectPath>> = BTreeMap::new();
+    for (elevation, objects) in map.objects.elevations.iter().enumerate() {
+        index_objects(objects, &mut Vec::new(), elevation, &mut found);
+    }
+
+    // The records by category (active ones), and the serials in use.
+    let mut records: [Vec<MapScript>; 5] =
+        std::array::from_fn(|category| map.scripts[category].active().cloned().collect());
+    let mut used: [BTreeSet<u32>; 5] = std::array::from_fn(|category| {
+        records[category]
+            .iter()
+            .filter(|record| record.id >> 24 == category as u32)
+            .map(|record| record.id & 0x00ff_ffff)
+            .collect()
+    });
+    let mut changed = [false; 5];
+    // By record id, the first record's script index (the one lookups
+    // find); and the spatial records by (script, packed place, radius).
+    let mut script_of: BTreeMap<u32, u32> = BTreeMap::new();
+    for record in records.iter().flatten() {
+        script_of
+            .entry(record.id)
+            .or_insert(record.file_index as u32);
+    }
+    let mut spatial: BTreeSet<(u32, u32, i32)> = records[SPATIAL_STREAM]
+        .iter()
+        .filter_map(|record| match record.prefix {
+            ScriptPrefix::Spatial { location, radius } => {
+                Some((record.file_index as u32, location.0, radius))
+            }
+            _ => None,
+        })
+        .collect();
+    let mut bindings: BTreeMap<ObjectPath, (u32, u32)> = BTreeMap::new();
+
+    let new_serial = |used: &mut BTreeSet<u32>| -> Result<u32, EmitError> {
+        let serial = (1..0x0100_0000)
+            .find(|serial| !used.contains(serial))
+            .ok_or_else(|| EmitError::Map("no free script serial".into()))?;
+        used.insert(serial);
+        Ok(serial)
+    };
+
+    for attachment in &attachments {
+        match attachment.site {
+            ScriptSite::Object { id, kind } => {
+                let category = match kind {
+                    ObjectScript::Item => ITEM_STREAM,
+                    ObjectScript::Critter => CRITTER_STREAM,
+                };
+                let paths = found
+                    .get(&id)
+                    .ok_or_else(|| EmitError::Map(format!("object id {id} is not on the map")))?;
+                if paths.len() != 1 {
+                    return bad(format!("object id {id} is on {} objects", paths.len()));
+                }
+                let path = paths[0].clone();
+                let object = object_at(map, &path);
+                let is_critter = Category::from_pid(object.pid).ok() == Some(Category::Critter);
+                if is_critter != (kind == ObjectScript::Critter) {
+                    return bad(format!(
+                        "object {id} (PID {:#010x}) {} a critter, and the script is a {} script",
+                        object.pid,
+                        if is_critter { "is" } else { "is not" },
+                        if is_critter { "item" } else { "critter" },
+                    ));
+                }
+                // An earlier attachment of this call, or an earlier run, may
+                // have bound it already.
+                let current = bindings.get(&path).map(|(_, index)| *index).or_else(|| {
+                    (object.script_id >= 0)
+                        .then(|| script_of.get(&(object.script_id as u32)).copied())
+                        .flatten()
+                });
+                if let Some(index) = current {
+                    if index == attachment.script_index {
+                        continue;
+                    }
+                    return bad(format!(
+                        "object {id} already has script {index}, not {}",
+                        attachment.script_index
+                    ));
+                }
+                if object.script_id >= 0 {
+                    return bad(format!(
+                        "object {id} names script record {:#010x}, which the map does not hold",
+                        object.script_id
+                    ));
+                }
+                let serial = new_serial(&mut used[category])?;
+                let script_id = ((category as u32) << 24) | serial;
+                let mut record = blank_script_slot();
+                record.id = script_id;
+                record.file_index = attachment.script_index as i32;
+                record.object_id = id as i32;
+                record.local_base = -1;
+                record.stored_local_count = attachment.local_vars as i32;
+                record.local_count = written_locals(attachment.local_vars);
+                record.action = -1;
+                records[category].push(record);
+                changed[category] = true;
+                bindings.insert(path, (script_id, attachment.script_index));
+            }
+            ScriptSite::Spatial {
+                hex,
+                elevation,
+                radius,
+            } => {
+                let location = PackedLocation(hex as u32 | (u32::from(elevation) << 29));
+                if !spatial.insert((attachment.script_index, location.0, radius)) {
+                    continue;
+                }
+                let serial = new_serial(&mut used[SPATIAL_STREAM])?;
+                let mut record = blank_script_slot();
+                record.id = ((SPATIAL_STREAM as u32) << 24) | serial;
+                record.prefix = ScriptPrefix::Spatial { location, radius };
+                record.file_index = attachment.script_index as i32;
+                record.object_id = -1;
+                record.local_base = -1;
+                record.stored_local_count = attachment.local_vars as i32;
+                record.local_count = written_locals(attachment.local_vars);
+                record.action = -1;
+                records[SPATIAL_STREAM].push(record);
+                changed[SPATIAL_STREAM] = true;
+            }
+        }
+    }
+
+    for (category, list) in records.into_iter().enumerate() {
+        if changed[category] {
+            map.scripts[category] = category_of(list);
+        }
+    }
+    for (path, (script_id, script_index)) in bindings {
+        let object = object_at(map, &path);
+        object.script_id = script_id as i32;
+        object.cached_script_file = script_index as i32;
+    }
+    if let Some(index) = map_script {
+        map.header.script_reference = index as i32 + 1;
+    }
+    Ok(())
+}
+
+/// [`attach_scripts_to`] on a built map's bytes: parse them as a Fallout 2
+/// map with `prototypes` (the map's records need their prototypes' sizes),
+/// attach, and write the map back through [`MapFile::write`]. A second run
+/// with the same attachments returns the same bytes. With nothing to attach
+/// the result is the writer's form of the map, which is the input when the
+/// input came from `MapFile::write`.
+pub fn attach_scripts(
+    map: &[u8],
+    prototypes: &impl PrototypeLookup,
+    attachments: &[ScriptAttachment],
+    map_script: Option<u32>,
+) -> Result<Vec<u8>, EmitError> {
+    let mut parsed = MapFile::parse_for(map, prototypes, GameProfile::Fallout2)?;
+    attach_scripts_to(&mut parsed, attachments, map_script)?;
+    Ok(parsed.write()?)
 }

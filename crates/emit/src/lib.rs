@@ -24,15 +24,21 @@
 //!   locked doors, loaded weapons, armed critters).
 //! - [`text`]: names and descriptions for the prototype message files.
 //! - [`icon`]: inventory icons and the item art pair.
+//! - [`int`]: the script assembler ([`int::assemble`]), from the text
+//!   format of `docs/vault-engine-briefs/int-assembler.md` to `.int` bytes.
 //! - [`animation`]: critter animation and weapon codes, suffixes, and the
 //!   files a fighting critter needs.
 //! - [`rebalance`]: source-game figures to Fallout 2 prototype values.
+//! - [`append`]: appenders for the data files a simulation layer extends
+//!   (messages, `vault13.gam`, `scripts.lst`, `quests.txt`, `holodisk.txt`).
+//! - [`map::attach_scripts`]: script records and bindings in a built map.
 //! - [`ModLayer`]: the mod folder and its manifest.
 
 /// The pinned Fallout 2 format crate every adapter here targets.
 pub use vault_formats;
 
 pub mod animation;
+pub mod append;
 pub mod art;
 pub mod critter;
 mod error;
@@ -40,6 +46,7 @@ pub mod fighter;
 pub mod frm;
 pub mod gam;
 pub mod icon;
+pub mod int;
 pub mod items;
 pub mod layer;
 pub mod lst;
@@ -54,6 +61,10 @@ pub mod transit;
 mod writers;
 
 pub use animation::{Anim, AnimationSet, AttackMode, Need, Requirement, WeaponCode};
+pub use append::{
+    Appended, HolodiskRow, QuestRow, ScriptRow, append_globals, append_holodisks,
+    append_message_entries, append_messages, append_quests, append_script_rows,
+};
 pub use art::{
     ArtList, CRITTER_LIST_PATH, CritterArt, CritterList, FID_INDEX_CAP, RESERVED_TILE_ENTRIES,
     TILE_CATEGORY, WALL_CATEGORY, critter_fid, standalone_reserved,
@@ -73,7 +84,10 @@ pub use icon::ItemArt;
 pub use items::{AmmoSpec, ArmorSpec, DamageType, DrugSpec, KeySpec, MiscSpec, Skill, WeaponSpec};
 pub use layer::ModLayer;
 pub use lst::LstLine;
-pub use map::{CritterPlacement, MapEntry, critter_object, map_with_elevations};
+pub use map::{
+    CritterPlacement, MapEntry, ObjectScript, ScriptAttachment, ScriptSite, attach_scripts,
+    attach_scripts_to, critter_object, map_with_elevations,
+};
 pub use msg::{MsgEntry, MsgFile};
 pub use objects::{Loadout, LockState, ProtoSet, Stack};
 pub use proto::{CritterSpec, ProtoList, critter_prototype};

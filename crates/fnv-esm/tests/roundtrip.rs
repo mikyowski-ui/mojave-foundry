@@ -479,6 +479,19 @@ fn npc() -> Npc {
             },
         ],
         death_item: Some(FormId(0x0100_1603)),
+        ai: Some(AiData {
+            aggression: 1,
+            confidence: 3,
+            energy_level: 50,
+            responsibility: 70,
+            mood: 5,
+            services: 0x0000_0403,
+            trained_skill: 4,
+            trainer_level: 30,
+            assistance: 2,
+            aggro_radius_behaviour: 1,
+            aggro_radius: 500,
+        }),
         voice: Some(FormId(0x0100_1604)),
         template: Some(FormId(0x0100_1605)),
         race: Some(FormId(0x0100_1606)),
@@ -512,7 +525,7 @@ fn npc() -> Npc {
         facegen_texture: Some((0..200u8).rev().collect()),
         height: Some(1.02),
         weight: Some(48.0),
-        unknown: vec![sub(b"AIDT", &[7; 20])],
+        unknown: vec![sub(b"QQQQ", &[7; 20])],
     }
 }
 
@@ -668,7 +681,8 @@ fn info() -> Info {
         data: Some(InfoData {
             info_type: 0,
             next_speaker: 1,
-            flags: Some(0x0005),
+            flags: Some(0x0105),
+            short: false,
         }),
         quest: Some(FormId(0x0100_1800)),
         topic: Some(FormId(0x0100_1A00)),
@@ -703,7 +717,8 @@ fn info() -> Info {
         prompt: Some("What do you need?".into()),
         speaker: Some(FormId(0x0100_1600)),
         speech_challenge: Some(3),
-        unknown: vec![sub(b"KNAM", &0x0100_1A40u32.to_le_bytes())],
+        knam: Some(FormId(0x0100_1A40)),
+        unknown: vec![sub(b"QQQQ", &0x0100_1A41u32.to_le_bytes())],
     }
 }
 
@@ -944,7 +959,7 @@ fn samples_cover_every_row_of_the_decoder_table() {
         );
     }
     assert_eq!(DECODERS.len(), 32);
-    assert!(decoder_for(Sig::new(b"GMST")).is_none());
+    assert!(decoder_for(Sig::new(b"SOUN")).is_none());
 }
 
 #[test]

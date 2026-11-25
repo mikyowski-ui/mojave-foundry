@@ -994,6 +994,7 @@ mod tests {
             hidden: false,
             team: None,
             ai_packet: None,
+            ..Default::default()
         }
     }
 
@@ -1018,6 +1019,7 @@ mod tests {
             ],
             unplaced: Vec::new(),
             notes: Vec::new(),
+            ..Default::default()
         };
         let mut logic = LogicInputs::default();
         logic.bases.insert(

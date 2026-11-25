@@ -1,0 +1,47 @@
+; Every grammar rule of spec 5.2, written for the transpiler's tests.
+; Nothing here comes from a game file.
+scn TSGrammarScript
+
+short counter
+int asInt
+long asLong
+float rate
+ref target
+reference other
+
+begin GameMode
+	set counter to counter + 1
+	set rate to ( rate * 2 - 1 ) / 4
+	set asInt to -counter
+	set asLong to !asInt
+	if counter >= 10 && rate < 0.5 || asInt == 3
+		set counter to 0
+	elseif counter != 5
+		set target to player
+	else
+		return
+	endif
+	if ( GetStage TSQuest >= 20 )
+		SetStage TSQuest 30
+	endif
+	TSDoorRef.Lock 50
+	player.AddItem TSKey, 1
+	set counter to player.GetItemCount TSKey + 2
+	set rate to TSQuest.qRate
+	set TSQuest.qCount to 7
+	set asInt to TSMayorRef.mood
+end
+
+begin OnActivate
+	if IsActionRef player == 1
+		Activate
+	endif
+end
+
+begin OnTriggerEnter player
+	ShowMessage TSMessage counter
+end
+
+begin OnDeath
+	RewardXP 10
+end

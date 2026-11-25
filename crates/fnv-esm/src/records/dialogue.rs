@@ -102,9 +102,23 @@ typed_record!(Topic, DIAL);
 /// An `INFO`'s `DATA`: 4 bytes, or 3 or 2 in the older forms.
 ///
 /// Measured on the Fallout 3 master: 634 infos have the 3-byte form (one
-/// flag byte), the rest the 4-byte one. The 3-byte form's flag byte is the
-/// low byte of `flags` here, its high byte zero; encoding always writes the
-/// 4-byte form.
+/// flag byte), the rest the 4-byte one; every New Vegas info has the 4-byte
+/// form. The 3-byte form's flag byte is the low byte of `flags` here, its
+/// high byte zero, and `short` is set, so that the second flag byte reads
+/// as "not stored" ([`InfoData::has_second_flag_byte`]); encoding writes
+/// the form that was read.
+///
+/// # Flags
+///
+/// First byte: bit 0 goodbye, 1 random, 2 say once, 3 run immediately, 4
+/// info refusal, 5 random end, 6 run for rumors, 7 speech challenge. Second
+/// byte: bit 0 say once a day, 1 always darken. Measured: bit 7 is set on
+/// exactly the infos that have a speech-challenge level (`DNAM` from 1 to 5)
+/// and a `KNAM` in Fallout 3 (263 of them), and on the 3 challenge infos
+/// of New Vegas. Bit 6 of the first byte is set on no info of either
+/// master; in the second byte only bits 0 and 1 occur in Fallout 3, and
+/// New Vegas also has bits 4 and 5 (on 28 and 20 infos), which are not
+/// named here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct InfoData {
     /// The dialogue type, as stored (same codes as
@@ -113,8 +127,130 @@ pub struct InfoData {
     /// Who speaks next, as stored: 0 target, 1 self, 2 either.
     pub next_speaker: u8,
     /// The two flag bytes, little-endian; absent from the 2-byte form.
-    /// Bit 0 is "goodbye", bit 1 "random", bit 2 "say once".
+    /// See [`InfoData::GOODBYE`] and the other flag constants.
     pub flags: Option<u16>,
+    /// The stored `DATA` was the 3-byte form: only the first flag byte.
+    pub short: bool,
+}
+
+impl InfoData {
+    /// Flag: ends the conversation after it.
+    pub const GOODBYE: u16 = 0x0001;
+    /// Flag: one of a random group.
+    pub const RANDOM: u16 = 0x0002;
+    /// Flag: said once, never again.
+    pub const SAY_ONCE: u16 = 0x0004;
+    /// Flag: the result script runs right after it begins.
+    pub const RUN_IMMEDIATELY: u16 = 0x0008;
+    /// Flag: said, but the player stays in the same choice list.
+    pub const INFO_REFUSAL: u16 = 0x0010;
+    /// Flag: the last of a random group.
+    pub const RANDOM_END: u16 = 0x0020;
+    /// Flag: run for rumors.
+    pub const RUN_FOR_RUMORS: u16 = 0x0040;
+    /// Flag: a speech challenge (the first flag byte's `0x80`).
+    pub const SPEECH_CHALLENGE: u16 = 0x0080;
+    /// Flag: said once a day (the second flag byte's `0x01`).
+    pub const SAY_ONCE_A_DAY: u16 = 0x0100;
+    /// Flag: always darken the screen (the second flag byte's `0x02`).
+    pub const ALWAYS_DARKEN: u16 = 0x0200;
+
+    /// `DATA` of the 4-byte form.
+    pub fn new(info_type: u8, next_speaker: u8, flags: u16) -> Self {
+        Self {
+            info_type,
+            next_speaker,
+            flags: Some(flags),
+            short: false,
+        }
+    }
+
+    /// `DATA` of the 3-byte form: only the first flag byte.
+    pub fn short_form(info_type: u8, next_speaker: u8, flags: u8) -> Self {
+        Self {
+            info_type,
+            next_speaker,
+            flags: Some(u16::from(flags)),
+            short: true,
+        }
+    }
+
+    /// Whether the second flag byte (say once a day, always darken) was
+    /// stored: the 4-byte form only. When it was not, those two flags read
+    /// as clear.
+    pub fn has_second_flag_byte(&self) -> bool {
+        self.flags.is_some() && !self.short
+    }
+
+    /// Whether every bit of `mask` is set; clear when no flags are stored.
+    pub fn has_flags(&self, mask: u16) -> bool {
+        self.flags.is_some_and(|f| f & mask == mask)
+    }
+
+    /// The goodbye flag.
+    pub fn is_goodbye(&self) -> bool {
+        self.has_flags(Self::GOODBYE)
+    }
+
+    /// The random flag.
+    pub fn is_random(&self) -> bool {
+        self.has_flags(Self::RANDOM)
+    }
+
+    /// The say-once flag.
+    pub fn is_say_once(&self) -> bool {
+        self.has_flags(Self::SAY_ONCE)
+    }
+
+    /// The run-immediately flag.
+    pub fn is_run_immediately(&self) -> bool {
+        self.has_flags(Self::RUN_IMMEDIATELY)
+    }
+
+    /// The info-refusal flag.
+    pub fn is_info_refusal(&self) -> bool {
+        self.has_flags(Self::INFO_REFUSAL)
+    }
+
+    /// The random-end flag.
+    pub fn is_random_end(&self) -> bool {
+        self.has_flags(Self::RANDOM_END)
+    }
+
+    /// The run-for-rumors flag.
+    pub fn is_run_for_rumors(&self) -> bool {
+        self.has_flags(Self::RUN_FOR_RUMORS)
+    }
+
+    /// The speech-challenge flag.
+    pub fn is_speech_challenge(&self) -> bool {
+        self.has_flags(Self::SPEECH_CHALLENGE)
+    }
+
+    /// The say-once-a-day flag; clear in the 3-byte form.
+    pub fn is_say_once_a_day(&self) -> bool {
+        self.has_flags(Self::SAY_ONCE_A_DAY)
+    }
+
+    /// The always-darken flag; clear in the 3-byte form.
+    pub fn is_always_darken(&self) -> bool {
+        self.has_flags(Self::ALWAYS_DARKEN)
+    }
+}
+
+/// The name of a speech-challenge level (`INFO` `DNAM`): 1 very easy, 2
+/// easy, 3 average, 4 hard, 5 very hard; 0 means none. Measured: every
+/// challenge info of both masters has a level from 1 to 5, and the game
+/// settings `iSpeechChallengeDifficulty<Name>` are the five names.
+pub fn speech_difficulty_name(level: u32) -> Option<&'static str> {
+    Some(match level {
+        1 => "VeryEasy",
+        2 => "Easy",
+        3 => "Average",
+        4 => "Hard",
+        5 => "VeryHard",
+        _ => return None,
+    })
 }
 
 /// A response's `TRDT`: 24 bytes, or 20 or 16 in the older forms.
@@ -215,8 +351,13 @@ pub struct Info {
     pub prompt: Option<String>,
     /// The speaker (`ANAM`).
     pub speaker: Option<FormId>,
-    /// The speech challenge level (`DNAM`), as stored.
+    /// The speech challenge level (`DNAM`), as stored; see
+    /// [`speech_difficulty_name`]. Present on every challenge info and on
+    /// many that are not ([`InfoData::is_speech_challenge`] tells).
     pub speech_challenge: Option<u32>,
+    /// The label of a skill check (`KNAM`): the actor value or perk the
+    /// option is tagged with, a form id of an `AVIF` or `PERK` record.
+    pub knam: Option<FormId>,
     /// Subrecords the decoder did not consume.
     pub unknown: Vec<RawSubrecord>,
 }
@@ -242,15 +383,79 @@ impl Info {
     ) -> Self {
         Self {
             common: Common::new(form_id),
-            data: Some(InfoData {
-                info_type: 0,
-                next_speaker: 0,
-                flags: Some(0),
-            }),
+            data: Some(InfoData::new(0, 0, 0)),
             quest: Some(quest.into()),
             responses,
             ..Self::default()
         }
+    }
+
+    /// Sets the `DATA` flags (see [`InfoData::GOODBYE`] and the others),
+    /// in the 4-byte form.
+    #[must_use]
+    pub fn with_flags(mut self, flags: u16) -> Self {
+        let data = self.data.get_or_insert_with(|| InfoData::new(0, 0, 0));
+        data.flags = Some(flags);
+        data.short = false;
+        self
+    }
+
+    /// Sets the type and who speaks next.
+    #[must_use]
+    pub fn with_type(mut self, info_type: u8, next_speaker: u8) -> Self {
+        let data = self.data.get_or_insert_with(|| InfoData::new(0, 0, 0));
+        data.info_type = info_type;
+        data.next_speaker = next_speaker;
+        self
+    }
+
+    /// Sets the skill-check label (`KNAM`).
+    #[must_use]
+    pub fn with_knam(mut self, label: impl Into<FormId>) -> Self {
+        self.knam = Some(label.into());
+        self
+    }
+
+    /// Sets the speech-challenge level (`DNAM`).
+    #[must_use]
+    pub fn with_speech_challenge(mut self, level: u32) -> Self {
+        self.speech_challenge = Some(level);
+        self
+    }
+
+    /// Sets the conditions.
+    #[must_use]
+    pub fn with_conditions(mut self, conditions: Vec<Condition>) -> Self {
+        self.conditions = conditions;
+        self
+    }
+
+    /// Sets the topic choices (`TCLT`).
+    #[must_use]
+    pub fn with_choices(mut self, choices: Vec<FormId>) -> Self {
+        self.choices = choices;
+        self
+    }
+
+    /// Sets the speaker (`ANAM`).
+    #[must_use]
+    pub fn with_speaker(mut self, speaker: impl Into<FormId>) -> Self {
+        self.speaker = Some(speaker.into());
+        self
+    }
+
+    /// Sets the result script that runs when the response begins.
+    #[must_use]
+    pub fn with_result_begin(mut self, script: ScriptBody) -> Self {
+        self.result_begin = script;
+        self
+    }
+
+    /// Sets the result script that runs when the response ends.
+    #[must_use]
+    pub fn with_result_end(mut self, script: ScriptBody) -> Self {
+        self.result_end = script;
+        self
     }
 
     fn decode_fields(&mut self, subs: &[SubrecordRef<'_>]) {
@@ -319,6 +524,7 @@ impl Info {
                 b"RNAM" => set(&mut self.prompt, zstring(d)),
                 b"ANAM" => set(&mut self.speaker, one_form(d)),
                 b"DNAM" => set(&mut self.speech_challenge, one_u32(d)),
+                b"KNAM" => set(&mut self.knam, one_form(d)),
                 _ => false,
             }
         });
@@ -330,6 +536,7 @@ impl Info {
             self.data.map(|d| {
                 let w = Wr::default().u8(d.info_type).u8(d.next_speaker);
                 match d.flags {
+                    Some(flags) if d.short => w.u8(flags as u8),
                     Some(flags) => w.u16(flags),
                     None => w,
                 }
@@ -376,6 +583,7 @@ impl Info {
         out.zstr(b"RNAM", &self.prompt);
         out.form(b"ANAM", self.speaker);
         out.u32(b"DNAM", self.speech_challenge);
+        out.form(b"KNAM", self.knam);
     }
 }
 
@@ -397,6 +605,7 @@ fn parse_data(data: &[u8]) -> Option<InfoData> {
         info_type,
         next_speaker,
         flags,
+        short: data.len() == 3,
     })
 }
 

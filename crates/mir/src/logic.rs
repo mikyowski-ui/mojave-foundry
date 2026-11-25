@@ -2,9 +2,13 @@
 //! notes, AI packages, the packages actors use, conditions, and the set of
 //! placed references that something points at.
 //!
-//! These tables arrived with [`crate::RECORDS_REVISION`] 1. On a file
-//! written before them every method here returns
-//! [`MirError::MissingTable`]; extracting again rebuilds the file.
+//! These tables arrived with [`crate::RECORDS_REVISION`] 1; the globals,
+//! game settings, messages, factions, actor AI data and factions, info
+//! links, package events, script contexts and decode skips with revision 2.
+//! On a file written before a table every method that reads it returns
+//! [`MirError::MissingTable`]; extracting again rebuilds the file. The
+//! columns revision 2 added to older tables (`conditions`, `infos`,
+//! `packages`) read as absent on an older file.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -15,7 +19,9 @@ use crate::error::MirError;
 use crate::paths::FormKey;
 use crate::reader::Records;
 
-fn form(text: Option<String>) -> Option<FormKey> {
+use fnv_esm::PackageData;
+
+pub(crate) fn form(text: Option<String>) -> Option<FormKey> {
     text.and_then(|t| t.parse().ok())
 }
 
@@ -43,6 +49,13 @@ pub struct ConditionRow {
     pub reference: Option<FormKey>,
     /// OR-ed with the next condition.
     pub is_or: bool,
+    /// The placed reference the first parameter names, for the functions
+    /// that take one (`fnv_esm::REFERENCE_PARAMETER_FUNCTIONS`) when it
+    /// resolves to one; `None` otherwise. Revision 2.
+    pub param1_ref: Option<FormKey>,
+    /// The placed reference the second parameter names, as
+    /// [`Self::param1_ref`]. Revision 2.
+    pub param2_ref: Option<FormKey>,
 }
 
 /// One menu item of a terminal.
@@ -179,6 +192,46 @@ pub struct PackageRow {
     /// Event scripts with source text: `("on begin" | "on end" |
     /// "on change", source)`.
     pub scripts: Vec<(String, String)>,
+    /// The size of the stored `PKDT`: 8 or 12. Revision 2.
+    pub pkdt_size: Option<u8>,
+    /// The behaviour flags, `None` when `PKDT` has none or stores the
+    /// uninitialised fill (`fnv_esm::PackageData::behaviour_flags`).
+    /// Revision 2.
+    pub behaviour_flags: Option<u16>,
+    /// The behaviour word as stored, fill included. Revision 2.
+    pub behaviour_flags_raw: Option<u16>,
+    /// The type-specific flags; `None` in the 8-byte form. Revision 2.
+    pub type_flags: Option<u16>,
+    /// The three event blocks that are present, in order, with their idle
+    /// and topic and script source. Revision 2.
+    pub events: Vec<PackageEventRow>,
+}
+
+impl PackageRow {
+    /// The `PKDT` as `fnv_esm` reads it, for its named flag accessors
+    /// (`must_reach_location`, `always_run`, `sandbox_flag_names`, ...).
+    /// `None` when the package has none.
+    pub fn data(&self) -> Option<PackageData> {
+        let (flags, package_type) = (self.flags?, self.package_type?);
+        let behaviour = self.behaviour_flags_raw.unwrap_or(0);
+        Some(match self.type_flags {
+            Some(type_flags) => PackageData::new(package_type, flags, behaviour, type_flags),
+            None => PackageData::short(package_type, flags, behaviour),
+        })
+    }
+}
+
+/// One event block of a package (`POBA`, `POEA`, `POCA`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageEventRow {
+    /// `"on begin"`, `"on end"` or `"on change"`.
+    pub event: String,
+    /// The idle played (`INAM`).
+    pub idle: Option<FormKey>,
+    /// The topic said (`TNAM`).
+    pub topic: Option<FormKey>,
+    /// The script's source text, when it has any.
+    pub script_source: Option<String>,
 }
 
 /// Why a placed reference is pointed at; see [`Records::referenced_refs`].
@@ -202,6 +255,24 @@ pub enum RefReason {
     PackageTarget,
     /// A package's location (`PLDT`, `PLD2`).
     PackageLocation,
+    /// A reference named by a parameter of a condition
+    /// (`conditions.param1_ref`, `param2_ref`): `GetIsReference`,
+    /// `GetDistance`, `GetInSameCell` and the other functions of
+    /// `fnv_esm::REFERENCE_PARAMETER_FUNCTIONS`. Revision 2.
+    ConditionParam,
+    /// The destination door of a teleport door (`XTEL`), which `MoveTo`
+    /// into another map needs. `by` is the door that teleports. Revision 2.
+    TeleportDestination,
+}
+
+impl RefReason {
+    /// The reasons [`Records::referenced_refs`] counts: every one but
+    /// those revision 2 added ([`RefReason::ConditionParam`] and
+    /// [`RefReason::TeleportDestination`]), so that a pass that keeps the
+    /// referenced references (declutter) keeps the set it always kept.
+    pub fn is_legacy(self) -> bool {
+        !matches!(self, Self::ConditionParam | Self::TeleportDestination)
+    }
 }
 
 /// One thing pointing at a placed reference.
@@ -232,10 +303,10 @@ pub struct QuestTargetRow {
     pub flags: u8,
 }
 
-const CONDITION_COLUMNS: &str =
-    "context, function, comparison, value, global, param1, param2, run_on, reference, is_or";
+pub(crate) const CONDITION_COLUMNS: &str = "context, function, comparison, value, global, param1, param2, \
+     run_on, reference, is_or";
 
-fn condition_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ConditionRow> {
+pub(crate) fn condition_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ConditionRow> {
     Ok(ConditionRow {
         context: r.get(0)?,
         function: r.get::<_, i64>(1)? as u32,
@@ -247,12 +318,14 @@ fn condition_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ConditionRow> {
         run_on: r.get::<_, i64>(7)? as u32,
         reference: form(r.get(8)?),
         is_or: r.get(9)?,
+        param1_ref: form(r.get(10)?),
+        param2_ref: form(r.get(11)?),
     })
 }
 
 impl Records {
     /// Fails with [`MirError::MissingTable`] when the file lacks a table.
-    fn require(&self, table: &'static str) -> Result<(), MirError> {
+    pub(crate) fn require(&self, table: &'static str) -> Result<(), MirError> {
         let found: Option<i64> = self
             .connection()
             .query_row(
@@ -281,14 +354,40 @@ impl Records {
         }
     }
 
+    /// Whether a table has a column; the columns revision 2 added are
+    /// absent from an older file.
+    pub(crate) fn has_column(&self, table: &str, column: &str) -> Result<bool, MirError> {
+        let found: Option<i64> = self
+            .connection()
+            .query_row(
+                "SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2",
+                [table, column],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    /// `column` when the table has it, else `NULL`.
+    pub(crate) fn column_or_null(&self, table: &str, column: &str) -> Result<String, MirError> {
+        Ok(if self.has_column(table, column)? {
+            column.to_owned()
+        } else {
+            "NULL".to_owned()
+        })
+    }
+
     /// The conditions of a record, in file order.
     ///
     /// # Errors
     ///
     /// SQLite errors.
     pub fn conditions(&self, owner: &FormKey) -> Result<Vec<ConditionRow>, MirError> {
-        let sql =
-            format!("SELECT {CONDITION_COLUMNS} FROM conditions WHERE owner = ?1 ORDER BY seq");
+        let p1 = self.column_or_null("conditions", "param1_ref")?;
+        let p2 = self.column_or_null("conditions", "param2_ref")?;
+        let sql = format!(
+            "SELECT {CONDITION_COLUMNS}, {p1}, {p2} FROM conditions WHERE owner = ?1 ORDER BY seq"
+        );
         let mut statement = self.connection().prepare(&sql)?;
         let rows = statement.query_map([owner.to_string()], condition_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -456,12 +555,22 @@ impl Records {
         } else {
             ""
         };
+        let extra = [
+            "pkdt_size",
+            "behaviour_flags",
+            "behaviour_raw",
+            "type_flags",
+        ]
+        .iter()
+        .map(|c| self.column_or_null("packages", c))
+        .collect::<Result<Vec<_>, _>>()?
+        .join(", ");
         let sql = format!(
             "SELECT form, editor_id, package_type, type_name, flags, month, day_of_week, date, \
              hour, duration, location_type, location, location_value, location_radius, \
              location2_type, location2, location2_value, location2_radius, target_type, target, \
              target_value, target_count, target2_type, target2, target2_value, target2_count, \
-             dialogue_topic, combat_style FROM packages{filter} ORDER BY form"
+             dialogue_topic, combat_style, {extra} FROM packages{filter} ORDER BY form"
         );
         let mut statement = conn.prepare(&sql)?;
         let map = |r: &rusqlite::Row<'_>| {
@@ -515,6 +624,11 @@ impl Records {
                 combat_style: form(r.get(27)?),
                 conditions: Vec::new(),
                 scripts: Vec::new(),
+                pkdt_size: int(28)?.map(|v| v as u8),
+                behaviour_flags: int(29)?.map(|v| v as u16),
+                behaviour_flags_raw: int(30)?.map(|v| v as u16),
+                type_flags: int(31)?.map(|v| v as u16),
+                events: Vec::new(),
             })
         };
         let mut packages: Vec<PackageRow> = match only {
@@ -526,12 +640,28 @@ impl Records {
         let mut scripts = conn.prepare(
             "SELECT context, source FROM embedded_scripts WHERE owner = ?1 ORDER BY rowid",
         )?;
+        let have_events = self.require("package_events").is_ok();
         for package in &mut packages {
             package.conditions = self.conditions(&package.form)?;
             let rows = scripts.query_map([package.form.to_string()], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
             })?;
             package.scripts = rows.collect::<Result<_, _>>()?;
+            if have_events {
+                let mut events = conn.prepare(
+                    "SELECT event, idle, topic, script_source FROM package_events \
+                     WHERE package = ?1 ORDER BY rowid",
+                )?;
+                let rows = events.query_map([package.form.to_string()], |r| {
+                    Ok(PackageEventRow {
+                        event: r.get(0)?,
+                        idle: form(r.get(1)?),
+                        topic: form(r.get(2)?),
+                        script_source: r.get(3)?,
+                    })
+                })?;
+                package.events = rows.collect::<Result<_, _>>()?;
+            }
         }
         Ok(packages)
     }
@@ -623,13 +753,15 @@ impl Records {
     /// Everything that points at a placed reference, over the whole plugin
     /// list, sorted: quest objective targets, script reference lists,
     /// conditions run on a reference, linked references, enable parents
-    /// (both sides) and package targets and locations. Only forms that are
+    /// (both sides), package targets and locations, condition parameters
+    /// that name a reference and teleport destinations. Only forms that are
     /// placed references (`placed_refs`) are listed.
     ///
-    /// Cost: ten SQL queries, each one pass over its source table
-    /// (`quest_targets`, `script_refs`, `conditions`, `placed_refs` three
-    /// times, `packages` four times, once per column) with a primary-key
-    /// lookup in `placed_refs` per row, then a sort; memory is one
+    /// Cost: thirteen SQL queries, each one pass over its source table
+    /// (`quest_targets`, `script_refs`, `conditions` three times,
+    /// `placed_refs` four times, `packages` four times, once per column)
+    /// with a primary-key lookup in `placed_refs` per row, then a sort;
+    /// memory is one
     /// [`Referral`] per row found. Measured on the retail masters: 0.25 s
     /// for Fallout 3 (573,610 placed references, 49,448 conditions, 19,362
     /// script references; 14,274 references found) and 0.29 s for New
@@ -642,7 +774,8 @@ impl Records {
         for table in ["quest_targets", "script_refs", "packages"] {
             self.require(table)?;
         }
-        let queries: [(RefReason, &str); 10] = [
+        let new_tables = self.has_column("conditions", "param1_ref")?;
+        let queries: [(RefReason, &str); 13] = [
             (
                 RefReason::QuestTarget,
                 "SELECT q.target, q.quest, 'objective ' || q.objective FROM quest_targets q \
@@ -693,9 +826,29 @@ impl Records {
                 "SELECT k.location2, k.form, 'location 2' FROM packages k \
                  JOIN placed_refs p ON p.form = k.location2",
             ),
+            (
+                RefReason::ConditionParam,
+                "SELECT c.param1_ref, c.owner, c.context || ' parameter 1' FROM conditions c \
+                 JOIN placed_refs p ON p.form = c.param1_ref",
+            ),
+            (
+                RefReason::ConditionParam,
+                "SELECT c.param2_ref, c.owner, c.context || ' parameter 2' FROM conditions c \
+                 JOIN placed_refs p ON p.form = c.param2_ref",
+            ),
+            (
+                RefReason::TeleportDestination,
+                "SELECT r.teleport_door, r.form, 'teleport destination' FROM placed_refs r \
+                 JOIN placed_refs p ON p.form = r.teleport_door",
+            ),
         ];
         let mut out = Vec::new();
         for (reason, sql) in queries {
+            // The two reasons of revision 2 need its columns; an older
+            // file has no such references to find.
+            if !new_tables && !reason.is_legacy() && sql.contains("param") {
+                continue;
+            }
             let mut statement = self.connection().prepare(sql)?;
             let rows = statement.query_map([], |r| {
                 Ok((
@@ -740,12 +893,30 @@ impl Records {
     }
 
     /// The placed references something points at, for a declutter pass
-    /// that must keep them: see [`Records::ref_referrals`].
+    /// that must keep them: see [`Records::ref_referrals`]. Only the
+    /// reasons of [`RefReason::is_legacy`] count, which is the set this
+    /// method has always returned; [`Records::referenced_refs_all`] adds
+    /// condition parameters and teleport destinations.
     ///
     /// # Errors
     ///
     /// As [`Records::ref_referrals`].
     pub fn referenced_refs(&self) -> Result<BTreeSet<FormKey>, MirError> {
+        Ok(self
+            .ref_referrals()?
+            .into_iter()
+            .filter(|r| r.reason.is_legacy())
+            .map(|r| r.reference)
+            .collect())
+    }
+
+    /// Every placed reference something points at, whatever the reason
+    /// ([`RefReason`], revision 2's two included).
+    ///
+    /// # Errors
+    ///
+    /// As [`Records::ref_referrals`].
+    pub fn referenced_refs_all(&self) -> Result<BTreeSet<FormKey>, MirError> {
         Ok(self
             .ref_referrals()?
             .into_iter()
