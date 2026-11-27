@@ -129,6 +129,9 @@ impl Builder<'_> {
                 "NOTE" => {
                     self.uses.notes.insert(named.form.clone());
                 }
+                "MESG" => {
+                    self.uses.messages.insert(named.form.clone());
+                }
                 _ if named.is_placed() => self.uses.mark(&named.form, RefUses::SCRIPT),
                 _ => {}
             }

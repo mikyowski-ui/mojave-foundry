@@ -12,8 +12,8 @@ use fnv_esm::fixture::{CellSpec, PluginBuilder, WorldSpec};
 use fnv_esm::{Cell, RawRecord, World};
 use mir::fixture::{CHILD_WORLDSPACE, Fallout3Town, fallout3_town, mini_town};
 use mir::{
-    ExtractOptions, ExtractSummary, GameVariant, Mir, MirError, RawStore, RefReason, Slice,
-    extract, extract_for_game,
+    ExtractOptions, ExtractSummary, GameVariant, Mir, MirError, PrimitiveDoc, PrimitiveShape,
+    RawStore, RefReason, Slice, extract, extract_for_game,
 };
 
 struct Run {
@@ -208,6 +208,43 @@ fn a_child_worldspace_takes_its_parents_land() {
     // The other persistent reference stands in (1, 0).
     assert!(own.reference(&r.town.persistent_ref).is_some());
     assert!(mir.report_text().unwrap().contains("2 notes.\n"));
+}
+
+/// A sphere primitive on an activator of the Fallout 3 install (header
+/// version 0.94) is a trigger volume with its shape and bounds kept; the
+/// New Vegas install's box is checked in `extract.rs`.
+#[test]
+fn a_fallout3_trigger_volume_keeps_its_primitive() {
+    let r = run();
+    let mir = Mir::open(&r.out).unwrap();
+    let doc = mir
+        .cell(CHILD_WORLDSPACE, 0, 0)
+        .unwrap()
+        .expect("cell 0, 0");
+    let trigger = doc.reference(&r.town.trigger_volume).unwrap();
+    assert!(trigger.trigger_volume);
+    assert_eq!(trigger.base_kind.as_deref(), Some("ACTI"));
+    assert_eq!(
+        trigger.primitive,
+        Some(PrimitiveDoc {
+            bounds: [192.0, 192.0, 192.0],
+            shape: PrimitiveShape::Sphere,
+        })
+    );
+    let flagged: Vec<_> = doc.references.iter().filter(|r| r.trigger_volume).collect();
+    assert_eq!(flagged.len(), 1);
+    // Nothing else carries a primitive, and the field stays out of their JSON.
+    assert_eq!(
+        doc.references
+            .iter()
+            .filter(|r| r.primitive.is_some())
+            .count(),
+        1
+    );
+    let json = fs::read_to_string(r.out.join("cells/mwtownworld/0_0.json")).unwrap();
+    let compact: String = json.split_whitespace().collect();
+    assert_eq!(compact.matches("\"primitive\"").count(), 1);
+    assert!(compact.contains("\"shape\":\"sphere\""));
 }
 
 #[test]

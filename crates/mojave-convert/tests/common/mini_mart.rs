@@ -18,10 +18,12 @@ use std::path::{Path, PathBuf};
 use fnv_bsa::fixture::BsaBuilder;
 use fnv_esm::fixture::{CellSpec, FALLOUT3_PLUGIN_VERSION, PluginBuilder, WorldSpec, flat_heights};
 use fnv_esm::{
-    ActorBase, Armor, ArmorData, BipedData, Cell, Container, ContainerItem, Door, Eyes,
-    FactionRank, FormId, Hair, Land, LeveledEntry, LeveledKind, LeveledList, Lock, MiscItem,
-    NavTriangle, Navmesh, Npc, NpcStats, PlacedKind, PlacedRef, Race, RaceData, RacePart,
-    RaceParts, RawRecord, RawSubrecord, Rgb, Static, World,
+    ActorBase, Armor, ArmorData, BipedData, Cell, Comparison, Condition, Container, ContainerItem,
+    Door, Eyes, FactionRank, FormId, Hair, Info, Land, LeveledEntry, LeveledKind, LeveledList,
+    Lock, MiscItem, NavTriangle, Navmesh, Npc, NpcStats, PackageData, PlacedKind, PlacedRef, Quest,
+    QuestLogEntry, QuestObjective, QuestStage, Race, RaceData, RacePart, RaceParts, RawRecord,
+    RawSubrecord, Response, Rgb, ScriptBody, ScriptReference, Static, Terminal, TerminalData,
+    TerminalMenuItem, Topic, TopicData, World,
 };
 use nif::fixture::{box_mesh, walk_kf};
 
@@ -107,6 +109,21 @@ pub const R_TRIGGER: u32 = 0x945;
 pub const R_LINKED_DOOR: u32 = 0x946;
 const TRIGGER_BASE: u32 = 0x827;
 const CLERK_PACKAGE: u32 = 0x860;
+
+/// What [`write_sim`] adds on top of [`write_groups`]: a quest whose stage
+/// the clerk's greeting sets, the clerk's dialogue (a greeting and a
+/// top-level topic), a placed terminal, and a sandbox package that keeps
+/// the gunner near a marker the slicer skips.
+pub const QUEST: u32 = 0x870;
+pub const GREETING: u32 = 0x871;
+pub const GREETING_INFO: u32 = 0x872;
+pub const JOB_TOPIC: u32 = 0x873;
+pub const JOB_INFO: u32 = 0x874;
+pub const TERMINAL: u32 = 0x875;
+pub const MARKER: u32 = 0x828;
+pub const GUNNER_SANDBOX: u32 = 0x861;
+pub const R_TERMINAL: u32 = 0x947;
+pub const R_MARKER: u32 = 0x948;
 
 /// The upper storey's height (a mezzanine east of the shop floor, up a
 /// ramp of slope 1).
@@ -219,7 +236,7 @@ fn bc1(rgb: [u8; 3]) -> Vec<u8> {
 
 /// Writes the install under `dir` (`dir/Data/...`).
 pub fn write(dir: &Path) -> MiniMart {
-    write_install(dir, false, false)
+    write_install(dir, false, false, false)
 }
 
 /// The linked mart (as [`write_linked`]) with the references of
@@ -239,6 +256,23 @@ pub fn write_groups(dir: &Path) -> LinkedMart {
     }
 }
 
+/// The groups mart (as [`write_groups`]) with the records of [`QUEST`]
+/// and the rest, and `sim.layer.toml`: the same two maps as
+/// `groups.layer.toml` with `sim = true`.
+pub fn write_sim(dir: &Path) -> LinkedMart {
+    let mart = write_linked_flags(dir, true, true);
+    let layer = "name = \"minimart-sim\"\nstart = \"mmlot\"\npresence_copies = true\nsim = true\n\n\
+                 [all_maps]\nwire = true\nenable_groups = true\n\n\
+                 [[maps]]\nslice = \"lot.toml\"\nmap = \"mmlot\"\n\n\
+                 [[maps]]\nslice = \"store.toml\"\nmap = \"mmstore\"\nstoreys = \"auto\"\n";
+    let layer_file = dir.join("sim.layer.toml");
+    std::fs::write(&layer_file, layer).expect("the layer file");
+    LinkedMart {
+        data_dir: mart.data_dir,
+        layer_file,
+    }
+}
+
 /// The install with the mezzanine (a shelf and a raider up there), and
 /// beside it `lot.toml` (the car park outside the store's door),
 /// `store.toml` (the store, its storeys split) and `mart.layer.toml`
@@ -248,7 +282,11 @@ pub fn write_linked(dir: &Path) -> LinkedMart {
 }
 
 fn write_linked_with(dir: &Path, groups: bool) -> LinkedMart {
-    let mart = write_install(dir, true, groups);
+    write_linked_flags(dir, groups, false)
+}
+
+fn write_linked_flags(dir: &Path, groups: bool, sim: bool) -> LinkedMart {
+    let mart = write_install(dir, true, groups, sim);
     let lot = format!(
         "name = \"minimart-lot\"\ngame = \"fo3\"\nworldspace = \"{WORLDSPACE}\"\n\
          plugins = [\"{PLUGIN}\"]\nx = [0, 0]\ny = [0, 0]\ninterior_depth = 1\n\
@@ -267,7 +305,90 @@ fn write_linked_with(dir: &Path, groups: bool) -> LinkedMart {
     }
 }
 
-fn write_install(dir: &Path, upper: bool, groups: bool) -> MiniMart {
+fn is_id(base: u32) -> Condition {
+    Condition::float(72, Comparison::Equal, 1.0).with_params(base, 0)
+}
+
+fn script_body(source: &str, references: &[u32]) -> ScriptBody {
+    ScriptBody {
+        references: references
+            .iter()
+            .map(|&r| ScriptReference::Form(FormId(r)))
+            .collect(),
+        ..ScriptBody::from_source(source)
+    }
+}
+
+/// The quest, the clerk's dialogue, the terminal, the marker and the
+/// gunner's sandbox package.
+fn sim_records(plugin: &mut PluginBuilder) {
+    let mut quest = Quest::new(QUEST, "MMQuest", "Clean Up the Mart");
+    let met = QuestLogEntry {
+        script: script_body("SetObjectiveDisplayed MMQuest 10 1", &[QUEST]),
+        ..QuestLogEntry::new("The clerk wants the raiders gone.")
+    };
+    quest.stages = vec![
+        QuestStage {
+            index: 10,
+            entries: vec![met],
+        },
+        QuestStage {
+            index: 20,
+            entries: vec![QuestLogEntry::new("The raiders are gone.")],
+        },
+    ];
+    quest.objectives = vec![QuestObjective {
+        index: 10,
+        description: Some("Clear out the raiders.".into()),
+        targets: Vec::new(),
+    }];
+    plugin.add(quest);
+    let mut hello = Info::new(
+        GREETING_INFO,
+        QUEST,
+        vec![Response::new(1, "Welcome to the Mini Mart.")],
+    );
+    hello.conditions = vec![is_id(CLERK)];
+    hello.choices = vec![FormId(JOB_TOPIC)];
+    hello.result_end = script_body("SetStage MMQuest 10", &[QUEST]);
+    plugin.topic(Topic::new(GREETING, "GREETING", "", QUEST), vec![hello]);
+    let mut job = Info::new(
+        JOB_INFO,
+        QUEST,
+        vec![Response::new(1, "Clear out the raiders, please.")],
+    );
+    job.conditions = vec![is_id(CLERK)];
+    job.prompt = Some("Any work?".into());
+    let mut topic = Topic::new(JOB_TOPIC, "MMJobTopic", "Work", QUEST);
+    topic.data = Some(TopicData {
+        topic_type: 0,
+        flags: Some(0x02),
+    });
+    plugin.topic(topic, vec![job]);
+    let mut terminal = Terminal::new(TERMINAL, "MMTerminal", "Store Terminal", "INVENTORY");
+    terminal.common = terminal.common.clone().with_model("minimart\\register.nif");
+    terminal.data = Some(TerminalData {
+        difficulty: 1,
+        flags: 0,
+        server_type: 0,
+    });
+    terminal.items = vec![TerminalMenuItem::new(
+        "Read the stock list",
+        "Ten cans of beans.",
+    )];
+    plugin.add(terminal);
+    plugin.add(Static::new(MARKER, "XMarker", "minimart\\xmarker.nif"));
+    let mut sandbox = fnv_esm::Package::new(GUNNER_SANDBOX, "MMGunnerSandbox", 12)
+        .with_data(PackageData::new(12, 0, 0, 0x0020));
+    sandbox.location = Some(fnv_esm::PackageLocation {
+        location_type: fnv_esm::PackageLocation::NEAR_REFERENCE,
+        value: R_MARKER,
+        radius: 256,
+    });
+    plugin.add(sandbox);
+}
+
+fn write_install(dir: &Path, upper: bool, groups: bool, sim: bool) -> MiniMart {
     let data = dir.join("Data");
     std::fs::create_dir_all(&data).expect("data dir");
     let mut plugin = PluginBuilder::new();
@@ -326,6 +447,9 @@ fn write_install(dir: &Path, upper: bool, groups: bool) -> MiniMart {
             radius: 256,
         });
         plugin.add(package);
+    }
+    if sim {
+        sim_records(&mut plugin);
     }
     plugin.add(Door::new(
         FRONT_DOOR_BASE,
@@ -575,7 +699,7 @@ fn write_install(dir: &Path, upper: bool, groups: bool) -> MiniMart {
         npc.unknown.push(ai_data(aggression));
         npc
     };
-    plugin.add(person(
+    let mut gunner = person(
         GUNNER,
         "MMRaiderGunner",
         "Raider",
@@ -589,7 +713,11 @@ fn write_install(dir: &Path, upper: bool, groups: bool) -> MiniMart {
             ContainerItem::new(AMMO_10MM, 24),
             ContainerItem::new(STIMPAK, 1),
         ],
-    ));
+    );
+    if sim {
+        gunner.packages = vec![FormId(GUNNER_SANDBOX)];
+    }
+    plugin.add(gunner);
     plugin.add(person(
         RAIDER,
         "MMRaider",
@@ -729,6 +857,11 @@ fn write_install(dir: &Path, upper: bool, groups: bool) -> MiniMart {
                 }),
             )
             .with_temporary(linked_door);
+    }
+    if sim {
+        inside = inside
+            .with_temporary(at(R_TERMINAL, TERMINAL, [-450.0, -300.0, 0.0]))
+            .with_temporary(at(R_MARKER, MARKER, [-100.0, -250.0, 0.0]));
     }
     if upper {
         inside = inside

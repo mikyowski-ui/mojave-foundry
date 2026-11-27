@@ -380,6 +380,7 @@ impl Builder<'_> {
             return;
         };
         let editor_id = quest.editor_id.clone().unwrap_or_default();
+        let condition = self.lower_cond(&quest.conditions, &id);
         let name = self
             .texts
             .intern_opt(&id, TextRole::QuestName, quest.name.as_deref());
@@ -466,6 +467,7 @@ impl Builder<'_> {
                 vars,
                 stages,
                 objectives,
+                condition,
             },
         );
     }

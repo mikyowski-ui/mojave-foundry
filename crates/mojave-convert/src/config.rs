@@ -217,6 +217,12 @@ pub struct SliceSpec {
     /// off: such references are left out as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enable_groups: Option<bool>,
+    /// `sim = true` (Pass 2, task T9): `all` runs the simulation stage
+    /// (`crate::sim`) after the map stage, which needs nothing more than
+    /// the run's output and the Fallout 2 install. Default off. A layer
+    /// takes the layer file's top-level `sim` key as well.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sim: Option<bool>,
     /// `hostile_packet = <n>`: the AI packet number hostile people take
     /// when `loot` is on (`crate::catalogue`), instead of the rebalance
     /// table's (`convert.hostility.hostile_packet`, then
@@ -299,6 +305,7 @@ impl Default for SliceSpec {
             coverage_bridges: None,
             close_unreached: None,
             enable_groups: None,
+            sim: None,
             hostile_packet: None,
         }
     }
@@ -860,6 +867,9 @@ pub struct Inputs {
     /// `--cache-dir`: where the map stage keeps its renders and grounds
     /// (`crate::cache`). `None`: `<out>/cache`.
     pub cache_dir: Option<PathBuf>,
+    /// The `[sim]` table of the `--config` file (`foundry.toml`): the
+    /// simulation stage's build options. Defaults: the owner decisions.
+    pub sim: transpile::ir::SimConfig,
 }
 
 impl Inputs {
@@ -912,6 +922,7 @@ impl Inputs {
             layer: None,
             with_interiors: false,
             cache_dir: None,
+            sim: transpile::ir::SimConfig::default(),
         })
     }
 
@@ -1071,9 +1082,17 @@ impl Inputs {
             path: path.to_owned(),
             source,
         })?;
-        self.calibration = foundry_render::Calibration::from_toml(&text)
+        let (calibration, sim) = split_config(&text)
             .map_err(|e| ConvertError::stage("config", format!("{}: {e}", path.display())))?;
+        self.calibration = calibration;
+        self.sim = sim;
         Ok(self)
+    }
+
+    /// Whether `all` runs the simulation stage: the layer file's `sim`, or
+    /// the slice's (default off).
+    pub fn sim_on(&self) -> bool {
+        self.layer.as_ref().is_some_and(|l| l.sim) || self.slice.sim.unwrap_or(false)
     }
 
     /// An interior slice builds a standalone demo map only: without
@@ -1173,24 +1192,56 @@ impl Inputs {
     /// Reads one file of the Fallout 2 install: a loose file under `data/`
     /// wins over the main archive.
     pub fn f2_file(&self, path: &str) -> Result<Vec<u8>, ConvertError> {
+        f2_file_in(&self.f2, self.f2_master.as_deref(), path)
+    }
+}
+
+/// A calibration file's text: the calibration, and its `[sim]` table (the
+/// simulation stage's options; the calibration itself refuses unknown
+/// keys, so the table is taken out first).
+pub fn split_config(
+    text: &str,
+) -> Result<(foundry_render::Calibration, transpile::ir::SimConfig), String> {
+    let mut table: toml::Table = toml::from_str(text).map_err(|e| e.to_string())?;
+    let sim = match table.remove("sim") {
+        Some(value) => value
+            .try_into::<transpile::ir::SimConfig>()
+            .map_err(|e| format!("[sim]: {e}"))?,
+        None => transpile::ir::SimConfig::default(),
+    };
+    let rest = toml::to_string(&table).map_err(|e| e.to_string())?;
+    let calibration = foundry_render::Calibration::from_toml(&rest).map_err(|e| e.to_string())?;
+    Ok((calibration, sim))
+}
+
+/// The main archive of a Fallout 2 install, or `None` when it is loose
+/// files only; an error when `f2` is no install.
+pub fn f2_master(f2: &Path) -> Result<Option<PathBuf>, ConvertError> {
+    find_master(f2)
+}
+
+/// Reads one file of the Fallout 2 install at `f2` (main archive `master`,
+/// [`f2_master`]): a loose file under `data/` wins over the archives.
+pub fn f2_file_in(f2: &Path, master: Option<&Path>, path: &str) -> Result<Vec<u8>, ConvertError> {
+    {
         let f2_error = |reason: String| ConvertError::F2 {
-            path: self.f2.clone(),
+            path: f2.to_owned(),
             reason,
         };
-        let loose = self.f2.join("data").join(path.replace('\\', "/"));
+        let loose = f2.join("data").join(path.replace('\\', "/"));
         if loose.is_file() {
             return std::fs::read(&loose).map_err(|source| ConvertError::Io {
                 path: loose,
                 source,
             });
         }
-        let Some(master) = &self.f2_master else {
+        let Some(master) = master else {
             return Err(f2_error(format!("{path}: not found under data/")));
         };
         // Later archives override earlier ones, as the game mounts them.
-        let mut archives = vec![master.clone()];
+        let mut archives = vec![master.to_owned()];
         for name in ["critter.dat", "patch000.dat"] {
-            let extra = self.f2.join(name);
+            let extra = f2.join(name);
             if extra.is_file() {
                 archives.push(extra);
             }
@@ -1412,6 +1463,7 @@ interior = "TestRoomInterior"
             layer: None,
             with_interiors: false,
             cache_dir: None,
+            sim: transpile::ir::SimConfig::default(),
         };
         let error = inputs.check_mode().expect_err("refused").to_string();
         assert!(error.contains("--standalone"), "{error}");
@@ -1445,6 +1497,7 @@ interior = "TestRoomInterior"
             layer: None,
             with_interiors: false,
             cache_dir: None,
+            sim: transpile::ir::SimConfig::default(),
         };
         let look = |i: &Inputs| i.critter_settings().expect("settings").look;
         // Declutter off: nothing set, at any level.

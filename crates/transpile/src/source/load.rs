@@ -1,12 +1,23 @@
 //! Filling a [`SimSource`] from a MIR.
 //!
-//! Today's MIR has typed queries for scripts, terminals, notes, packages
-//! and conditions; the rest (topics, INFOs with their choices, quests with
-//! their stage scripts, globals, actor factions) is decoded here from the
-//! lossless raw store through `fnv_esm`'s decoders, and the few columns no
-//! query returns are read through `Records::connection`. Every such read
-//! is in this file, so that the typed queries of task T1 replace it in one
-//! place.
+//! Typed queries first (wave S1, records revision 2): dialogue infos with
+//! their links and flags (`Records::topic_info_rows`), embedded script
+//! bodies with their reference and variable lists
+//! (`Records::script_contexts`), globals, game settings, messages,
+//! factions, the actors' AI data, factions and voice through templates
+//! (`actor_ai`, `actor_factions`), their packages (`actor_packages`) and the
+//! package rows with their behaviour and type flags. What has no typed
+//! query is read here and only here: the selection of infos by speaker
+//! (`infos` and `conditions`), topics and quests (decoded from the raw
+//! store: `DIAL` and `QUST` have no typed row with every field the build
+//! needs, the quest delay among them), the race, class and flags of an NPC
+//! or creature (decoded), and the placed references' enable parents and
+//! locks (`placed_refs`).
+//!
+//! Raw form ids in condition parameters still resolve through
+//! [`FormResolver`]'s assumption that a plugin's masters are the plugins
+//! before it: the MIR keeps no master list (the typed queries resolve their
+//! own forms).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -14,15 +25,20 @@ use fnv_esm::{FormId, Record};
 
 use super::{
     CondValue, Corpus, EmbeddedScript, FormResolver, SimSource, SourceActor, SourceBase,
-    SourceBody, SourceCondition, SourceGlobal, SourceInfo, SourceLocation, SourceLogEntry,
-    SourceMenuItem, SourceName, SourceNote, SourceObjective, SourcePackage, SourceQuest, SourceRef,
-    SourceResponse, SourceScript, SourceStage, SourceTarget, SourceTerminal, SourceTopic,
+    SourceBody, SourceCondition, SourceFaction, SourceGlobal, SourceInfo, SourceLocation,
+    SourceLogEntry, SourceMenuItem, SourceMessage, SourceName, SourceNote, SourceObjective,
+    SourcePackage, SourceQuest, SourceRef, SourceRelation, SourceResponse, SourceScript,
+    SourceStage, SourceTarget, SourceTerminal, SourceTopic,
 };
 use crate::error::TranspileError;
-use crate::ir::{FormKey, PackageEvent, SimSlice};
+use crate::ir::{AiData, FormKey, PackageEvent, SimSlice};
 use crate::obscript::DeclaredVar;
 
 type Result<T> = std::result::Result<T, TranspileError>;
+
+/// The editor id of the shared failure topic of Fallout 3 speech
+/// challenges (spec 4.7).
+pub const FAILURE_TOPIC: &str = "SpeechChallengeFailure";
 
 fn mir_key(key: &FormKey) -> Option<mir::FormKey> {
     key.as_str().parse().ok()
@@ -32,9 +48,40 @@ fn key(text: String) -> Option<FormKey> {
     text.parse::<mir::FormKey>().ok().map(FormKey::from)
 }
 
+fn opt(key: Option<&mir::FormKey>) -> Option<FormKey> {
+    key.map(FormKey::from)
+}
+
+/// A body from a typed script context; `None` without source text.
+fn context_body(context: &mir::ScriptContextRow) -> Option<SourceBody> {
+    let source = context.source.as_deref()?;
+    if source.trim().is_empty() {
+        return None;
+    }
+    Some(SourceBody {
+        source: source.to_owned(),
+        vars: context
+            .locals
+            .iter()
+            .map(|l| DeclaredVar {
+                index: l.index,
+                name: l.name.clone().unwrap_or_default(),
+                flags: l.flags,
+            })
+            .collect(),
+        references: context
+            .references
+            .iter()
+            .filter_map(|r| r.form().map(FormKey::from))
+            .collect(),
+    })
+}
+
 struct Loader<'r> {
     records: &'r mir::Records,
     resolver: FormResolver,
+    /// Editor ids by form, for the `KNAM` labels.
+    names: HashMap<FormKey, String>,
     plugin_of: HashMap<FormKey, Option<usize>>,
     exists: HashMap<FormKey, bool>,
 }
@@ -110,12 +157,6 @@ impl Loader<'_> {
         self.resolver.resolve(owner, id.0)
     }
 
-    fn resolve_all(&self, owner: usize, ids: &[FormId]) -> Vec<FormKey> {
-        ids.iter()
-            .filter_map(|id| self.resolve(owner, *id))
-            .collect()
-    }
-
     /// A raw parameter as a form, when it names a record of the plugin
     /// list.
     fn param_form(&mut self, owner: usize, raw: u32) -> Result<Option<FormKey>> {
@@ -177,7 +218,11 @@ impl Loader<'_> {
             param1_form: self.param_form(owner, c.param1)?,
             param2_form: self.param_form(owner, c.param2)?,
             run_on: c.run_on,
-            reference: c.reference.as_ref().map(FormKey::from),
+            reference: c
+                .reference
+                .as_ref()
+                .or(c.param1_ref.as_ref().filter(|_| c.run_on == 2))
+                .map(FormKey::from),
             is_or: c.is_or,
         })
     }
@@ -230,18 +275,43 @@ impl Loader<'_> {
     fn forms_of(&self, query: &'static str, sql: &str) -> Result<Vec<FormKey>> {
         self.rows(query, sql, |r| r[0].clone().and_then(key), 1)
     }
+
+    /// The embedded script bodies of a record, by context.
+    fn contexts(&self, owner: &FormKey) -> Result<BTreeMap<String, SourceBody>> {
+        let Some(k) = mir_key(owner) else {
+            return Ok(BTreeMap::new());
+        };
+        Ok(self
+            .records
+            .script_contexts(&k)?
+            .iter()
+            .filter_map(|c| Some((c.context.clone(), context_body(c)?)))
+            .collect())
+    }
+
+    fn row_conditions(
+        &mut self,
+        owner: usize,
+        list: &[mir::ConditionRow],
+    ) -> Result<Vec<SourceCondition>> {
+        list.iter().map(|c| self.row_condition(owner, c)).collect()
+    }
 }
 
 /// Reads what the build needs for a slice. The selection: the slice's
 /// references (with their enable parents and linked references), their
-/// bases and actors, the actors' packages, the INFOs that name an actor as
-/// speaker (`ANAM`, `GetIsID` or `GetIsVoiceType` on the subject), their
-/// topics and the topics they name, the slice's terminals and their
-/// sub-terminals, and every script, quest, global and note.
+/// bases and actors, the actors' packages, the dialogue (spec 4.2: the
+/// topics with an INFO that names a slice actor as speaker, `ANAM`,
+/// `GetIsID` or `GetIsVoiceType` on the subject, then every topic those
+/// topics' INFOs lead to, and the shared failure topic; within each topic
+/// the INFOs whose speaker terms allow a slice actor or that have none),
+/// the slice's terminals and their sub-terminals, and every script, quest,
+/// global, game setting, message, faction and note.
 ///
 /// # Errors
 ///
-/// When the MIR cannot be read.
+/// When the MIR cannot be read, or was written before records revision 2
+/// ([`mir::MirError::MissingTable`]: extract again).
 pub fn load(mir: &mir::Mir, slice: &SimSlice) -> Result<SimSource> {
     let records = mir.records()?;
     let (mut l, mut source) = common(&records)?;
@@ -250,6 +320,9 @@ pub fn load(mir: &mir::Mir, slice: &SimSlice) -> Result<SimSource> {
     load_actors(&mut l, &mut source)?;
     load_quests(&mut l, &mut source)?;
     load_globals(&mut l, &mut source)?;
+    load_settings(&mut l, &mut source)?;
+    load_factions(&mut l, &mut source)?;
+    load_messages(&mut l, &mut source)?;
     load_notes(&mut l, &mut source)?;
     load_terminals(&mut l, &mut source)?;
     load_dialogue(&mut l, &mut source)?;
@@ -283,6 +356,7 @@ pub fn load_corpus(records: &mir::Records) -> Result<Corpus> {
                 delay: None,
                 stages: Vec::new(),
                 objectives: Vec::new(),
+                conditions: Vec::new(),
             },
         );
     }
@@ -358,6 +432,7 @@ fn common(records: &mir::Records) -> Result<(Loader<'_>, SimSource)> {
     let mut l = Loader {
         records,
         resolver: FormResolver::default(),
+        names: HashMap::new(),
         plugin_of: HashMap::new(),
         exists: HashMap::new(),
     };
@@ -463,7 +538,8 @@ fn load_scripts(l: &mut Loader<'_>, source: &mut SimSource) -> Result<()> {
 fn load_ref(l: &Loader<'_>, form: &FormKey) -> Result<Option<SourceRef>> {
     let sql = format!(
         "SELECT base_sig, editor_id, base, linked_ref, enable_parent, enable_opposite, \
-         initially_disabled, persistent FROM placed_refs WHERE form = '{}'",
+         initially_disabled, persistent, lock_level, lock_key, cell FROM placed_refs \
+         WHERE form = '{}'",
         form.as_str().replace('\'', "")
     );
     let rows = l.rows(
@@ -485,9 +561,14 @@ fn load_ref(l: &Loader<'_>, form: &FormKey) -> Result<Option<SourceRef>> {
                     .map(|p| (p, r[5].as_deref().is_some_and(|v| v != "0"))),
                 initially_disabled: r[6].as_deref().is_some_and(|v| v != "0"),
                 persistent: r[7].as_deref().is_some_and(|v| v != "0"),
+                lock: r[8]
+                    .as_deref()
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .map(|level| (level.clamp(0, 255) as u8, r[9].clone().and_then(key))),
+                cell: r[10].clone().and_then(key),
             })
         },
-        8,
+        11,
     )?;
     Ok(rows.into_iter().next())
 }
@@ -579,32 +660,48 @@ fn load_actors(l: &mut Loader<'_>, source: &mut SimSource) -> Result<()> {
                 continue;
             }
         };
+        // Race, class and the base flags have no typed query: decoded.
         match l.decode(&form, &sig)? {
             Some(Record::Npc(npc)) => {
-                actor.packages = l.resolve_all(owner, &npc.packages);
-                actor.factions = npc
-                    .factions
-                    .iter()
-                    .filter_map(|f| l.resolve(owner, f.faction).map(|k| (k, f.rank as i8)))
-                    .collect();
-                actor.voice = npc.voice.and_then(|v| l.resolve(owner, v));
                 actor.race = npc.race.and_then(|v| l.resolve(owner, v));
                 actor.class = npc.class.and_then(|v| l.resolve(owner, v));
+                actor.voice = npc.voice.and_then(|v| l.resolve(owner, v));
                 actor.actor_flags = npc.base.map_or(0, |b| b.flags);
-                actor.female = actor.actor_flags & 1 != 0;
             }
             Some(Record::Creature(creature)) => {
-                actor.packages = l.resolve_all(owner, &creature.packages);
-                actor.factions = creature
-                    .factions
-                    .iter()
-                    .filter_map(|f| l.resolve(owner, f.faction).map(|k| (k, f.rank as i8)))
-                    .collect();
                 actor.voice = creature.voice.and_then(|v| l.resolve(owner, v));
                 actor.actor_flags = creature.base.map_or(0, |b| b.flags);
-                actor.female = actor.actor_flags & 1 != 0;
             }
             _ => {}
+        }
+        actor.female = actor.actor_flags & 1 != 0;
+        if let Some(k) = mir_key(&form) {
+            actor.packages = l
+                .records
+                .actor_packages(&k)?
+                .iter()
+                .map(FormKey::from)
+                .collect();
+            if let Some(ai) = l.records.actor_ai(&k)? {
+                actor.ai = ai.ai.map(|a| AiData {
+                    aggression: a.aggression,
+                    confidence: a.confidence,
+                    energy: a.energy_level,
+                    responsibility: a.responsibility,
+                    mood: a.mood,
+                    services: a.services,
+                    assistance: a.assistance,
+                });
+                if let Some(voice) = &ai.voice {
+                    actor.voice = Some(FormKey::from(voice));
+                }
+            }
+            actor.factions = l
+                .records
+                .actor_factions(&k)?
+                .iter()
+                .filter_map(|f| Some((FormKey::from(f.faction.as_ref()?), f.rank as i8)))
+                .collect();
         }
         for package in actor.packages.clone() {
             if source.packages.contains_key(&package) {
@@ -627,52 +724,42 @@ fn load_actors(l: &mut Loader<'_>, source: &mut SimSource) -> Result<()> {
 fn package_from_row(l: &mut Loader<'_>, row: &mir::PackageRow) -> Result<SourcePackage> {
     let form = FormKey::from(&row.form);
     let owner = l.plugin_of(&form)?.unwrap_or(0);
-    let conditions = row
-        .conditions
-        .iter()
-        .map(|c| l.row_condition(owner, c))
-        .collect::<Result<Vec<_>>>()?;
-    let refs = l.records.script_references(&row.form).unwrap_or_default();
+    let conditions = l.row_conditions(owner, &row.conditions)?;
+    let mut bodies = l.contexts(&form)?;
     let events = [
         ("on begin", PackageEvent::Begin),
         ("on end", PackageEvent::End),
         ("on change", PackageEvent::Change),
     ]
     .into_iter()
-    .filter_map(|(context, event)| {
-        let source = row.scripts.iter().find(|(c, _)| c == context)?;
-        Some((
-            event,
-            Some(SourceBody {
-                source: source.1.clone(),
-                vars: Vec::new(),
-                references: refs
-                    .iter()
-                    .filter(|(c, _)| c == context)
-                    .map(|(_, f)| FormKey::from(f))
-                    .collect(),
-            }),
-        ))
-    })
+    .filter(|(context, _)| row.events.iter().any(|e| e.event == *context))
+    .map(|(context, event)| (event, bodies.remove(context)))
     .collect();
+    let data = row.data();
     Ok(SourcePackage {
         editor_id: row.editor_id.clone(),
         package_type: row.package_type.unwrap_or(0),
         flags: row.flags.unwrap_or(0),
-        behaviour_flags: 0,
-        type_flags: 0,
+        behaviour_flags: data
+            .as_ref()
+            .and_then(fnv_esm::PackageData::behaviour_flags)
+            .unwrap_or(0),
+        type_flags: data
+            .as_ref()
+            .and_then(fnv_esm::PackageData::type_flags)
+            .unwrap_or(0),
         schedule: row
             .schedule
             .map(|s| (s.month, s.day_of_week, s.date, s.hour, s.duration)),
         location: row.location.as_ref().map(|loc| SourceLocation {
             location_type: loc.location_type,
-            form: loc.form.as_ref().map(FormKey::from),
+            form: opt(loc.form.as_ref()),
             value: loc.value,
             radius: loc.radius,
         }),
         target: row.target.as_ref().map(|t| SourceTarget {
             target_type: t.target_type,
-            form: t.form.as_ref().map(FormKey::from),
+            form: opt(t.form.as_ref()),
             value: t.value,
             count: t.count,
         }),
@@ -690,15 +777,21 @@ fn load_quests(l: &mut Loader<'_>, source: &mut SimSource) -> Result<()> {
         let Some(Record::Quest(quest)) = l.decode(&form, b"QUST")? else {
             continue;
         };
+        let mut bodies = l.contexts(&form)?;
         let mut stages = Vec::new();
         for stage in &quest.stages {
             let mut entries = Vec::new();
-            for entry in &stage.entries {
+            for (number, entry) in stage.entries.iter().enumerate() {
+                let context = format!("stage {} entry {number}", stage.index);
+                let script = match bodies.remove(&context) {
+                    Some(body) => Some(body),
+                    None => l.body(owner, &entry.script),
+                };
                 entries.push(SourceLogEntry {
                     flags: entry.flags.unwrap_or(0),
                     conditions: l.conditions(owner, &entry.conditions)?,
                     text: entry.text.clone(),
-                    script: l.body(owner, &entry.script),
+                    script,
                     next_quest: entry.next_quest.and_then(|q| l.resolve(owner, q)),
                 });
             }
@@ -732,6 +825,7 @@ fn load_quests(l: &mut Loader<'_>, source: &mut SimSource) -> Result<()> {
                 delay: quest.data.and_then(|d| d.delay),
                 stages,
                 objectives,
+                conditions: l.conditions(owner, &quest.conditions)?,
             },
         );
     }
@@ -739,32 +833,78 @@ fn load_quests(l: &mut Loader<'_>, source: &mut SimSource) -> Result<()> {
 }
 
 fn load_globals(l: &mut Loader<'_>, source: &mut SimSource) -> Result<()> {
-    for form in l.forms_of(
-        "globals",
-        "SELECT form FROM records WHERE sig = 'GLOB' ORDER BY form",
-    )? {
-        let Some(k) = mir_key(&form) else { continue };
-        let subs = l.records.raw_subrecords(&k)?;
-        let mut global = SourceGlobal {
-            editor_id: None,
-            kind: 's',
-            value: 0.0,
-        };
-        for (sig, data) in subs {
-            match (sig.as_str(), data.as_slice()) {
-                ("EDID", bytes) => {
-                    global.editor_id = Some(
-                        String::from_utf8_lossy(bytes)
-                            .trim_end_matches('\0')
-                            .to_owned(),
-                    );
-                }
-                ("FNAM", [c, ..]) => global.kind = char::from(*c),
-                ("FLTV", [a, b, c, d]) => global.value = f32::from_le_bytes([*a, *b, *c, *d]),
-                _ => {}
-            }
+    for row in l.records.globals()? {
+        source.globals.insert(
+            FormKey::from(&row.form),
+            SourceGlobal {
+                editor_id: row.editor_id,
+                kind: row.kind.map_or('s', |k| char::from(k.code())),
+                value: row.value.unwrap_or(0.0),
+            },
+        );
+    }
+    Ok(())
+}
+
+fn load_settings(l: &mut Loader<'_>, source: &mut SimSource) -> Result<()> {
+    for row in l.records.game_settings()? {
+        if let Some(value) = row
+            .value
+            .as_ref()
+            .and_then(fnv_esm::GameSettingValue::as_f32)
+        {
+            source.settings.insert(row.name, f64::from(value));
         }
-        source.globals.insert(form, global);
+    }
+    Ok(())
+}
+
+fn load_factions(l: &mut Loader<'_>, source: &mut SimSource) -> Result<()> {
+    for row in l.records.factions()? {
+        source.factions.insert(
+            FormKey::from(&row.form),
+            SourceFaction {
+                editor_id: row.editor_id,
+                flags: row.flags.unwrap_or(0),
+                flags2: row.flags2.unwrap_or(0),
+                relations: row
+                    .relations
+                    .iter()
+                    .filter_map(|r| {
+                        Some(SourceRelation {
+                            other: FormKey::from(r.other.as_ref()?),
+                            modifier: r.modifier,
+                            reaction: r.combat_reaction,
+                        })
+                    })
+                    .collect(),
+            },
+        );
+    }
+    Ok(())
+}
+
+fn load_messages(l: &mut Loader<'_>, source: &mut SimSource) -> Result<()> {
+    for row in l.records.messages()? {
+        let form = FormKey::from(&row.form);
+        let owner = l.plugin_of(&form)?.unwrap_or(0);
+        let mut buttons = Vec::new();
+        for button in &row.buttons {
+            buttons.push((
+                button.text.clone().unwrap_or_default(),
+                l.row_conditions(owner, &button.conditions)?,
+            ));
+        }
+        source.messages.insert(
+            form,
+            SourceMessage {
+                editor_id: row.editor_id,
+                title: row.title,
+                text: row.text,
+                flags: row.flags.unwrap_or(0),
+                buttons,
+            },
+        );
     }
     Ok(())
 }
@@ -789,6 +929,25 @@ fn load_notes(l: &mut Loader<'_>, source: &mut SimSource) -> Result<()> {
             },
         );
     }
+    // A voice note reads as its topic's responses (spec 9.2, decision 4).
+    let topics: BTreeSet<FormKey> = source
+        .notes
+        .values()
+        .filter(|n| n.note_type == 3)
+        .filter_map(|n| n.topic.clone())
+        .collect();
+    for topic in topics {
+        let Some(k) = mir_key(&topic) else { continue };
+        let lines: Vec<String> = l
+            .records
+            .topic_info_rows(&k)?
+            .iter()
+            .flat_map(|info| info.responses.iter())
+            .filter_map(|r| r.text.clone())
+            .filter(|t| !t.trim().is_empty())
+            .collect();
+        source.voice_lines.insert(topic, lines);
+    }
     Ok(())
 }
 
@@ -810,34 +969,32 @@ fn load_terminals(l: &mut Loader<'_>, source: &mut SimSource) -> Result<()> {
             Err(e) => return Err(e.into()),
         };
         let owner = l.plugin_of(&form)?.unwrap_or(0);
-        let refs = l.records.script_references(&k).unwrap_or_default();
+        let mut bodies = l.contexts(&form)?;
         let mut items = Vec::new();
         for item in &row.items {
             let context = format!("item {}", item.seq);
-            let conditions = item
-                .conditions
-                .iter()
-                .map(|c| l.row_condition(owner, c))
-                .collect::<Result<Vec<_>>>()?;
+            let conditions = l.row_conditions(owner, &item.conditions)?;
             let sub_terminal = item.sub_terminal.as_ref().map(FormKey::from);
             if let Some(sub) = &sub_terminal {
                 pending.push(sub.clone());
             }
+            let script = bodies.remove(&context).or_else(|| {
+                item.script_source
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| SourceBody {
+                        source: s,
+                        vars: Vec::new(),
+                        references: Vec::new(),
+                    })
+            });
             items.push(SourceMenuItem {
                 text: item.text.clone(),
                 result: item.result_text.clone(),
                 flags: item.flags.unwrap_or(0),
                 display_note: item.display_note.as_ref().map(FormKey::from),
                 sub_terminal,
-                script: item.script_source.clone().map(|s| SourceBody {
-                    source: s,
-                    vars: Vec::new(),
-                    references: refs
-                        .iter()
-                        .filter(|(c, _)| *c == context)
-                        .map(|(_, f)| FormKey::from(f))
-                        .collect(),
-                }),
+                script,
                 conditions,
             });
         }
@@ -857,6 +1014,98 @@ fn load_terminals(l: &mut Loader<'_>, source: &mut SimSource) -> Result<()> {
     Ok(())
 }
 
+/// The speaker terms of an INFO: `ANAM` and the bases of `GetIsID == 1` on
+/// the subject; and the voice types of `GetIsVoiceType == 1` on the
+/// subject.
+fn speaker_terms(
+    l: &Loader<'_>,
+    owner: usize,
+    row: &mir::InfoRow,
+) -> (BTreeSet<FormKey>, BTreeSet<FormKey>) {
+    let mut bases = BTreeSet::new();
+    let mut voices = BTreeSet::new();
+    if let Some(speaker) = &row.speaker {
+        bases.insert(FormKey::from(speaker));
+    }
+    for c in &row.conditions {
+        let is_one = match (c.comparison.as_str(), c.value) {
+            ("==" | ">=", Some(v)) => v == 1.0,
+            ("!=", Some(v)) => v == 0.0,
+            _ => false,
+        };
+        if c.run_on != 0 || !is_one || c.global.is_some() {
+            continue;
+        }
+        let Some(form) = l.resolver.resolve(owner, c.param1) else {
+            continue;
+        };
+        match c.function {
+            72 => {
+                bases.insert(form);
+            }
+            427 => {
+                voices.insert(form);
+            }
+            _ => {}
+        }
+    }
+    (bases, voices)
+}
+
+fn info_from_row(
+    l: &mut Loader<'_>,
+    owner: usize,
+    topic: &FormKey,
+    position: usize,
+    row: &mir::InfoRow,
+) -> Result<SourceInfo> {
+    let form = FormKey::from(&row.form);
+    let mut bodies = l.contexts(&form)?;
+    let flags = match row.flag_bytes {
+        0 => 0,
+        1 => row.flags.unwrap_or(0) & 0x00FF,
+        _ => row.flags.unwrap_or(0),
+    };
+    let label = match (&row.knam, row.knam_sig.as_deref()) {
+        (Some(k), Some("AVIF")) => l
+            .names
+            .get(&FormKey::from(k))
+            .and_then(|edid| crate::ir::ActorValue::named(edid.strip_prefix("AV").unwrap_or(edid)))
+            .map(|av| av.0),
+        _ => None,
+    };
+    let topics = |list: &[mir::FormKey]| list.iter().map(FormKey::from).collect::<Vec<_>>();
+    Ok(SourceInfo {
+        topic: topic.clone(),
+        quest: opt(row.quest.as_ref()),
+        order: (0, position as u64),
+        info_type: row.info_type.unwrap_or(0),
+        flags,
+        speaker: opt(row.speaker.as_ref()),
+        prompt: row.prompt.clone(),
+        responses: row
+            .responses
+            .iter()
+            .map(|r| SourceResponse {
+                number: r.number.unwrap_or(0),
+                emotion_type: r.emotion_type.unwrap_or(0),
+                emotion_value: r.emotion_value.unwrap_or(0),
+                text: r.text.clone().unwrap_or_default(),
+            })
+            .collect(),
+        conditions: l.row_conditions(owner, &row.conditions)?,
+        choices: topics(&row.choices),
+        link_from: topics(&row.link_from),
+        add_topics: topics(&row.add_topics),
+        begin: bodies.remove("result begin"),
+        end: bodies.remove("result end"),
+        challenge: row.speech_challenge,
+        label,
+        knam: opt(row.knam.as_ref()),
+        knam_sig: row.knam_sig.clone(),
+    })
+}
+
 fn load_dialogue(l: &mut Loader<'_>, source: &mut SimSource) -> Result<()> {
     let actors: BTreeSet<FormKey> = source.actors.keys().cloned().collect();
     let voices: BTreeSet<FormKey> = source
@@ -864,15 +1113,30 @@ fn load_dialogue(l: &mut Loader<'_>, source: &mut SimSource) -> Result<()> {
         .values()
         .filter_map(|a| a.voice.clone())
         .collect();
-    let mut selected: BTreeSet<FormKey> = BTreeSet::new();
+    for name in &source.names {
+        l.names.insert(name.form.clone(), name.editor_id.clone());
+    }
+    // Seeds: the topics of the INFOs that name a slice actor or voice.
+    let info_topics: HashMap<FormKey, FormKey> = l
+        .rows(
+            "info topics",
+            "SELECT form, topic FROM infos WHERE topic IS NOT NULL",
+            |r| Some((key(r[0].clone()?)?, key(r[1].clone()?)?)),
+            2,
+        )?
+        .into_iter()
+        .collect();
+    let mut seeds: BTreeSet<FormKey> = BTreeSet::new();
     for (info, speaker) in l.rows(
         "info speakers",
         "SELECT form, speaker FROM infos WHERE speaker IS NOT NULL",
         |r| Some((key(r[0].clone()?)?, key(r[1].clone()?)?)),
         2,
     )? {
-        if actors.contains(&speaker) {
-            selected.insert(info);
+        if actors.contains(&speaker)
+            && let Some(topic) = info_topics.get(&info)
+        {
+            seeds.insert(topic.clone());
         }
     }
     for (info, function, raw) in l.rows(
@@ -888,7 +1152,10 @@ fn load_dialogue(l: &mut Loader<'_>, source: &mut SimSource) -> Result<()> {
         },
         3,
     )? {
-        if selected.contains(&info) {
+        let Some(topic) = info_topics.get(&info) else {
+            continue;
+        };
+        if seeds.contains(topic) {
             continue;
         }
         let owner = l.plugin_of(&info)?.unwrap_or(0);
@@ -900,60 +1167,61 @@ fn load_dialogue(l: &mut Loader<'_>, source: &mut SimSource) -> Result<()> {
             _ => voices.contains(&named),
         };
         if hit {
-            selected.insert(info);
+            seeds.insert(topic.clone());
+        }
+    }
+    for found in l.records.find_editor_id(FAILURE_TOPIC)? {
+        seeds.insert(FormKey::from(&found));
+    }
+    // Reverse links: topic T is offered after topic X when an INFO of T
+    // names X in `TCLF`.
+    let mut linked_from: BTreeMap<FormKey, BTreeSet<FormKey>> = BTreeMap::new();
+    for (info, from) in l.rows(
+        "reverse links",
+        "SELECT info, topic FROM info_links WHERE kind = 'link_from'",
+        |r| Some((key(r[0].clone()?)?, key(r[1].clone()?)?)),
+        2,
+    )? {
+        if let Some(topic) = info_topics.get(&info) {
+            linked_from.entry(from).or_default().insert(topic.clone());
         }
     }
 
+    let mut pending: Vec<FormKey> = seeds.into_iter().rev().collect();
+    let mut seen: BTreeSet<FormKey> = BTreeSet::new();
     let mut topics: BTreeSet<FormKey> = BTreeSet::new();
-    for form in selected {
-        let Some(k) = mir_key(&form) else { continue };
-        let Some(row) = l.records.record(&k)? else {
+    while let Some(topic) = pending.pop() {
+        if !seen.insert(topic.clone()) {
             continue;
-        };
-        let owner = l.resolver.plugin_index(&row.plugin).unwrap_or(0);
-        let Some(Record::Info(info)) = l.decode(&form, b"INFO")? else {
+        }
+        let Some(k) = mir_key(&topic) else { continue };
+        let rows = l.records.topic_info_rows(&k)?;
+        if rows.is_empty() {
             continue;
-        };
-        let Some(topic) = row
-            .parent
-            .as_ref()
-            .map(FormKey::from)
-            .or_else(|| info.topic.and_then(|t| l.resolve(owner, t)))
-        else {
-            continue;
-        };
-        let loaded = SourceInfo {
-            topic: topic.clone(),
-            quest: info.quest.and_then(|q| l.resolve(owner, q)),
-            order: (u32::try_from(owner).unwrap_or(u32::MAX), row.offset),
-            info_type: info.data.map_or(0, |d| d.info_type),
-            flags: info.data.and_then(|d| d.flags).unwrap_or(0),
-            speaker: info.speaker.and_then(|s| l.resolve(owner, s)),
-            prompt: info.prompt.clone(),
-            responses: info
-                .responses
-                .iter()
-                .map(|r| SourceResponse {
-                    number: r.data.map_or(0, |d| d.response_number),
-                    emotion_type: r.data.map_or(0, |d| d.emotion_type),
-                    emotion_value: r.data.map_or(0, |d| d.emotion_value),
-                    text: r.text.clone().unwrap_or_default(),
-                })
-                .collect(),
-            conditions: l.conditions(owner, &info.conditions)?,
-            choices: l.resolve_all(owner, &info.choices),
-            link_from: l.resolve_all(owner, &info.link_from),
-            add_topics: l.resolve_all(owner, &info.add_topics),
-            begin: l.body(owner, &info.result_begin),
-            end: l.body(owner, &info.result_end),
-            challenge: info.speech_challenge,
-            label: None,
-        };
-        topics.insert(topic);
-        topics.extend(loaded.choices.iter().cloned());
-        topics.extend(loaded.link_from.iter().cloned());
-        topics.extend(loaded.add_topics.iter().cloned());
-        source.infos.insert(form, loaded);
+        }
+        topics.insert(topic.clone());
+        for (position, row) in rows.iter().enumerate() {
+            let form = FormKey::from(&row.form);
+            let owner = l.plugin_of(&form)?.unwrap_or(0);
+            let (bases, info_voices) = speaker_terms(l, owner, row);
+            let relevant = (bases.is_empty() && info_voices.is_empty())
+                || bases.iter().any(|b| actors.contains(b))
+                || info_voices.iter().any(|v| voices.contains(v));
+            if !relevant {
+                continue;
+            }
+            let loaded = info_from_row(l, owner, &topic, position, row)?;
+            for next in loaded.choices.iter().chain(&loaded.add_topics) {
+                pending.push(next.clone());
+            }
+            topics.extend(loaded.choices.iter().cloned());
+            topics.extend(loaded.link_from.iter().cloned());
+            topics.extend(loaded.add_topics.iter().cloned());
+            source.infos.insert(form, loaded);
+        }
+        if let Some(after) = linked_from.get(&topic) {
+            pending.extend(after.iter().cloned());
+        }
     }
     for form in topics {
         let Some(Record::Topic(topic)) = l.decode(&form, b"DIAL")? else {

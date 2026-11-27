@@ -1346,7 +1346,8 @@
           "text": 50,
           "targets": []
         }
-      ]
+      ],
+      "condition": "true"
     },
     "quest/testtown.esm:000871/0": {
       "id": "quest/testtown.esm:000871/0",
@@ -1358,10 +1359,88 @@
       "script": null,
       "vars": [],
       "stages": [],
-      "objectives": []
+      "objectives": [],
+      "condition": "true"
     }
   },
   "globals": {
+    "info/testtown.esm:000891/1": {
+      "id": "info/testtown.esm:000891/1",
+      "purpose": "once_flag",
+      "name": "ONCE_GREETING_000891",
+      "ty": "int",
+      "initial": 0
+    },
+    "quest/testtown.esm:000870/1": {
+      "id": "quest/testtown.esm:000870/1",
+      "purpose": "quest_state",
+      "name": "TSQUEST_STAGE",
+      "ty": "int",
+      "initial": 0
+    },
+    "quest/testtown.esm:000870/2": {
+      "id": "quest/testtown.esm:000870/2",
+      "purpose": "quest_state",
+      "name": "TSQUEST_FLAGS",
+      "ty": "int",
+      "initial": 9
+    },
+    "quest/testtown.esm:000870/256": {
+      "id": "quest/testtown.esm:000870/256",
+      "purpose": "quest_state",
+      "name": "TSQUEST_DONE0",
+      "ty": "int",
+      "initial": 0
+    },
+    "quest/testtown.esm:000870/512": {
+      "id": "quest/testtown.esm:000870/512",
+      "purpose": "quest_state",
+      "name": "TSQUEST_PEND0",
+      "ty": "int",
+      "initial": 0
+    },
+    "quest/testtown.esm:000871/1": {
+      "id": "quest/testtown.esm:000871/1",
+      "purpose": "quest_state",
+      "name": "TSOTHERQUEST_STAGE",
+      "ty": "int",
+      "initial": 0
+    },
+    "quest/testtown.esm:000871/2": {
+      "id": "quest/testtown.esm:000871/2",
+      "purpose": "quest_state",
+      "name": "TSOTHERQUEST_FLAGS",
+      "ty": "int",
+      "initial": 0
+    },
+    "objective/testtown.esm:000870/10": {
+      "id": "objective/testtown.esm:000870/10",
+      "purpose": "quest_state",
+      "name": "TSQUEST_OBJ10",
+      "ty": "int",
+      "initial": 0
+    },
+    "objective/testtown.esm:000870/20": {
+      "id": "objective/testtown.esm:000870/20",
+      "purpose": "quest_state",
+      "name": "TSQUEST_OBJ20",
+      "ty": "int",
+      "initial": 0
+    },
+    "quest_var/testtown.esm:000870/1": {
+      "id": "quest_var/testtown.esm:000870/1",
+      "purpose": "quest_var",
+      "name": "TSQUEST_QCOUNT",
+      "ty": "int",
+      "initial": 0
+    },
+    "quest_var/testtown.esm:000870/2": {
+      "id": "quest_var/testtown.esm:000870/2",
+      "purpose": "quest_var",
+      "name": "TSQUEST_QRATE",
+      "ty": "float",
+      "initial": 0
+    },
     "global/testtown.esm:000880/0": {
       "id": "global/testtown.esm:000880/0",
       "purpose": "glob",
@@ -1387,6 +1466,13 @@
       "id": "group/testtown.esm:000c0a/0",
       "purpose": "group",
       "name": "TSLONELYREF",
+      "ty": "int",
+      "initial": 0
+    },
+    "note/testtown.esm:000802/0": {
+      "id": "note/testtown.esm:000802/0",
+      "purpose": "note",
+      "name": "NOTE_TSNOTE",
       "ty": "int",
       "initial": 0
     }
@@ -1645,6 +1731,16 @@
         "enable_parent"
       ]
     },
+    "testtown.esm:000c08": {
+      "form": "testtown.esm:000c08",
+      "editor_id": "TSTerminalRef",
+      "base": "testtown.esm:000803",
+      "area": "tstown",
+      "mobile": false,
+      "why": [
+        "terminal"
+      ]
+    },
     "testtown.esm:000c0a": {
       "form": "testtown.esm:000c0a",
       "editor_id": "TSLonelyRef",
@@ -1703,6 +1799,19 @@
   },
   "diagnostics": [
     {
+      "severity": "warning",
+      "category": "stage_ordering",
+      "owner": "script/testtown.esm:000891/2",
+      "subject": "TSQuest 10",
+      "message": "sets TSQuest stage 10 and then reads what its stage script changes; the stage script runs later (spec 6.2)"
+    },
+    {
+      "severity": "warning",
+      "category": "no_walkable",
+      "subject": "tstown",
+      "message": "no walkable hex near a sandbox anchor on map tstown (or no walkable data): the anchor is its only candidate"
+    },
+    {
       "severity": "note",
       "category": "condition_fallback",
       "owner": "info/testtown.esm:000894/0",
@@ -1721,6 +1830,446 @@
       "owner": "actor/testtown.esm:000810/0",
       "subject": "TSMayor",
       "message": "essential flag ignored (owner decision 12)"
+    },
+    {
+      "severity": "note",
+      "category": "missing_setting",
+      "subject": "fSpeechAutoSuccessThreshold,fSpeechChallengeMultiplier,iSpeechChallengeDifficultyAverage,iSpeechChallengeDifficultyEasy,iSpeechChallengeDifficultyHard,iSpeechChallengeDifficultyVeryEasy,iSpeechChallengeDifficultyVeryHard,iXPRewardHackComputerAverage,iXPRewardHackComputerEasy,iXPRewardHackComputerHard,iXPRewardHackComputerVeryEasy,iXPRewardHackComputerVeryHard,iXPRewardPickLockAverage,iXPRewardPickLockEasy,iXPRewardPickLockHard,iXPRewardPickLockVeryEasy,iXPRewardPickLockVeryHard,iXPRewardSpeechChallengeAverage,iXPRewardSpeechChallengeEasy,iXPRewardSpeechChallengeHard,iXPRewardSpeechChallengeVeryEasy,iXPRewardSpeechChallengeVeryHard",
+      "message": "22 game settings missing, defaults used (speech XP: the nearest lower level's): fSpeechAutoSuccessThreshold, fSpeechChallengeMultiplier, iSpeechChallengeDifficultyAverage, iSpeechChallengeDifficultyEasy, iSpeechChallengeDifficultyHard, iSpeechChallengeDifficultyVeryEasy, iSpeechChallengeDifficultyVeryHard, iXPRewardHackComputerAverage, iXPRewardHackComputerEasy, iXPRewardHackComputerHard, iXPRewardHackComputerVeryEasy, iXPRewardHackComputerVeryHard, iXPRewardPickLockAverage, iXPRewardPickLockEasy, iXPRewardPickLockHard, iXPRewardPickLockVeryEasy, iXPRewardPickLockVeryHard, iXPRewardSpeechChallengeAverage, iXPRewardSpeechChallengeEasy, iXPRewardSpeechChallengeHard, iXPRewardSpeechChallengeVeryEasy, iXPRewardSpeechChallengeVeryHard"
+    },
+    {
+      "severity": "note",
+      "category": "not_a_group",
+      "owner": "script/testtown.esm:000860/0",
+      "subject": "testtown.esm:000c0b",
+      "message": "Enable or Disable of testtown.esm:000c0b, which parents no group: its own visibility"
     }
+  ],
+  "dialogues": {
+    "testtown.esm:000810": {
+      "speaker": "testtown.esm:000810",
+      "editor_id": "TSMayor",
+      "nodes": [
+        {
+          "ordinal": 1,
+          "info": "info/testtown.esm:000891/0",
+          "topic": "topic/testtown.esm:000890/0",
+          "condition": "true",
+          "prompt": null,
+          "choices": [
+            "topic/testtown.esm:000892/0"
+          ],
+          "failure": null
+        },
+        {
+          "ordinal": 2,
+          "info": "info/testtown.esm:000893/0",
+          "topic": "topic/testtown.esm:000890/0",
+          "condition": {
+            "cmp": {
+              "lhs": {
+                "call": {
+                  "func": {
+                    "known": "GetStage"
+                  },
+                  "on": "self_ref",
+                  "args": [
+                    {
+                      "form": "testtown.esm:000870"
+                    }
+                  ]
+                }
+              },
+              "op": "ge",
+              "rhs": {
+                "var": {
+                  "global": "global/testtown.esm:000880/0"
+                }
+              }
+            }
+          },
+          "prompt": null,
+          "choices": [],
+          "failure": null
+        },
+        {
+          "ordinal": 3,
+          "info": "info/testtown.esm:000895/0",
+          "topic": "topic/testtown.esm:000892/0",
+          "condition": "true",
+          "prompt": 36,
+          "choices": [],
+          "failure": null
+        }
+      ],
+      "topics": {
+        "topic/testtown.esm:000890/0": {
+          "topic": "topic/testtown.esm:000890/0",
+          "picks": [
+            {
+              "info": 1
+            },
+            {
+              "info": 2
+            }
+          ]
+        },
+        "topic/testtown.esm:000892/0": {
+          "topic": "topic/testtown.esm:000892/0",
+          "picks": [
+            {
+              "info": 3
+            }
+          ]
+        }
+      },
+      "greeting": "topic/testtown.esm:000890/0",
+      "greeting_label": false,
+      "hub": [
+        {
+          "topic": "topic/testtown.esm:000892/0",
+          "given": null
+        }
+      ],
+      "counts": {
+        "candidates": 3,
+        "folded_away": 0,
+        "barks": 0,
+        "unreached": 0,
+        "challenges": 0,
+        "thresholds": 0
+      }
+    },
+    "testtown.esm:000811": {
+      "speaker": "testtown.esm:000811",
+      "editor_id": "TSGuard",
+      "nodes": [
+        {
+          "ordinal": 1,
+          "info": "info/testtown.esm:000893/0",
+          "topic": "topic/testtown.esm:000890/0",
+          "condition": {
+            "cmp": {
+              "lhs": {
+                "call": {
+                  "func": {
+                    "known": "GetStage"
+                  },
+                  "on": "self_ref",
+                  "args": [
+                    {
+                      "form": "testtown.esm:000870"
+                    }
+                  ]
+                }
+              },
+              "op": "ge",
+              "rhs": {
+                "var": {
+                  "global": "global/testtown.esm:000880/0"
+                }
+              }
+            }
+          },
+          "prompt": null,
+          "choices": [],
+          "failure": null
+        },
+        {
+          "ordinal": 2,
+          "info": "info/testtown.esm:000894/0",
+          "topic": "topic/testtown.esm:000890/0",
+          "condition": {
+            "all": [
+              {
+                "fallback": {
+                  "function": 255,
+                  "name": "GetOffersServicesNow",
+                  "value": 1.0,
+                  "report": false
+                }
+              },
+              {
+                "cmp": {
+                  "lhs": {
+                    "var": {
+                      "quest": {
+                        "quest": "quest/testtown.esm:000870/0",
+                        "index": 1,
+                        "ty": "int"
+                      }
+                    }
+                  },
+                  "op": "ge",
+                  "rhs": {
+                    "int": 2
+                  }
+                }
+              }
+            ]
+          },
+          "prompt": null,
+          "choices": [],
+          "failure": null
+        }
+      ],
+      "topics": {
+        "topic/testtown.esm:000890/0": {
+          "topic": "topic/testtown.esm:000890/0",
+          "picks": [
+            {
+              "random": [
+                1,
+                2
+              ]
+            }
+          ]
+        }
+      },
+      "greeting": "topic/testtown.esm:000890/0",
+      "greeting_label": false,
+      "hub": [],
+      "counts": {
+        "candidates": 2,
+        "folded_away": 0,
+        "barks": 0,
+        "unreached": 0,
+        "challenges": 0,
+        "thresholds": 0
+      }
+    }
+  },
+  "settings": {
+    "speech_multiplier": 2.0,
+    "speech_auto_success": 0.9,
+    "speech_difficulty": [
+      10,
+      40,
+      55,
+      70,
+      80
+    ],
+    "speech_xp": [
+      5,
+      5,
+      5,
+      5,
+      5
+    ],
+    "hack_xp": [
+      20,
+      30,
+      40,
+      50,
+      60
+    ],
+    "lockpick_xp": [
+      20,
+      30,
+      40,
+      50,
+      60
+    ]
+  },
+  "messages": {},
+  "journal": {
+    "quest/testtown.esm:000870/0": {
+      "quest": "quest/testtown.esm:000870/0",
+      "heading": 45,
+      "rows": [
+        {
+          "objective": "objective/testtown.esm:000870/10",
+          "text": 49,
+          "global": "objective/testtown.esm:000870/10",
+          "display_at": 1,
+          "completed_at": 2
+        },
+        {
+          "objective": "objective/testtown.esm:000870/20",
+          "text": 50,
+          "global": "objective/testtown.esm:000870/20",
+          "display_at": 1,
+          "completed_at": 2
+        }
+      ]
+    }
+  },
+  "state": {
+    "tstown": [
+      {
+        "reference": "testtown.esm:000c05",
+        "group": "group/testtown.esm:000c05/0",
+        "opposite": false,
+        "mobile": false,
+        "hidden": false
+      },
+      {
+        "reference": "testtown.esm:000c06",
+        "group": "group/testtown.esm:000c05/0",
+        "opposite": false,
+        "mobile": false,
+        "hidden": false
+      },
+      {
+        "reference": "testtown.esm:000c07",
+        "group": "group/testtown.esm:000c05/0",
+        "opposite": true,
+        "mobile": false,
+        "hidden": false
+      },
+      {
+        "reference": "testtown.esm:000c0a",
+        "group": "group/testtown.esm:000c0a/0",
+        "opposite": false,
+        "mobile": false,
+        "hidden": false
+      }
+    ]
+  },
+  "group_users": {
+    "script/testtown.esm:000860/0": [
+      "group/testtown.esm:000c05/0",
+      "group/testtown.esm:000c0a/0"
+    ]
+  },
+  "terminal_programs": {
+    "terminal/testtown.esm:000803/0": {
+      "terminal": "terminal/testtown.esm:000803/0",
+      "references": [
+        "testtown.esm:000c08"
+      ],
+      "menus": [
+        "terminal/testtown.esm:000803/0",
+        "terminal/testtown.esm:000804/0"
+      ],
+      "missing": [],
+      "hack": {
+        "science": 0,
+        "xp": 20,
+        "password": "note/testtown.esm:000802/0"
+      }
+    }
+  },
+  "locks": {},
+  "holodisks": {
+    "note/testtown.esm:000802/0": {
+      "note": "note/testtown.esm:000802/0",
+      "global": "note/testtown.esm:000802/0",
+      "title": 53,
+      "paragraphs": [
+        54
+      ],
+      "source": "text"
+    }
+  },
+  "runs": {
+    "testtown.esm:000810": {
+      "base": "testtown.esm:000810",
+      "slots": [
+        {
+          "package": "package/testtown.esm:000850/0",
+          "runner": "sandbox",
+          "kind": "sandbox",
+          "run": false,
+          "condition": "true",
+          "schedule": {
+            "month": -1,
+            "day_of_week": -1,
+            "date": 0,
+            "hour": -1,
+            "duration_hours": 0
+          },
+          "places": [
+            {
+              "map": "tstown",
+              "anchor": {
+                "ref": "testtown.esm:000c03"
+              },
+              "radius": 8,
+              "candidates": [
+                {
+                  "elevation": 0,
+                  "hex": 10004
+                }
+              ]
+            }
+          ],
+          "target": null,
+          "fallback": null
+        }
+      ],
+      "combat": {
+        "hostile": false,
+        "reason": "aggression 0, no enemy faction",
+        "team": "testtown.esm:000820",
+        "aggression": 0,
+        "confidence": 0,
+        "assistance": 0
+      },
+      "factions": [
+        "testtown.esm:000820"
+      ],
+      "presence": []
+    },
+    "testtown.esm:000811": {
+      "base": "testtown.esm:000811",
+      "slots": [
+        {
+          "package": "package/testtown.esm:000851/0",
+          "runner": "travel",
+          "kind": "travel",
+          "run": false,
+          "condition": {
+            "cmp": {
+              "lhs": {
+                "call": {
+                  "func": {
+                    "known": "GetRandomPercent"
+                  },
+                  "on": "self_ref",
+                  "args": []
+                }
+              },
+              "op": "lt",
+              "rhs": {
+                "int": 50
+              }
+            }
+          },
+          "schedule": {
+            "month": -1,
+            "day_of_week": -1,
+            "date": 0,
+            "hour": -1,
+            "duration_hours": 0
+          },
+          "places": [
+            {
+              "map": "tstown",
+              "anchor": {
+                "ref": "testtown.esm:000c04"
+              },
+              "radius": 0,
+              "candidates": []
+            }
+          ],
+          "target": null,
+          "fallback": null
+        }
+      ],
+      "combat": {
+        "hostile": false,
+        "reason": "aggression 0, no enemy faction",
+        "team": null,
+        "aggression": 0,
+        "confidence": 0,
+        "assistance": 0
+      },
+      "factions": [],
+      "presence": []
+    }
+  },
+  "teams": [
+    "testtown.esm:000820"
   ]
 }

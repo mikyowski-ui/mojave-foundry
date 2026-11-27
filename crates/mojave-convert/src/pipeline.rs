@@ -30,10 +30,14 @@ pub struct AllSummary {
     pub critters: crate::critters::CrittersSummary,
     pub map: crate::map::MapSummary,
     pub gallery: crate::gallery::GallerySummary,
+    /// The simulation stage, when the slice or layer file asks for it
+    /// (`sim = true`).
+    pub sim: Option<crate::sim::SimOutcome>,
 }
 
-/// Every stage in order: extract, sprites, critters, map, gallery. Each stage skips
-/// the work its content-hash cache already holds.
+/// Every stage in order: extract, sprites, critters, map, gallery, and sim
+/// when the slice or layer file sets `sim = true`. Each stage skips the
+/// work its content-hash cache already holds.
 pub fn all(inputs: &Inputs) -> Result<AllSummary, ConvertError> {
     // An interior slice without --standalone stops before extract.
     inputs.check_mode()?;
@@ -54,11 +58,24 @@ pub fn all(inputs: &Inputs) -> Result<AllSummary, ConvertError> {
         let _t = crate::timings::span("gallery");
         crate::gallery::gallery(inputs, "")?
     };
+    let sim = if inputs.sim_on() {
+        let _t = crate::timings::span("sim");
+        let options = crate::sim::SimOptions {
+            f2: Some(inputs.f2.clone()),
+            report_only: false,
+            force: false,
+            config: inputs.sim.clone(),
+        };
+        Some(crate::sim::sim(&inputs.out, &options).map_err(|e| ConvertError::stage("sim", e))?)
+    } else {
+        None
+    };
     Ok(AllSummary {
         extract,
         sprites,
         critters,
         map,
         gallery,
+        sim,
     })
 }

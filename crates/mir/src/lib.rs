@@ -130,9 +130,9 @@ pub use model::{
     AnimationInfo, ArchiveEntry, AssetEntry, AssetStatus, CELL_UNITS, CellDoc, CellKey,
     CellLocation, CellRef, EnableParentDoc, Image, InteriorEntry, Issue, LAND_GRID, LAND_SPACING,
     LandDefault, LandDoc, LandLayer, LayerOpacity, LockDoc, Manifest, MeshInfo, NavDoorLinkDoc,
-    NavExternalLinkDoc, NavTriangleDoc, NavmeshDoc, PartRole, PluginEntry, RECORDS_REVISION,
-    RawStore, RefFlags, RefGroup, RefKind, Reference, SCHEMA_VERSION, SkeletonInfo, Slice,
-    TeleportDoc, TextureInfo, Transform, cell_of,
+    NavExternalLinkDoc, NavTriangleDoc, NavmeshDoc, PartRole, PluginEntry, PrimitiveDoc,
+    PrimitiveShape, RECORDS_REVISION, RawStore, RefFlags, RefGroup, RefKind, Reference,
+    SCHEMA_VERSION, SkeletonInfo, Slice, TeleportDoc, TextureInfo, Transform, cell_of,
 };
 pub use paths::{
     FormKey, MESH_ROOT, TEXTURE_ROOT, creature_model_path, form_file_stem, normalize_mesh_path,

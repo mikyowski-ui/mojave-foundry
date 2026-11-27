@@ -330,14 +330,29 @@ enum Command {
         #[arg(long, default_value = "")]
         filter: String,
     },
-    /// Scaffold of the simulation stage (Pass 2): reads a finished --out
-    /// directory, counts the source logic for the placed references, prints
-    /// the stage cache key and writes sim-report.md. Needs no game install
-    /// and changes nothing in the layer.
+    /// The simulation stage (Pass 2): reads a finished --out directory,
+    /// compiles dialogue, scripts, quests and packages into the layer
+    /// (programs, tables, map script records, manifest rows) and writes
+    /// sim-report.md. Needs --f2 for the base copies, unless --report-only.
     Sim {
         /// The --out directory of a finished run (holding mir/ and mods/mojave).
         #[arg(long)]
         out: PathBuf,
+        /// The Fallout 2 install directory, for the base copies of
+        /// scripts.lst, vault13.gam, quests.txt, holodisk.txt and the shared
+        /// message files.
+        #[arg(long)]
+        f2: Option<PathBuf>,
+        /// Build and lower in memory and write only sim-report.md: no
+        /// install needed, the layer untouched.
+        #[arg(long)]
+        report_only: bool,
+        /// Run even when the stage's cache key is unchanged.
+        #[arg(long)]
+        force: bool,
+        /// A foundry.toml whose [sim] table sets the build options.
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// Print what the stage took (always written to <out>/timings.txt).
         #[arg(long)]
         timings: bool,
@@ -519,6 +534,21 @@ fn run(cli: Cli) -> Result<(), String> {
             );
             println!("map: {:#?}", summary.map);
             println!("gallery: {:?}", summary.gallery);
+            match &summary.sim {
+                None => {}
+                Some(outcome) if outcome.cached => {
+                    println!("sim: cache hit ({})", outcome.cache_key);
+                }
+                Some(outcome) => {
+                    for line in outcome.report.iter().flat_map(|r| r.console_lines()) {
+                        println!("sim: {line}");
+                    }
+                    println!(
+                        "sim report: {}",
+                        inputs.out.join(sim::REPORT_FILE).display()
+                    );
+                }
+            }
             println!("report: {}", inputs.mir_dir().join("report.md").display());
             println!("layer: {}", inputs.mod_dir().display());
             Ok(())
@@ -627,9 +657,34 @@ fn run(cli: Cli) -> Result<(), String> {
             println!("output: {}", inputs.gallery_dir().display());
             Ok(())
         }
-        Command::Sim { out, .. } => {
+        Command::Sim {
+            out,
+            f2,
+            report_only,
+            force,
+            config,
+            ..
+        } => {
             let _t = mojave_convert::timings::span("sim");
-            sim::cli(&out)
+            let config = match config {
+                Some(path) => {
+                    let text = std::fs::read_to_string(&path)
+                        .map_err(|e| format!("{}: {e}", path.display()))?;
+                    mojave_convert::config::split_config(&text)
+                        .map_err(|e| format!("{}: {e}", path.display()))?
+                        .1
+                }
+                None => Default::default(),
+            };
+            sim::cli(
+                &out,
+                &sim::SimOptions {
+                    f2,
+                    report_only,
+                    force,
+                    config,
+                },
+            )
         }
         Command::Probe(Probe::Bsa { archive, step, dds }) => probe::bsa(&archive, step, dds),
         Command::Probe(Probe::Nif {
@@ -663,7 +718,7 @@ impl Command {
             | Command::All { common, .. }
             | Command::Estimate { common, .. }
             | Command::Gallery { common, .. } => common,
-            Command::Sim { out, timings } => return Some((out.clone(), *timings)),
+            Command::Sim { out, timings, .. } => return Some((out.clone(), *timings)),
             _ => return None,
         };
         Some((common.out.clone(), common.timings))

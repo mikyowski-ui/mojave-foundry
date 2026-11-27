@@ -29,6 +29,14 @@ pub struct Quest {
     pub stages: Vec<Stage>,
     /// Objectives, by index.
     pub objectives: Vec<Objective>,
+    /// The quest's own conditions, which every INFO of the quest must also
+    /// pass (task T5; the dialogue compiler adds them to each node).
+    #[serde(default = "cond_true")]
+    pub condition: Cond,
+}
+
+fn cond_true() -> Cond {
+    Cond::True
 }
 
 /// A quest stage.
@@ -70,4 +78,57 @@ pub struct Objective {
     pub text: Option<TextId>,
     /// Targets and their conditions: kept, not lowered (gap O).
     pub targets: Vec<(FormKey, Cond)>,
+}
+
+/// The bits of a quest's `G_q_FLAGS` global (spec 6.1).
+pub mod quest_flags {
+    /// The quest is running (`StartQuest`, start enabled).
+    pub const RUNNING: i32 = 0x01;
+    /// The quest is completed (a log entry's "complete quest").
+    pub const COMPLETED: i32 = 0x02;
+    /// The quest has failed.
+    pub const FAILED: i32 = 0x04;
+    /// The start-enabled flag was applied (set in the initial value of a
+    /// start-enabled quest, with [`RUNNING`]).
+    pub const APPLIED: i32 = 0x08;
+}
+
+/// The values of a `G_q_OBJ_n` global (spec 6.1, 6.3).
+pub mod objective_state {
+    /// Not shown.
+    pub const HIDDEN: i32 = 0;
+    /// Shown in the Pip-Boy.
+    pub const DISPLAYED: i32 = 1;
+    /// Shown struck through.
+    pub const COMPLETED: i32 = 2;
+}
+
+/// A quest's Pip-Boy group (spec 6.3, owner decision 8: objectives
+/// only): one heading and one `quests.txt` row per objective. Built by
+/// [`crate::quest`] for every quest with a name and at least one objective
+/// with text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Journal {
+    /// The quest.
+    pub quest: SimId,
+    /// The heading: the quest's name, a new `map.msg` message.
+    pub heading: TextId,
+    /// The rows, by objective index.
+    pub rows: Vec<JournalRow>,
+}
+
+/// One `quests.txt` row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalRow {
+    /// The objective.
+    pub objective: SimId,
+    /// Its text, a new `quests.msg` message.
+    pub text: TextId,
+    /// The global the row reads: the objective's `G_q_OBJ_n`
+    /// ([`super::SimKind::Objective`] id).
+    pub global: SimId,
+    /// Shown from this value ([`objective_state::DISPLAYED`]).
+    pub display_at: i32,
+    /// Struck through from this value ([`objective_state::COMPLETED`]).
+    pub completed_at: i32,
 }

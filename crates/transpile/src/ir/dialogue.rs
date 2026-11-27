@@ -380,6 +380,148 @@ impl ActorValue {
     }
 }
 
+/// One speaker's dialogue (spec 4.2 to 4.5): everything the speaker
+/// program says, with every condition folded for this speaker. Built by
+/// [`crate::dialogue`]; `Module::dialogues` is keyed by the speaker base.
+///
+/// INFO ordinals are 1-based positions in [`Dialogue::nodes`] (the `n` of
+/// the message ids `10000 + 10 n + r`, spec 4.10); `nodes` is in INFO
+/// [`super::SimId`] order, so the ordinals are stable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Dialogue {
+    /// The speaker base (`NPC_` or `CREA`).
+    pub speaker: FormKey,
+    /// Its editor id.
+    pub editor_id: String,
+    /// The INFOs the speaker can say: ordinal `n` is `nodes[n - 1]`.
+    pub nodes: Vec<Node>,
+    /// The topics the speaker can say, with their picks.
+    pub topics: std::collections::BTreeMap<SimId, SpeakerTopic>,
+    /// The `GREETING` topic, when one of its INFOs can pass for the
+    /// speaker; talk says its pick (spec 4.1).
+    pub greeting: Option<SimId>,
+    /// Every `GREETING` INFO folded away: talk opens the hub with the
+    /// converter greeting label (spec 4.9).
+    pub greeting_label: bool,
+    /// The hub (spec 4.1): the top-level topics and the topics `AddTopic`
+    /// gives, ordered by priority, highest first, then by id.
+    pub hub: Vec<HubEntry>,
+    /// What folding did, for the report.
+    pub counts: DialogueCounts,
+}
+
+/// One topic of a speaker's dialogue.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpeakerTopic {
+    /// The topic.
+    pub topic: SimId,
+    /// The picks in the topic's file order (spec 4.4 `p_<t>`): the first
+    /// whose INFO passes is said; a random group draws one among its
+    /// passing members.
+    pub picks: Vec<Pick>,
+}
+
+/// One pick of a topic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Pick {
+    /// One INFO, by ordinal.
+    Info(u32),
+    /// A random group (spec 4.1): a run of random INFOs up to and
+    /// including a random-end one, by ordinal.
+    Random(Vec<u32>),
+}
+
+/// One entry of the hub.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubEntry {
+    /// The topic.
+    pub topic: SimId,
+    /// Shown only once this global is set: the topic's "given" flag
+    /// ([`super::once_sub::GIVEN`]), for a topic that is not top level and
+    /// that `AddTopic` gives. `None` for a top-level topic.
+    pub given: Option<SimId>,
+}
+
+/// One INFO as one speaker says it (spec 4.3, 4.4 `i_<n>`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Node {
+    /// Its ordinal, from 1.
+    pub ordinal: u32,
+    /// The INFO ([`Info`] holds responses, flags, scripts and the check).
+    pub info: SimId,
+    /// Its topic.
+    pub topic: SimId,
+    /// The INFO's condition folded for this speaker (spec 4.2): `c_<n>`.
+    pub condition: Cond,
+    /// The option text: the INFO's prompt, else the topic's name.
+    pub prompt: Option<TextId>,
+    /// The topics offered after it, deduplicated and ordered by priority,
+    /// highest first, then by first appearance (`TCLT` order, then the
+    /// topics whose INFOs name this one's topic in `TCLF`). Only topics the
+    /// speaker can say are listed. Empty: back to the hub.
+    pub choices: Vec<SimId>,
+    /// A challenge's failure topic for this speaker (spec 4.7): its pick
+    /// is said on a failed roll; `None` when the speaker has none, and the
+    /// player then stays in the current list.
+    pub failure: Option<SimId>,
+}
+
+/// What the dialogue compiler did for one speaker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct DialogueCounts {
+    /// INFOs whose speaker set allows the speaker.
+    pub candidates: u32,
+    /// Of those, the ones whose folded condition is false (dropped).
+    pub folded_away: u32,
+    /// Bark INFOs not lowered (hello, combat, detection, conversation
+    /// topics; owner decision 14).
+    pub barks: u32,
+    /// Passing INFOs of topic-type topics nothing leads to (not lowered).
+    pub unreached: u32,
+    /// Fallout 3 percentage challenges.
+    pub challenges: u32,
+    /// Threshold checks (New Vegas pairs and Fallout 3 gates).
+    pub thresholds: u32,
+}
+
+/// The plugin's settings the checks, hacking and lock picking use (spec
+/// 4.7, 9.1, 9.3; owner decisions 2 and 3), read from its game settings at
+/// build time. Arrays are indexed by difficulty: `DNAM - 1` for speech
+/// (1 very easy to 5 very hard), the stored terminal difficulty (0 to 4)
+/// or the lock tier (0 to 4) for the others.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CheckSettings {
+    /// `fSpeechChallengeMultiplier`.
+    pub speech_multiplier: f32,
+    /// `fSpeechAutoSuccessThreshold`, a fraction of 1: a chance at or
+    /// above `100 *` it becomes 100 ([`crate::dialogue::checks::fo3_chance`]).
+    pub speech_auto_success: f32,
+    /// `iSpeechChallengeDifficulty<VeryEasy..VeryHard>`.
+    pub speech_difficulty: [i32; 5],
+    /// `iXPRewardSpeechChallenge<VeryEasy..VeryHard>`.
+    pub speech_xp: [i32; 5],
+    /// `iXPRewardHackComputer<VeryEasy..VeryHard>`.
+    pub hack_xp: [i32; 5],
+    /// `iXPRewardPickLock<VeryEasy..VeryHard>`.
+    pub lockpick_xp: [i32; 5],
+}
+
+impl Default for CheckSettings {
+    /// The values used when a plugin lacks a setting (each use is
+    /// reported): the Fallout 3 master's values as measured.
+    fn default() -> Self {
+        Self {
+            speech_multiplier: 2.0,
+            speech_auto_success: 0.9,
+            speech_difficulty: [10, 40, 55, 70, 80],
+            speech_xp: [5, 5, 5, 5, 5],
+            hack_xp: [20, 30, 40, 50, 60],
+            lockpick_xp: [20, 30, 40, 50, 60],
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

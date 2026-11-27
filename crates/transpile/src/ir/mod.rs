@@ -10,21 +10,33 @@ mod module;
 mod package;
 mod quest;
 mod script;
+pub mod visit;
 mod world;
 
 pub use dialogue::{
-    ActorValue, FailureRoute, Info, InfoFlags, Remember, Response, Skill, SkillCheck, SpeakerSet,
-    Stat, Topic, TopicKind,
+    ActorValue, CheckSettings, Dialogue, DialogueCounts, FailureRoute, HubEntry, Info, InfoFlags,
+    Node, Pick, Remember, Response, Skill, SkillCheck, SpeakerSet, SpeakerTopic, Stat, Topic,
+    TopicKind,
 };
 pub use expr::{BinOp, Call, CmpOp, Cond, Expr, Func, FuncId, RefExpr, UnOp, VarRef, VarTy};
-pub use id::{BadSimId, FormKey, SimId, SimKind, Text, TextId, TextRole, quest_sub, script_sub};
-pub use module::{
-    BaseFiles, Lowered, Module, PlacedKind, PlacedObject, Placement, SimConfig, SimSlice,
+pub use id::{
+    BadSimId, FormKey, SimId, SimKind, Text, TextId, TextRole, actor_sub, once_sub, quest_sub,
+    script_sub,
 };
-pub use package::{Location, Package, PackageEvent, PackageKind, Runner, Schedule, Target};
-pub use quest::{LogEntry, Objective, Quest, Stage};
+pub use module::{
+    BaseFiles, Lowered, Module, PlacedGroup, PlacedKind, PlacedLock, PlacedObject, Placement,
+    SimConfig, SimSlice, WalkMask,
+};
+pub use package::{
+    ActorRun, Anchor, Combat, HexAt, Location, Package, PackageEvent, PackageKind, Place, RunSlot,
+    RunTarget, Runner, Schedule, Target,
+};
+pub use quest::{
+    Journal, JournalRow, LogEntry, Objective, Quest, Stage, objective_state, quest_flags,
+};
 pub use script::{Block, Event, ResultOwner, Script, ScriptKind, Stmt, VarDecl};
 pub use world::{
-    Actor, ActorKind, AiData, EnableGroup, Global, GlobalPurpose, MenuItem, Note, NoteBody,
-    RefEntry, RefUses, Terminal, fixed_point, global_name,
+    Actor, ActorKind, AiData, EnableGroup, Global, GlobalPurpose, Hack, Holodisk, HolodiskSource,
+    Lock, MenuItem, MessageBox, Note, NoteBody, RefEntry, RefUses, StateChild, Terminal,
+    TerminalProgram, fixed_point, global_name,
 };

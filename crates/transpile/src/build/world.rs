@@ -90,6 +90,14 @@ impl Builder<'_> {
         }
         let uses = std::mem::take(&mut self.uses.refs);
         for (reference, why) in &uses {
+            // A marker needs no slot (spec 5.8): its hex is a constant.
+            if self
+                .placed
+                .get(reference)
+                .is_some_and(|list| list.iter().all(|o| o.marker))
+            {
+                continue;
+            }
             let Some(objects) = self.placed.get(reference) else {
                 let diag = Diag::note(
                     Category::RefOutsideSlice,

@@ -2246,7 +2246,32 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
             copies: Vec::new(),
             triggers: crate::placements::trigger_spots(&references, &frame, |_| 0),
             hostile: crate::placements::hostile_of(catalogue.as_ref()),
+            key_pids: crate::placements::key_pids_of(built.loot.as_ref()),
             originals: groups.originals.clone(),
+            positions: crate::placements::marker_spots(
+                &references,
+                &built.objects.iter().map(|o| o.reference.as_str()).collect(),
+                &frame,
+                |_| 0,
+            ),
+            outside: Vec::new(),
+            interior: interior.is_some(),
+            walkable: vec![(0, built.walkable.clone())],
+            exits: report
+                .exits
+                .iter()
+                .map(|e| crate::placements::ExitFact {
+                    door: e.door.clone(),
+                    elevation: 0,
+                    hex: e.door_hex,
+                    to: e
+                        .stub_file
+                        .trim_start_matches("maps/")
+                        .trim_end_matches(".map")
+                        .to_owned(),
+                })
+                .collect(),
+            items: crate::placements::item_pids_of(built.loot.as_ref()),
         };
         crate::placements::write_for_stage(
             &inputs.out,

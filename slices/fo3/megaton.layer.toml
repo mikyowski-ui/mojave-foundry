@@ -10,6 +10,9 @@ start = "megaton"
 # Pass 2: a named actor whose packages lead to another map of the layer gets
 # a hidden copy there (presence copies).
 presence_copies = true
+# Pass 2 (task T9): `all` runs the simulation stage after the map stage
+# (dialogue, scripts, quests, packages into the layer; needs --f2).
+sim = true
 
 [all_maps]
 loot = true

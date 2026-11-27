@@ -13,11 +13,28 @@
 #   GATE_JOBS           cargo -j value (default: 4)
 #   GATE_REQUIRE_REAL=1 a skipped byte-identity step is a failure
 #   CARGO_HOME          honoured if set, never forced
+# A git-ignored gate.env at the repo root supplies defaults for these.
 #
 # --fast skips the byte-identity step on purpose.
 set -euo pipefail
 
 ROOT="$(builtin cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Local defaults: a git-ignored gate.env at the repo root may set FNV_DIR,
+# F2_DIR, CARGO_HOME and the GATE_* variables. A variable already set in the
+# environment wins. See gate.env.example.
+if [ -f "$ROOT/gate.env" ]; then
+  while IFS='=' read -r key value; do
+    case "$key" in
+      FNV_DIR|F2_DIR|CARGO_HOME|GATE_BASELINES|GATE_SCRATCH|GATE_BIN|GATE_JOBS|GATE_REQUIRE_REAL)
+        if [ -z "${!key:-}" ]; then
+          value="${value%\"}"; value="${value#\"}"
+          export "$key=$value"
+        fi
+        ;;
+    esac
+  done < "$ROOT/gate.env"
+fi
 BRIEFS_DIR="docs/vault-engine-briefs"
 JOBS="${GATE_JOBS:-4}"
 

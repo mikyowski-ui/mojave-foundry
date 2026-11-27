@@ -36,7 +36,7 @@ summary="$check/summary.txt"
 : > "$summary"
 
 # The registered maps, in manifest order: `file` lines of [[maps]].
-mapfiles=$(grep -E '^file *= *"' "$layer/vault-mod.toml" | sed -E 's/^file *= *"([^"]+)".*/\1/')
+mapfiles=$(grep -E '^file *= *"[^"]+\.map"' "$layer/vault-mod.toml" | sed -E 's/^file *= *"([^"]+)".*/\1/')
 start=$(printf '%s\n' "$mapfiles" | head -n 1)
 
 idle="$check/idle.jsonl"
@@ -49,12 +49,20 @@ idle="$check/idle.jsonl"
 
 for map in $mapfiles; do
     stem=${map%.map}
-    ( cd "$out" && "$engine" --replay-inputs "$idle" --game-profile fallout2 \
+    # A short headless bot run, not a replay: a replay log must carry the
+    # layer's mod-stack record once the layer has scripts, and an idle log
+    # written here has none.
+    rm -rf "$check/load-$stem"
+    ( cd "$out" && "$engine" --autoplay-headless --game-profile fallout2 \
         --master-dat "$f2/master.dat" --critter-dat "$f2/critter.dat" \
-        --mod-list load_order.toml --preview-map "maps/$map" ) \
+        --mod-list load_order.toml --preview-map "maps/$map" \
+        --autoplay-output "engine-check/load-$stem" --ticks 30 ) \
         > "$check/load-$stem.out" 2> "$check/load-$stem.err"
     status=$?
-    printf 'load %s: exit %s; %s\n' "$map" "$status" "$(tail -n 1 "$check/load-$stem.out")" >> "$summary"
+    result=$(grep -m1 '^result:' "$check/load-$stem/report.txt" 2>/dev/null || tail -n 1 "$check/load-$stem.err" | cut -c1-200)
+    refused=$(grep -ci 'refused' "$check/load-$stem.err" || true)
+    diags=$(grep -c 'world diagnostic' "$check/load-$stem.err" || true)
+    printf 'load %s: exit %s; %s; script refusals %s; world diagnostics %s\n' "$map" "$status" "$result" "$refused" "$diags" >> "$summary"
     # Stub maps (`<head>_NNN.map`) are empty: nothing to walk.
     case "$stem" in *_[0-9][0-9][0-9]) continue ;; esac
     for e in 0 1 2; do

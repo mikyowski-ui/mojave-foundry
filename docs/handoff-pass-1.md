@@ -1,6 +1,6 @@
 # Pass 1 handoff: M0 to M3
 
-Written 2026-11-20. Pinned `vault-formats` revision: `3adeac9`.
+Written 2026-11-20. Pinned `vault-formats` revision: `3adeac9` (moved to `2e632c2` in section 13).
 
 ## 1. What was done
 
@@ -1276,3 +1276,90 @@ The owner locked all 15 decisions of `docs/simulation-layer-spec.md` section
 13 on 2026-11-23 (the table is in `docs/contracts.md` section 11). The engine
 pin bump and the final Megaton autoplay gate wait for the owner's engine
 fixes (the elevation-change audit and the camera follow toggle).
+
+## 13. Pass 2, wave S1 (2026-11-24)
+
+The first wave of the simulation layer (`docs/simulation-layer-spec.md`):
+the extraction the transpiler needs, the transpiler's front end, the `emit`
+assembler and appenders, and the map stage's Pass 2 output. The interfaces are
+in `docs/contracts.md` section 11 (11.1 the IR helper types, 11.2 the placement
+index, 11.7 the `emit` calls).
+
+**Records revision 2.** The MIR's `records.sqlite` gained the simulation
+tables (`docs/contracts.md` section 2; `RECORDS_REVISION` 2) and the typed
+queries over them. Row counts on the retail masters:
+
+| Table | Fallout 3 | New Vegas |
+|---|---|---|
+| `globals` | 155 | 218 |
+| `game_settings` | 530 | 648 |
+| `messages` | 518 | 1,144 |
+| `factions` | 326 | 682 |
+| `faction_relations` | 666 | 1,314 |
+| `actor_ai` rows | 2,180 | 5,394 |
+| `script_contexts` | 8,713 | 11,373 |
+
+The speech-challenge flag is read from 263 dialogue lines in Fallout 3 and 3 in
+New Vegas.
+
+**The transpile front end on the real data.** Every script record and embedded result
+script of both masters was parsed (`cargo run -p transpile --example
+parse_all`, which reads the MIR and writes nothing); none panicked. Function
+calls are counted by the signature table's status.
+
+| | Fallout 3 | New Vegas |
+|---|---|---|
+| scripts parsed | 8,638 | 11,300 |
+| panics | 0 | 0 |
+| scripts with an error | 24 | 50 |
+| function calls compiled | 17,501 | 33,641 |
+| folded | 701 | 1,201 |
+| dropped | 2,387 | 4,736 |
+| unknown | 1,623 | 5,586 |
+
+**The `emit` assembler** (`emit::int::assemble`) was checked against the
+engine's own loader (`vault_vm::IntProgram::parse_in`, `crates/emit/tests/
+int_vm.rs`): what it writes loads and runs. With it came the appenders for
+`vault13.gam`, `scripts.lst`, message files, `quests.txt` and `holodisk.txt`,
+the map script attacher, and the layer's script, global-script and hook
+registrations with their write-time checks (`docs/contracts.md` 11.7).
+
+**The map stage** (slice keys `enable_groups` and `hostile_packet`, layer key
+`presence_copies`; `docs/running.md`, "Layers") writes the placement index,
+schema 2, with the builder's exact object map. Results on the real layers:
+
+| Layer | Index entries matching the written maps | Also |
+|---|---|---|
+| Super-Duper Mart | 223 of 223 | 5 hidden group critters, 4 locks, 5 triggers |
+| Megaton | 183 of 183 | 3 presence copies |
+
+**Engine pin.** `vault-formats` and `vault-vm` are pinned to the engine's
+`2e632c2` (they were `3adeac9`). That engine's commit is "Engine Wave 1: held objects
+follow their holder's elevation, camera_follow, stable player script identifier
+on load".
+
+**First engine check on `2e632c2`.** Super-Duper Mart, plain and chaos
+autoplay: clean (both failed the elevation audit on the old engine). Megaton,
+plain and chaos autoplay: clean (the chaos run failed "the locals differ" on the
+old engine).
+
+**Follow-ups to the map stage (same day).**
+
+- *Trigger volumes carry their bounds.* The `XPRM` primitive (32 bytes, in
+  every reference of both masters: Fallout 3 4,137 references with one, New
+  Vegas 5,677, none of another size or undecoded) is kept in the MIR as
+  `Reference::primitive` (`bounds`, `shape`), which raised `mir::SCHEMA_VERSION`
+  to 3: every older extract directory is rebuilt by the next run. The index's
+  `triggers` now have `shape` and `radius` (a covering hex radius; a corner off
+  the map is pulled in to the map's edge). The bounds are read as half-extents,
+  which public documentation says and nothing here has checked.
+- *Locks name their key's prototype.* `lock.key_pid` is the Fallout 2
+  prototype id of the converted key item, left out when the key is not in the
+  layer; a `keys_missing` note counts those.
+- *Super-Duper Mart rebuilt on this code.* All 223 index entries still match
+  the written maps (the ignored `index_check`), with 5 hidden group critters.
+  The five triggers, all boxes (map, hex, radius in hexes): `sdmart` 1851 radius
+  3, 3912 radius 103, 21262 radius 2, 28518 radius 58, and `sdmartin` (elevation
+  1) 13113 radius 10. The four locks: one door (`sdmartin`, level 25)
+  has `key_pid` 599; the other three, containers (levels 25, 25 and 0), name no
+  key. No key is missing.

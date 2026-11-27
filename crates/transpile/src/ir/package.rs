@@ -227,3 +227,116 @@ pub enum Runner {
     /// Not run.
     None,
 }
+
+/// How one actor base runs its packages (spec 7): the runner's input in
+/// the critter program. Built by [`crate::packages`]; `Module::runs` is
+/// keyed by the base.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActorRun {
+    /// The actor base.
+    pub base: FormKey,
+    /// Its package slots, in `PKID` order (spec 7.2 walks them in order).
+    pub slots: Vec<RunSlot>,
+    /// Combat hand-off and team (spec 7.5).
+    pub combat: Combat,
+    /// The factions of the base, in order, after templates: the indices
+    /// of the faction-override globals ([`super::actor_sub::FACTION`]).
+    pub factions: Vec<FormKey>,
+    /// Presence copies (spec 7.6, owner decision 5): the maps holding a
+    /// copy of the actor, sorted, its own map included; empty when the
+    /// actor is not copied.
+    pub presence: Vec<String>,
+}
+
+/// One package slot of an actor.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunSlot {
+    /// The package ([`super::SimKind::Package`]).
+    pub package: SimId,
+    /// The behaviour; [`Runner::Wait`] for a counted fallback.
+    pub runner: Runner,
+    /// The source type.
+    pub kind: PackageKind,
+    /// Run rather than walk (general flag "always run").
+    pub run: bool,
+    /// The condition, folded for this actor as the subject (spec 4.2).
+    pub condition: Cond,
+    /// When it applies.
+    pub schedule: Schedule,
+    /// Where, per map the actor stands on.
+    pub places: Vec<Place>,
+    /// Whom it follows or faces.
+    pub target: Option<RunTarget>,
+    /// Why the slot is a fallback (the actor stands), when it is one.
+    pub fallback: Option<String>,
+}
+
+/// A package location resolved on one map (spec 7.3, "Locations to
+/// hexes").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Place {
+    /// The map's stem.
+    pub map: String,
+    /// What the location is anchored on.
+    pub anchor: Anchor,
+    /// The radius in hexes: `ceil(radius / 70)`.
+    pub radius: u32,
+    /// Sandbox candidates: up to 16 walkable hexes within the radius in
+    /// the anchor's component, sampled deterministically (sorted by
+    /// distance to the anchor, then hex, every k-th). Empty when the slot
+    /// is not a sandbox or no walkable data was given.
+    pub candidates: Vec<HexAt>,
+}
+
+/// A hex at an elevation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct HexAt {
+    /// Elevation 0 to 2.
+    pub elevation: u8,
+    /// Hex 0 to 39,999.
+    pub hex: u32,
+}
+
+/// What a location is anchored on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Anchor {
+    /// A placed reference on the same map: its hex (static) or its
+    /// current tile (a critter).
+    Ref(FormKey),
+    /// A known hex (a reference placed on the map, a linked reference).
+    Hex(HexAt),
+    /// The actor's own placed hex (`L_ANCHOR`, set on first run).
+    Editor,
+    /// Where the actor stands when the package is selected.
+    Current,
+}
+
+/// Whom a package follows or faces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunTarget {
+    /// The player.
+    Player,
+    /// A placed reference.
+    Ref(FormKey),
+}
+
+/// How an actor fights (spec 7.5, owner decision 11).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Combat {
+    /// Hostile to the player: attacks on sight with the hostile packet.
+    pub hostile: bool,
+    /// Why, in words, for the report.
+    pub reason: String,
+    /// The faction whose members form the actor's team (its first
+    /// non-crime faction); the lowering numbers teams from 100 in
+    /// `Module::teams` order. `None`: no faction, own team.
+    pub team: Option<FormKey>,
+    /// Aggression (`AIDT`) after templates.
+    pub aggression: u8,
+    /// Confidence after templates.
+    pub confidence: u8,
+    /// Assistance after templates.
+    pub assistance: u8,
+}

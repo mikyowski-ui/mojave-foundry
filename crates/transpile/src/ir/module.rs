@@ -6,12 +6,15 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::dialogue::{Info, Topic};
+use super::dialogue::{CheckSettings, Dialogue, Info, Topic};
 use super::id::{FormKey, SimId, Text};
-use super::package::Package;
-use super::quest::Quest;
+use super::package::{ActorRun, HexAt, Package};
+use super::quest::{Journal, Quest};
 use super::script::Script;
-use super::world::{Actor, EnableGroup, Global, Note, RefEntry, Terminal};
+use super::world::{
+    Actor, EnableGroup, Global, Holodisk, Lock, MessageBox, Note, RefEntry, StateChild, Terminal,
+    TerminalProgram,
+};
 use crate::diag::Diag;
 
 /// Everything the front end built, in [`SimId`] order.
@@ -43,6 +46,42 @@ pub struct Module {
     pub actors: BTreeMap<FormKey, Actor>,
     /// The report's source: everything not tied to one script.
     pub diagnostics: Vec<Diag>,
+    // ---- task T5 and T6 (additive; absent in older snapshots)
+    /// Per-speaker dialogues ([`crate::dialogue`]), by speaker base.
+    #[serde(default)]
+    pub dialogues: BTreeMap<FormKey, Dialogue>,
+    /// The plugin's check, hacking and lock-picking settings.
+    #[serde(default)]
+    pub settings: CheckSettings,
+    /// Messages scripts show.
+    #[serde(default)]
+    pub messages: BTreeMap<SimId, MessageBox>,
+    /// Pip-Boy quest groups ([`crate::quest`]), by quest.
+    #[serde(default)]
+    pub journal: BTreeMap<SimId, Journal>,
+    /// Enable-group children by map ([`crate::state`], spec 8.3), sorted.
+    #[serde(default)]
+    pub state: BTreeMap<String, Vec<StateChild>>,
+    /// The groups each script enables or disables (spec 8.3: the calling
+    /// program applies them at once), by script.
+    #[serde(default)]
+    pub group_users: BTreeMap<SimId, Vec<SimId>>,
+    /// Terminal programs ([`crate::terminals`]), by terminal base.
+    #[serde(default)]
+    pub terminal_programs: BTreeMap<SimId, TerminalProgram>,
+    /// Locks of doors and containers, by reference.
+    #[serde(default)]
+    pub locks: BTreeMap<FormKey, Lock>,
+    /// Holodisks, by note.
+    #[serde(default)]
+    pub holodisks: BTreeMap<SimId, Holodisk>,
+    /// How actors run their packages ([`crate::packages`]), by base.
+    #[serde(default)]
+    pub runs: BTreeMap<FormKey, ActorRun>,
+    /// The team factions in team order (the lowering numbers them from
+    /// 100, spec 7.5).
+    #[serde(default)]
+    pub teams: Vec<FormKey>,
 }
 
 impl Module {
@@ -64,7 +103,9 @@ impl Module {
 
 /// What a placed object is, as the placement index says (contracts 11.2,
 /// `PlacedKind`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum PlacedKind {
     /// A critter.
@@ -78,6 +119,7 @@ pub enum PlacedKind {
     /// A terminal.
     Terminal,
     /// Scenery the caller names.
+    #[default]
     Scenery,
 }
 
@@ -85,7 +127,7 @@ pub enum PlacedKind {
 /// copy of the placement index's `PlacedRef` fields that the build and the
 /// lowering read (contracts 11.2). The `sim` stage fills it; `transpile`
 /// does not depend on `mojave-convert`.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
 pub struct PlacedObject {
     /// The map's stem.
     pub map: String,
@@ -107,6 +149,67 @@ pub struct PlacedObject {
     pub base: Option<FormKey>,
     /// The written object carries the hidden flag.
     pub hidden: bool,
+    // ---- schema 2 of the placement index (tasks T5, T6; the `sim` stage
+    // fills them, absent means unknown)
+    /// The enable group (index field `group`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<PlacedGroup>,
+    /// The lock (index field `lock`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock: Option<PlacedLock>,
+    /// The linked reference (index field `linked_ref`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_ref: Option<FormKey>,
+    /// The catalogue marks the critter hostile (index field `hostile`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hostile: bool,
+    /// A presence copy of this reference (index field `presence_of`):
+    /// `reference` is then the copied actor's reference itself (the
+    /// `sim` stage strips the index's `@<stem>` suffix).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub presence: bool,
+    /// A marker the map stage does not place (`XMarker`,
+    /// `XMarkerHeading`; index reason `skipped`): no object, `hex` and
+    /// `elevation` are where it would stand. Spec 5.8: it needs no slot;
+    /// package locations and `MoveTo` use its hex as a constant.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub marker: bool,
+}
+
+/// An enable group as the placement index states it (schema 2 `group`).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PlacedGroup {
+    /// The group's root (its state).
+    pub root: FormKey,
+    /// Enabled when the root is disabled.
+    pub opposite: bool,
+    /// Starts enabled.
+    pub initially_enabled: bool,
+}
+
+/// A lock as the placement index states it (schema 2 `lock`).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PlacedLock {
+    /// The written object carries the lock bit.
+    pub locked: bool,
+    /// The source's lock level, as stored (255 key only).
+    pub level: u8,
+    /// The key's base form.
+    pub key: Option<FormKey>,
+    /// The converted key item's PID (index field `key_pid`); absent when
+    /// the key did not convert.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_pid: Option<u32>,
+}
+
+/// The walkable hexes of one map and elevation (spec 7.3): the map
+/// stage's walkable mask, which sandbox candidates are sampled from.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct WalkMask {
+    /// Elevation 0 to 2.
+    pub elevation: u8,
+    /// The walkable hexes, sorted.
+    pub hexes: Vec<u32>,
 }
 
 /// The placed objects of the slice, sorted. [`crate::build`] reads the
@@ -159,6 +262,16 @@ pub struct SimSlice {
     pub name: String,
     /// The placed objects.
     pub placement: Placement,
+    /// The walkable hexes, by map stem (task T6; the `sim` stage fills it
+    /// from the map stage's walkable masks). Absent: sandbox locations get
+    /// no candidates beyond their anchor, reported.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub walkable: BTreeMap<String, Vec<WalkMask>>,
+    /// Hexes of the slice's teleport doors by destination map, for
+    /// presence copies that leave while watched (spec 7.6), by map stem:
+    /// `(door reference, hex, destination map stem)`. May be empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub exits: BTreeMap<String, Vec<(FormKey, HexAt, String)>>,
 }
 
 /// The `[sim]` table of `foundry.toml`: build options. Every default is an

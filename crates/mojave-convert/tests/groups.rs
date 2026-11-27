@@ -55,6 +55,8 @@ fn the_groups_layer_writes_hidden_children_copies_locks_and_an_exact_index() {
             .unwrap_or_else(|| panic!("{} is not placed\n{report}", key(id)))
     };
 
+    let lock_of = |id: u32| placed(id).lock.clone().expect("a lock");
+
     // The group: the parent starts disabled; its child and the rifle and
     // the clerk follow it and are placed hidden; the opposite child starts
     // enabled and is placed visible.
@@ -135,8 +137,21 @@ fn the_groups_layer_writes_hidden_children_copies_locks_and_an_exact_index() {
     assert_eq!(lock.key, None);
     assert!(placed(mini_mart::R_REGISTER).lock.is_none());
 
-    // The linked reference, and the trigger volume (no bounds in the MIR
-    // yet: a hex, no radius).
+    // The key items: the storeroom door's key is a prototype of the layer
+    // (the catalogue made it), the locker names none.
+    let key_pid = lock_of(mini_mart::R_STORE_DOOR)
+        .key_pid
+        .expect("the key's PID");
+    assert_eq!(key_pid >> 24, 0, "an item prototype: {key_pid:#x}");
+    assert_eq!(lock_of(mini_mart::R_LOCKER).key_pid, None);
+    assert!(
+        !index.notes.iter().any(|n| n.contains("keys_missing")),
+        "{:?}",
+        index.notes
+    );
+
+    // The linked reference, and the trigger volume (a 60-unit box: a hex,
+    // its shape and a radius).
     assert_eq!(
         placed(mini_mart::R_LINKED_DOOR).linked_ref.as_deref(),
         Some(key(mini_mart::R_LOCKER).as_str())
@@ -147,7 +162,8 @@ fn the_groups_layer_writes_hidden_children_copies_locks_and_an_exact_index() {
         .find(|t| t.reference == key(mini_mart::R_TRIGGER))
         .unwrap_or_else(|| panic!("no trigger\n{:?}", index.triggers));
     assert_eq!(trigger.map, "mmstore");
-    assert_eq!(trigger.radius, None);
+    assert_eq!(trigger.shape.as_deref(), Some("box"));
+    assert!(trigger.radius.is_some_and(|r| r >= 1), "{trigger:?}");
 
     // Every placed entry's object id is the written map's object: same
     // elevation, hex, PID and hidden flag; no id is used twice.

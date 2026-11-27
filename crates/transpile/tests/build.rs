@@ -440,6 +440,7 @@ fn slice(reversed: bool) -> SimSlice {
             reference: Some(key(reference)),
             base: Some(key(base)),
             hidden: false,
+            ..PlacedObject::default()
         })
         .collect();
     if reversed {
@@ -448,6 +449,7 @@ fn slice(reversed: bool) -> SimSlice {
     SimSlice {
         name: "testtown".into(),
         placement: Placement { objects },
+        ..SimSlice::default()
     }
 }
 
@@ -545,10 +547,13 @@ fn what_the_module_holds() {
     let rate = &m.globals[&SimId::of(SimKind::Global, &key(RATE))];
     assert_eq!((rate.ty, rate.initial), (VarTy::Float, 500));
     assert_eq!(rate.name, "TSGLOBALRATE");
+    // (The middle passes add quest state, notes and once-flags; the front
+    // end's own globals keep their order among them.)
     let order: Vec<GlobalPurpose> = m
         .globals_in_allocation_order()
         .iter()
         .map(|g| g.purpose)
+        .filter(|p| matches!(p, GlobalPurpose::Glob | GlobalPurpose::Group))
         .collect();
     assert_eq!(
         order,

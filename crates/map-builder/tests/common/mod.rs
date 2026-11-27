@@ -424,6 +424,7 @@ pub fn teleport_door(
         linked_ref: None,
         owner: None,
         trigger_volume: false,
+        primitive: None,
     }
 }
 

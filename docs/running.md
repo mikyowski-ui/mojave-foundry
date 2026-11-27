@@ -351,6 +351,7 @@ name = "super-duper-mart"     # the layer; the report's title
 start = "sdmart"              # the start map's stem (default: the first map)
 with_interiors = false        # also every interior the exterior's doors lead to
 close_unreached = true        # default; false keeps every walkable component, reached or not
+presence_copies = false       # default; true: a hidden copy of a named actor on each map its packages lead to
 
 [all_maps]                    # slice keys laid over every map's slice
 loot = true
@@ -387,6 +388,22 @@ elevation says "critters lost to closing: none" (the build lists any it
 would lose). The reach is reported either way. Link hexes keep their
 keep-clear rule on a perch as anywhere else.
 
+`presence_copies = true` is a layer file key, not a slice key (spec 7.6): a
+named actor whose AI packages take it to another map of the layer gets one
+hidden copy there, on the walkable hex nearest the package's location, marked
+`presence_of` in the placement index (its reference is `<original>@<map stem>`).
+A package location is understood when it is a reference, a cell of a map of the
+layer, or the actor's linked reference. It is off by default, and it is part of
+the layer's cache key. `enable_groups` also works inside a layer (as an
+`[all_maps]` key or a map's own). All three change the written maps only when
+set; with them off the output is byte for byte what it was.
+
+The trigger volumes (a primitive on an activator) and the key items of locks
+are written to `map-placements.json` (`docs/contracts.md` 11.2) whenever the
+map stage runs: each trigger with its hex, shape and a covering hex radius, and
+each lock with `key_pid` when the layer holds the key's prototype. That needs
+a MIR of schema 3; an older extract directory is rebuilt by the next run.
+
 Every map must be of one game, one plugin list and one worldspace: extract,
 sprites and critters run once over their union (the union of the cell
 ranges, the deepest `interior_depth`; above the minimal animation level the
@@ -416,6 +433,8 @@ window) lead to, each with the exterior's keys, `place_disabled = true`,
 | `vertex_color_floor` | 0 | exterior: the darkest a land vertex colour may make the ground, 0 to 1 (`TerrainOptions::vertex_color_floor`) |
 | `coverage_bridges` | on | with a strict `navmesh_coverage`, joins the islands it cuts out of one floor through hexes the tolerance rule covers, at most 8 per join (`BuildOptions::coverage_bridges`) |
 | `close_unreached` | on | one-map builds (a layer takes the layer file's key): close the walkable components no walk from the entrance reaches, except those a person stands on (`BuildOptions::close_unreached`) |
+| `enable_groups` | off | Pass 2 (spec 8.3): a reference of an enable-parent group (a parent, or a child) that starts disabled is placed with the hidden flag instead of being left off, so a script can show it later; members follow their group's initial state, not their own flag. A member the slicer would bake into the ground or skip stays off and is listed. Hidden objects block nothing and take no part in walkability or the reach. The report gains `## Enable groups`; the placement index lists every one (`hidden`, `group`) |
+| `hostile_packet` | the rebalance table's | with `loot` on: the AI packet number hostile people take, a packet of the base `ai.txt` (another number stops the stage); the placement index marks the people it applied to as `hostile` |
 
 These keys are read on a one-map run as well, each only when present; a
 slice with `storeys = "auto"` or `levels = "auto"` is built as a layer of
@@ -603,9 +622,11 @@ of `foundry.toml`, which the scaffold does not read. The interfaces are in
 cargo test --workspace
 ```
 
-`vault-formats` is a git dependency pinned by revision. To resolve it from a
-local `vault-engine` checkout instead of the network, copy
-`.cargo/config.toml.example` to `.cargo/config.toml` and set the path.
+`vault-formats` is a git dependency pinned by revision. The pin is now
+`2e632c2` (it was `3adeac9` before wave S1; `.cargo/config.toml.example`
+already names it). To resolve it from a local `vault-engine` checkout instead
+of the network, copy `.cargo/config.toml.example` to `.cargo/config.toml` and
+set the path.
 
 ## Layout
 

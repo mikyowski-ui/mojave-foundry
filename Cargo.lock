@@ -1126,7 +1126,9 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "toml",
+ "transpile",
  "vault-formats",
+ "vault-vm",
 ]
 
 [[package]]

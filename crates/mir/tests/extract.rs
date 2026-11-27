@@ -208,7 +208,7 @@ fn records_sqlite_has_the_typed_rows() {
     assert_eq!(r.summary.records, counts.values().sum::<u64>() as usize);
     assert_eq!(
         records.meta("schema_version").unwrap().as_deref(),
-        Some("2")
+        Some("3")
     );
     assert!(records.bad_records().unwrap().is_empty());
 
@@ -459,6 +459,15 @@ fn a_primitive_on_an_activator_is_a_trigger_volume() {
         Some(mir::fixture::TRIGGER_STAND_IN)
     );
     assert!(trigger.mesh.is_some());
+    // The primitive's extents and shape are kept (header version 1.34; the
+    // Fallout 3 install's sphere is checked in `fallout3.rs`).
+    assert_eq!(
+        trigger.primitive,
+        Some(mir::PrimitiveDoc {
+            bounds: [256.0, 192.0, 128.0],
+            shape: mir::PrimitiveShape::Box,
+        })
+    );
 
     let mut flagged = Vec::new();
     for key in mir.cells() {
@@ -593,12 +602,23 @@ fn bad_options_and_directories_are_errors() {
     let text = fs::read_to_string(&path).unwrap();
     fs::write(
         &path,
-        text.replacen("\"schema_version\": 2", "\"schema_version\": 99", 1),
+        text.replacen("\"schema_version\": 3", "\"schema_version\": 99", 1),
     )
     .unwrap();
     assert!(matches!(
         Mir::open(&out),
         Err(MirError::SchemaVersion { found: 99, .. })
+    ));
+    // So is the last version, which kept no primitive volumes: a cache
+    // written then is rebuilt, not read.
+    fs::write(
+        &path,
+        text.replacen("\"schema_version\": 3", "\"schema_version\": 2", 1),
+    )
+    .unwrap();
+    assert!(matches!(
+        Mir::open(&out),
+        Err(MirError::SchemaVersion { found: 2, .. })
     ));
     // And extract rebuilds over it.
     let again = extract(&options).unwrap();

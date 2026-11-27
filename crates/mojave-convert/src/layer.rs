@@ -96,6 +96,9 @@ pub struct LayerSpec {
     /// the walkable hex nearest the package's location, marked in the
     /// placement index as a copy of the original. Default off.
     pub presence_copies: bool,
+    /// `sim = true` (task T9): `all` runs the simulation stage after the
+    /// map stage. Default off.
+    pub sim: bool,
     pub maps: Vec<LayerMap>,
     /// The first exterior's slice as a table, and the `[all_maps]` keys:
     /// what an automatic interior is made from.
@@ -122,6 +125,8 @@ struct LayerFile {
     close_unreached: bool,
     #[serde(default)]
     presence_copies: bool,
+    #[serde(default)]
+    sim: bool,
     #[serde(default)]
     all_maps: toml::Table,
     #[serde(default)]
@@ -279,6 +284,7 @@ impl LayerSpec {
             with_interiors: file.with_interiors,
             close_unreached: file.close_unreached,
             presence_copies: file.presence_copies,
+            sim: file.sim,
             maps,
             base,
             all_maps: file.all_maps,
@@ -296,6 +302,7 @@ impl LayerSpec {
             with_interiors: true,
             close_unreached: slice.close_unreached.unwrap_or(true),
             presence_copies: false,
+            sim: slice.sim.unwrap_or(false),
             maps: vec![LayerMap {
                 slice: slice.clone(),
                 automatic: false,
@@ -314,6 +321,7 @@ impl LayerSpec {
             with_interiors: false,
             close_unreached: slice.close_unreached.unwrap_or(true),
             presence_copies: false,
+            sim: slice.sim.unwrap_or(false),
             maps: vec![LayerMap {
                 slice: slice.clone(),
                 automatic: false,
@@ -2238,6 +2246,13 @@ pub fn map_layer(inputs: &Inputs, layer: &LayerSpec) -> Result<MapSummary, Conve
         if let Some(why) = why {
             crate::timings::note(format!("no referenced set: {why}"));
         }
+        let records = mir.records().ok();
+        let known: BTreeSet<String> = plan
+            .maps
+            .iter()
+            .flat_map(|m| m.references.iter().map(|r| r.form.to_string()))
+            .collect();
+        let items = crate::placements::item_pids_of(built.loot.as_ref());
         let stage_maps: Vec<crate::placements::StageMap<'_>> = plan
             .maps
             .iter()
@@ -2267,13 +2282,43 @@ pub fn map_layer(inputs: &Inputs, layer: &LayerSpec) -> Result<MapSummary, Conve
                     .collect();
                 stage.hostile =
                     crate::placements::hostile_of(catalogue.as_ref().map(|c| &c.report));
+                stage.key_pids = crate::placements::key_pids_of(built.loot.as_ref());
                 stage.originals = map.groups.originals.clone();
                 if let Ok(frame) = map_builder::walk::Frame::new(&map.window, &map.projection) {
                     stage.triggers =
                         crate::placements::trigger_spots(&map.references, &frame, |r| {
                             trigger_elevation(map, r)
                         });
+                    let placed: BTreeSet<&str> = built_map
+                        .objects
+                        .iter()
+                        .map(|o| o.reference.as_str())
+                        .collect();
+                    stage.positions =
+                        crate::placements::marker_spots(&map.references, &placed, &frame, |r| {
+                            marker_elevation(map, r)
+                        });
+                    if map.interior.is_none()
+                        && let Some(records) = &records
+                        && let Some(worldspace) = worldspace_form(&map.cells)
+                    {
+                        stage.outside = crate::placements::outside_markers(
+                            records,
+                            &worldspace,
+                            &frame,
+                            &known,
+                        );
+                    }
                 }
+                stage.interior = map.interior.is_some();
+                stage.walkable = built_map
+                    .walkable
+                    .iter()
+                    .enumerate()
+                    .map(|(e, mask)| (e as u8, mask.clone()))
+                    .collect();
+                stage.exits = exits_of(built_map);
+                stage.items = items.clone();
                 stage
             })
             .collect();
@@ -2545,6 +2590,66 @@ fn elevation_reach(text: &mut String, e: &map_builder::ElevationReport) {
         100.0 * r.open_floor_ratio
     );
     let _ = writeln!(text, "- people here: {}", e.critters.len());
+}
+
+/// The elevation a reference that became no object would stand on: the
+/// highest run of `map` that took it (a level's run takes its own
+/// references, the ground level takes every one), else the run whose
+/// interior band holds it ([`trigger_elevation`]).
+fn marker_elevation(map: &MapRun, reference: &mir::Reference) -> u8 {
+    map.runs
+        .iter()
+        .filter(|run| run.references.iter().any(|r| r.form == reference.form))
+        .map(|run| run.elevation)
+        .max()
+        .unwrap_or_else(|| trigger_elevation(map, reference))
+}
+
+/// The worldspace record of an exterior map's cells.
+fn worldspace_form(cells: &[CellDoc]) -> Option<mir::FormKey> {
+    cells.iter().find_map(|c| match &c.location {
+        mir::CellLocation::Exterior {
+            worldspace_form, ..
+        } => Some(worldspace_form.clone()),
+        mir::CellLocation::Interior => None,
+    })
+}
+
+/// The doors of a built map that lead to another map of the layer (its
+/// links) or to a stub (its exits), for `map-sim.json`.
+fn exits_of(built: &map_builder::BuiltMap) -> Vec<crate::placements::ExitFact> {
+    let stem_of = |file: &str| {
+        file.trim_start_matches("maps/")
+            .trim_end_matches(".map")
+            .to_owned()
+    };
+    let mut out: Vec<crate::placements::ExitFact> = built
+        .links
+        .iter()
+        .filter(|l| l.kind == map_builder::LinkKind::Door)
+        .filter_map(|l| {
+            Some(crate::placements::ExitFact {
+                door: l.from.clone(),
+                elevation: l.elevation,
+                hex: l.door_hex?,
+                to: stem_of(&l.to_file),
+            })
+        })
+        .collect();
+    for exit in &built.report.exits {
+        let elevation = built
+            .objects
+            .iter()
+            .find(|o| o.reference == exit.door)
+            .map_or(built.entrance_elevation, |o| o.elevation);
+        out.push(crate::placements::ExitFact {
+            door: exit.door.clone(),
+            elevation,
+            hex: exit.door_hex,
+            to: stem_of(&exit.stub_file),
+        });
+    }
+    out
 }
 
 /// The elevation of the run of `map` whose interior band holds the

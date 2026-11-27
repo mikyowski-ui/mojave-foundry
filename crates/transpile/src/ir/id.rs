@@ -96,6 +96,9 @@ pub enum SimKind {
     /// A converter text: `form` [`FormKey::converter`], `sub` the label
     /// number.
     Text,
+    /// A message (`MESG`) a script shows; `sub` 0. Added in task T5, after
+    /// every other kind so that the order of the others is unchanged.
+    Message,
 }
 
 impl SimKind {
@@ -119,11 +122,12 @@ impl SimKind {
             Self::Actor => "actor",
             Self::Ref => "ref",
             Self::Text => "text",
+            Self::Message => "message",
         }
     }
 
     /// Every kind, in order.
-    pub const ALL: [SimKind; 17] = [
+    pub const ALL: [SimKind; 18] = [
         Self::Topic,
         Self::Info,
         Self::Quest,
@@ -141,6 +145,7 @@ impl SimKind {
         Self::Actor,
         Self::Ref,
         Self::Text,
+        Self::Message,
     ];
 }
 
@@ -196,6 +201,39 @@ pub mod script_sub {
     pub const STAGE: u32 = 0x0100_0000;
 }
 
+/// Sub codes of the dialogue's state globals (spec 4.5), under the
+/// [`SimKind::Info`] or [`SimKind::Topic`] id of what they remember. Sub 0
+/// is the record itself.
+pub mod once_sub {
+    /// An INFO's say-once flag: 1 once said.
+    pub const SAY_ONCE: u32 = 1;
+    /// An INFO's say-once-a-day global: the game day it was last said
+    /// (`game_time / 864000`), -1 before.
+    pub const SAY_DAY: u32 = 2;
+    /// A challenge INFO's "attempted" flag (owner decision 1).
+    pub const ATTEMPTED: u32 = 3;
+    /// A challenge INFO's "passed" flag.
+    pub const PASSED: u32 = 4;
+    /// A topic's "given by `AddTopic`" flag, under its [`super::SimKind::Topic`] id.
+    pub const GIVEN: u32 = 1;
+}
+
+/// Sub codes of the per-actor and per-reference globals, under the
+/// [`SimKind::Actor`] id of a base or the [`SimKind::Ref`] id of a placed
+/// reference.
+pub mod actor_sub {
+    /// Under a [`super::SimKind::Ref`]: the reference is dead (1), shared by
+    /// its presence copies (spec 7.6) and read by `GetDead` from another map.
+    pub const DEAD: u32 = 1;
+    /// Under a [`super::SimKind::Actor`]: how many of the base were killed
+    /// (`GetDeadCount`, spec 4.8).
+    pub const KILLS: u32 = 1;
+    /// Under a [`super::SimKind::Actor`]: `FACTION + i` is the override of
+    /// the base's membership in faction `i` of [`crate::ir::ActorRun::factions`]
+    /// (rank + 1, 0 not a member), when a script changes it (spec 4.2, 5.9).
+    pub const FACTION: u32 = 0x100;
+}
+
 impl SimId {
     /// A new id.
     pub fn new(kind: SimKind, form: FormKey, sub: u32) -> Self {
@@ -236,6 +274,17 @@ impl SimId {
     /// A converter label ([`crate::labels`]).
     pub fn label(number: u32) -> Self {
         Self::new(SimKind::Text, FormKey::converter(), number)
+    }
+
+    /// The karma shadow global (owner decision 13, spec 6.4).
+    pub fn karma() -> Self {
+        Self::new(SimKind::Global, FormKey::converter(), 1)
+    }
+
+    /// The same kind and form with another sub-index.
+    #[must_use]
+    pub fn with_sub(&self, sub: u32) -> Self {
+        Self::new(self.kind, self.form.clone(), sub)
     }
 }
 

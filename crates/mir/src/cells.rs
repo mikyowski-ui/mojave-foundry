@@ -15,8 +15,8 @@ use crate::index::{Entry, Index, Key};
 use crate::model::{
     CellDoc, CellLocation, CellRef, EnableParentDoc, InteriorEntry, Issue, LandDefault, LandDoc,
     LandLayer, LayerOpacity, LockDoc, NavDoorLinkDoc, NavExternalLinkDoc, NavTriangleDoc,
-    NavmeshDoc, RefFlags, RefGroup, RefKind, Reference, SCHEMA_VERSION, Slice, TeleportDoc,
-    Transform, cell_of,
+    NavmeshDoc, PrimitiveDoc, PrimitiveShape, RefFlags, RefGroup, RefKind, Reference,
+    SCHEMA_VERSION, Slice, TeleportDoc, Transform, cell_of,
 };
 use crate::paths::{FormKey, normalize_mesh_path, normalize_texture_path};
 
@@ -438,6 +438,13 @@ impl<'i, 'a> Builder<'i, 'a> {
             linked_ref: key(placed.linked_ref),
             owner: key(placed.owner),
             trigger_volume,
+            primitive: placed
+                .primitive
+                .filter(|p| p.bounds.iter().all(|v| v.is_finite()))
+                .map(|p| PrimitiveDoc {
+                    bounds: p.bounds,
+                    shape: PrimitiveShape::from_code(p.shape),
+                }),
         };
         Some(Built {
             reference,

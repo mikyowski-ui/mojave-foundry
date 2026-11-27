@@ -2,6 +2,8 @@
 /target/
 # Local source replacement for the pinned vault-engine dependency.
 /.cargo/config.toml
+# Local install paths for scripts/gate.sh.
+/gate.env
 
 # Game data, extracted files and converted output never enter git.
 # See AGENTS.md, "Asset hygiene".

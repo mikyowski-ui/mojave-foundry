@@ -18,13 +18,26 @@
 //! Malformed source never stops a build: it is a diagnostic.
 
 pub mod build;
+pub mod codegen;
 pub mod cond;
 pub mod diag;
+pub mod dialogue;
 mod error;
 pub mod ir;
+pub mod lower;
+#[path = "ir/lowered.rs"]
+pub mod lowered;
+pub mod numbering;
 pub mod obscript;
+pub mod packages;
+pub mod quest;
 pub mod source;
+pub mod state;
+pub mod tables;
+pub mod terminals;
+pub mod testkit;
 pub mod texts;
 
 pub use build::{build, build_module};
 pub use error::TranspileError;
+pub use lower::{lower, lower_layer};

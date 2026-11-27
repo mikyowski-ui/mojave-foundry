@@ -14,8 +14,8 @@ use fnv_esm::fixture::{
 };
 use fnv_esm::{
     Cell, FormId, Land, Note, Package, PackageLocation, PackageTarget, PlacedKind, PlacedRef,
-    Quest, QuestObjective, QuestTarget, RawRecord, Script, ScriptBody, ScriptReference, Static,
-    Terminal, TerminalMenuItem, World,
+    Primitive, Quest, QuestObjective, QuestTarget, RawRecord, Script, ScriptBody, ScriptReference,
+    Static, Terminal, TerminalMenuItem, World,
 };
 
 use crate::extract::ExtractOptions;
@@ -75,6 +75,9 @@ pub struct Fallout3Town {
     pub plain_ref: FormKey,
     /// The settler's reference; nothing points at it either.
     pub settler_ref: FormKey,
+    /// A trigger volume in cell (0, 0): a reference to an activator
+    /// (`MWTrigger`, no model) with a sphere primitive of radius 192.
+    pub trigger_volume: FormKey,
     /// An NPC whose `DATA` is the older 25-byte form (skills first,
     /// health 75), and whose one package is [`Self::package`].
     pub settler: FormKey,
@@ -177,6 +180,8 @@ pub fn fallout3_town(dir: &Path) -> Fallout3Town {
     const R_TERMINAL: u32 = 0xC09;
     const R_PLAIN: u32 = 0xC0A;
     const R_SETTLER: u32 = 0xC0B;
+    const R_TRIGGER: u32 = 0xC0C;
+    const TRIGGER: u32 = 0x8C0;
     const R_GRIDLESS: u32 = 0xC20;
     const R_PERSISTENT: u32 = 0xC21;
 
@@ -187,6 +192,7 @@ pub fn fallout3_town(dir: &Path) -> Fallout3Town {
         .author("mojave-foundry fixture");
 
     plugin.add(Static::new(CRATE, "MWCrate", ""));
+    plugin.add_raw(RawRecord::new(b"ACTI", TRIGGER).with(b"EDID", zstr("MWTrigger")));
 
     // An NPC with the older 25-byte DATA: 14 skill values, health, the
     // seven attributes.
@@ -324,6 +330,14 @@ pub fn fallout3_town(dir: &Path) -> Fallout3Town {
         object(R_TERMINAL, 9),
         object(R_PLAIN, 10),
         PlacedRef::new(PlacedKind::Npc, R_SETTLER, SETTLER, at(11), [0.0; 3]),
+        PlacedRef::new(PlacedKind::Object, R_TRIGGER, TRIGGER, at(12), [0.0; 3]).with_primitive(
+            Primitive {
+                bounds: [192.0, 192.0, 192.0],
+                color: [0.2, 0.6, 0.9],
+                unknown: 0.5,
+                shape: Primitive::SHAPE_SPHERE,
+            },
+        ),
     ];
     let cell1 =
         CellSpec::new(Cell::exterior(CHILD_CELL1, 1, 0)).with_land(land(CHILD_LAND1, 300.0));
@@ -381,6 +395,7 @@ pub fn fallout3_town(dir: &Path) -> Fallout3Town {
         package_location: key(R_PACKAGE_LOCATION),
         terminal_target: key(R_TERMINAL),
         plain_ref: key(R_PLAIN),
+        trigger_volume: key(R_TRIGGER),
         settler_ref: key(R_SETTLER),
         settler: key(SETTLER),
         package: key(PACKAGE),

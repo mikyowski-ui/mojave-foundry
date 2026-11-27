@@ -234,6 +234,7 @@ pub(crate) fn reference(
         linked_ref: None,
         owner: None,
         trigger_volume: false,
+        primitive: None,
     }
 }
 

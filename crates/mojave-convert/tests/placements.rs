@@ -2,7 +2,7 @@
 //! ids from the builder, enable groups, locks, links, presence copies,
 //! triggers, and the omitted-never-null JSON.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use mojave_convert::placements::{
     self, EnableParent, GroupSource, MapInput, ObjectSpot, PlacedKind, PlacementIndex, SourceRef,
@@ -166,6 +166,8 @@ fn the_index_lists_each_reference_with_its_exact_object() {
         spot("p:000007@town", &copy_object),
     ];
     let hostile: BTreeSet<String> = ["p:000007".to_owned()].into();
+    // The layer holds the door's key as prototype 0x0000_0123.
+    let key_pids: BTreeMap<String, u32> = [("key:000009".to_owned(), 0x123)].into();
     let triggers = [TriggerSpot {
         reference: "p:000008".into(),
         elevation: 0,
@@ -185,6 +187,7 @@ fn the_index_lists_each_reference_with_its_exact_object() {
         copies: &copies,
         triggers: &triggers,
         hostile: &hostile,
+        key_pids: &key_pids,
     };
     let index = placements::build("test", "fallout3", &[map], &BTreeSet::new());
 
@@ -217,6 +220,12 @@ fn the_index_lists_each_reference_with_its_exact_object() {
     assert!(lock.locked);
     assert_eq!(lock.level, 50);
     assert_eq!(lock.key.as_deref(), Some("key:000009"));
+    assert_eq!(lock.key_pid, Some(0x123));
+    assert!(
+        !index.notes.iter().any(|n| n.contains("keys_missing")),
+        "{:?}",
+        index.notes
+    );
     assert_eq!(door.linked_ref.as_deref(), Some("p:000005"));
     // A container whose lock was not written says so.
     let chest = placed("p:000006");
@@ -278,6 +287,7 @@ fn an_object_the_written_map_does_not_bear_out_is_noted() {
     moved.hex = 12;
     let all = [one, moved];
     let hostile = BTreeSet::new();
+    let key_pids = BTreeMap::new();
     let referenced: BTreeSet<String> = sources.iter().map(|s| s.reference.clone()).collect();
     let map = MapInput {
         stem: "town",
@@ -289,6 +299,7 @@ fn an_object_the_written_map_does_not_bear_out_is_noted() {
         copies: &[],
         triggers: &[],
         hostile: &hostile,
+        key_pids: &key_pids,
     };
     let index = placements::build("test", "fallout3", &[map], &referenced);
     assert_eq!(index.placed.len(), 2);
@@ -304,6 +315,7 @@ fn a_multi_piece_reference_lists_every_object() {
     let spots = [spot("p:000001", &first), spot("p:000001", &second)];
     let all = [first, second];
     let hostile = BTreeSet::new();
+    let key_pids = BTreeMap::new();
     let map = MapInput {
         stem: "town",
         number: 70,
@@ -314,6 +326,7 @@ fn a_multi_piece_reference_lists_every_object() {
         copies: &[],
         triggers: &[],
         hostile: &hostile,
+        key_pids: &key_pids,
     };
     let index = placements::build("test", "fallout3", &[map], &BTreeSet::new());
     assert_eq!(index.placed.len(), 1);
@@ -330,6 +343,7 @@ fn building_twice_gives_the_same_bytes() {
     let spots = [spot("p:000002", &b), spot("p:000001", &a)];
     let all = [a, b];
     let hostile = BTreeSet::new();
+    let key_pids = BTreeMap::new();
     let make = || {
         let map = MapInput {
             stem: "town",
@@ -341,8 +355,165 @@ fn building_twice_gives_the_same_bytes() {
             copies: &[],
             triggers: &[],
             hostile: &hostile,
+            key_pids: &key_pids,
         };
         placements::build("test", "fallout3", &[map], &BTreeSet::new()).to_text()
     };
     assert_eq!(make(), make());
+}
+
+#[test]
+fn a_key_the_layer_does_not_hold_is_counted_in_the_notes() {
+    let mut door = source("p:000004", "DOOR");
+    door.lock = Some((50, Some("key:000009".into())));
+    let mut chest = source("p:000006", "CONT");
+    chest.lock = Some((25, None));
+    let mut shed = source("p:000007", "DOOR");
+    shed.lock = Some((100, Some("key:00000a".into())));
+    let mut a = written(0, 10, 1);
+    a.door = true;
+    let b = written(0, 11, 2);
+    let mut c = written(0, 12, 3);
+    c.door = true;
+    let sources = [door, chest, shed];
+    let spots = [
+        spot("p:000004", &a),
+        spot("p:000006", &b),
+        spot("p:000007", &c),
+    ];
+    let all = [a, b, c];
+    // The layer holds the shed's key only.
+    let key_pids: BTreeMap<String, u32> = [("key:00000a".to_owned(), 0x77)].into();
+    let hostile = BTreeSet::new();
+    let map = MapInput {
+        stem: "town",
+        number: 70,
+        references: &sources,
+        objects: &spots,
+        skipped: &[],
+        written: &all,
+        copies: &[],
+        triggers: &[],
+        hostile: &hostile,
+        key_pids: &key_pids,
+    };
+    let index = placements::build("test", "fallout3", &[map], &BTreeSet::new());
+    let lock = |reference: &str| {
+        index
+            .placed
+            .iter()
+            .find(|p| p.reference.as_deref() == Some(reference))
+            .and_then(|p| p.lock.clone())
+            .unwrap()
+    };
+    assert_eq!(lock("p:000004").key_pid, None);
+    assert_eq!(lock("p:000004").key.as_deref(), Some("key:000009"));
+    assert_eq!(lock("p:000006").key_pid, None);
+    assert_eq!(lock("p:000007").key_pid, Some(0x77));
+    // One lock names a key the layer lacks; the chest names none, so it
+    // is not missing one.
+    let missing: Vec<&String> = index
+        .notes
+        .iter()
+        .filter(|n| n.contains("keys_missing"))
+        .collect();
+    assert_eq!(missing.len(), 1, "{:?}", index.notes);
+    assert!(
+        missing[0].starts_with("town: keys_missing 1:"),
+        "{missing:?}"
+    );
+    let text = index.to_text();
+    assert!(text.contains("\"key_pid\": 119"), "{text}");
+    assert_eq!(text.matches("key_pid").count(), 1, "one lock has a key_pid");
+}
+
+fn trigger_reference(
+    id: u32,
+    position: [f32; 3],
+    yaw: f32,
+    scale: f32,
+    primitive: Option<mir::PrimitiveDoc>,
+) -> mir::Reference {
+    let text = format!(
+        r#"{{"form":"t.esm:{id:06x}","kind":"object","group":"temporary","base":"t.esm:000850","base_kind":"ACTI","transform":{{"position":[{},{},{}],"rotation":[0.0,0.0,{yaw}],"scale":{scale}}},"flags":{{"persistent":false,"initially_disabled":false,"deleted":false}},"trigger_volume":true}}"#,
+        position[0], position[1], position[2]
+    );
+    let mut reference: mir::Reference = serde_json::from_str(&text).unwrap();
+    reference.primitive = primitive;
+    reference
+}
+
+#[test]
+fn a_trigger_volume_has_its_shape_and_a_covering_radius() {
+    let projection = foundry_render::Projection::new(&foundry_render::Calibration::default())
+        .expect("projection");
+    let window = mir::MapWindow::from_center([0.0, 0.0], projection.tile_units());
+    let frame = map_builder::walk::Frame::new(&window, &projection).expect("frame");
+    let primitive = |bounds: [f32; 3], shape| Some(mir::PrimitiveDoc { bounds, shape });
+    let references = [
+        trigger_reference(
+            1,
+            [0.0, 0.0, 0.0],
+            0.0,
+            1.0,
+            primitive([200.0, 200.0, 50.0], mir::PrimitiveShape::Box),
+        ),
+        trigger_reference(
+            2,
+            [0.0, 0.0, 0.0],
+            0.0,
+            1.0,
+            primitive([200.0, 0.0, 0.0], mir::PrimitiveShape::Sphere),
+        ),
+        // The same box, twice the scale: a larger radius.
+        trigger_reference(
+            3,
+            [0.0, 0.0, 0.0],
+            0.0,
+            2.0,
+            primitive([200.0, 200.0, 50.0], mir::PrimitiveShape::Box),
+        ),
+        // A portal box, and a trigger without a primitive: listed, no shape.
+        trigger_reference(
+            4,
+            [0.0, 0.0, 0.0],
+            0.0,
+            1.0,
+            primitive([200.0, 200.0, 50.0], mir::PrimitiveShape::PortalBox),
+        ),
+        trigger_reference(5, [0.0, 0.0, 0.0], 0.0, 1.0, None),
+    ];
+    let spots = placements::trigger_spots(&references, &frame, |_| 0);
+    assert_eq!(spots.len(), 5);
+    let by = |id: u32| {
+        spots
+            .iter()
+            .find(|s| s.reference == format!("t.esm:{id:06x}"))
+            .unwrap()
+    };
+    assert_eq!(by(1).shape.as_deref(), Some("box"));
+    assert_eq!(by(2).shape.as_deref(), Some("sphere"));
+    let (box_radius, sphere_radius, double) = (
+        by(1).radius.expect("a box has a radius"),
+        by(2).radius.expect("a sphere has a radius"),
+        by(3).radius.expect("a scaled box has a radius"),
+    );
+    assert!(box_radius >= 1 && sphere_radius >= 1, "{spots:?}");
+    // A box's corner is farther than a sphere's radius of the same size,
+    // and scaling grows the cover.
+    assert!(box_radius >= sphere_radius, "{spots:?}");
+    assert!(double > box_radius, "{spots:?}");
+    // A volume that reaches past the map's edge is cut at the edge, not lost.
+    let huge = [trigger_reference(
+        6,
+        [0.0, 0.0, 0.0],
+        0.0,
+        1.0,
+        primitive([1.0e7, 1.0e7, 50.0], mir::PrimitiveShape::Box),
+    )];
+    let spots = placements::trigger_spots(&huge, &frame, |_| 0);
+    assert!(spots[0].radius.is_some_and(|r| r > double), "{spots:?}");
+    for plain in [by(4), by(5)] {
+        assert_eq!((plain.shape.as_deref(), plain.radius), (None, None));
+    }
 }

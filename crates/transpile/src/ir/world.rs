@@ -105,14 +105,20 @@ impl RefUses {
     pub const ENABLE_PARENT: RefUses = RefUses(0x10);
     /// Another needed reference's linked reference.
     pub const LINKED: RefUses = RefUses(0x20);
+    /// A locked door or container (spec 9.3; task T5).
+    pub const LOCK: RefUses = RefUses(0x40);
+    /// A placed terminal (spec 9.1; task T5).
+    pub const TERMINAL: RefUses = RefUses(0x80);
 
-    const NAMES: [(RefUses, &'static str); 6] = [
+    const NAMES: [(RefUses, &'static str); 8] = [
         (Self::SCRIPT, "script"),
         (Self::CONDITION, "condition"),
         (Self::PACKAGE, "package"),
         (Self::QUEST_TARGET, "quest_target"),
         (Self::ENABLE_PARENT, "enable_parent"),
         (Self::LINKED, "linked"),
+        (Self::LOCK, "lock"),
+        (Self::TERMINAL, "terminal"),
     ];
 
     /// No use.
@@ -310,6 +316,128 @@ pub fn fixed_point(value: f64) -> i32 {
     } else {
         scaled.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
     }
+}
+
+/// One child of an enable group on one map (spec 8.3): the map script's
+/// table row. The lowering joins it with the placement (hex, elevation,
+/// PID).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct StateChild {
+    /// The child reference (the parent itself for a group of one).
+    pub reference: FormKey,
+    /// Its group.
+    pub group: SimId,
+    /// Enabled when the group is off.
+    pub opposite: bool,
+    /// A critter: its own program applies the state (it moves).
+    pub mobile: bool,
+    /// The map stage wrote it with the hidden flag.
+    pub hidden: bool,
+}
+
+/// A terminal program (spec 9.1): one per terminal base placed in the
+/// slice, with the sub-terminals it reaches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalProgram {
+    /// The terminal base ([`super::SimKind::Terminal`]).
+    pub terminal: SimId,
+    /// The placed references of it, sorted.
+    pub references: Vec<FormKey>,
+    /// The menus of the no-head dialogue: the terminal first, then every
+    /// sub-terminal reachable from it, depth first in item order, once.
+    pub menus: Vec<SimId>,
+    /// Sub-terminals an item names that are not in the MIR, by item.
+    pub missing: Vec<SimId>,
+    /// The lock: `None` for a terminal flagged unlocked.
+    pub hack: Option<Hack>,
+}
+
+/// How a locked terminal opens (spec 9.1, owner decision 3: automatic at
+/// the required Science, no minigame, no lockout).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hack {
+    /// The Science skill needed (0, 25, 50, 75, 100 for difficulty 0 to
+    /// 4); `None` for difficulty 5, password only.
+    pub science: Option<u8>,
+    /// The XP given on success (`iXPRewardHackComputer<level>`).
+    pub xp: i32,
+    /// The note whose possession offers "[Password]".
+    pub password: Option<SimId>,
+}
+
+/// A lock on a door or container (spec 9.3, owner decision 3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lock {
+    /// The locked reference.
+    pub reference: FormKey,
+    /// Door or container.
+    pub kind: super::PlacedKind,
+    /// The source lock level, as stored (255 key only).
+    pub level: u8,
+    /// The Lockpick skill needed: the level rounded up to 0, 25, 50, 75 or
+    /// 100; `None` for a key-only lock.
+    pub lockpick: Option<u8>,
+    /// The key's base form, when the lock names one.
+    pub key: Option<FormKey>,
+    /// The converted key item's PID, from the placement index; `None`
+    /// when the key did not convert (the lock is then left to the skill,
+    /// reported) or the index does not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_pid: Option<u32>,
+    /// The XP given on picking it (`iXPRewardPickLock<tier>`).
+    pub xp: i32,
+    /// The map stage set the locked bit on the written object.
+    pub locked_bit: bool,
+}
+
+/// A Pip-Boy holodisk made from a note (spec 9.2, owner decision 4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Holodisk {
+    /// The note.
+    pub note: SimId,
+    /// The global that holds it (purpose [`GlobalPurpose::Note`]; the
+    /// note's own id).
+    pub global: SimId,
+    /// Its title.
+    pub title: Option<TextId>,
+    /// The body, one text per paragraph, in order; the lowering wraps
+    /// lines and writes `**END-PAR**` between them. Empty for an image or
+    /// sound note (title only, reported).
+    pub paragraphs: Vec<TextId>,
+    /// Where the body came from.
+    pub source: HolodiskSource,
+}
+
+/// Where a holodisk's body came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HolodiskSource {
+    /// A text note.
+    Text,
+    /// A voice note: its topic's responses, as text.
+    Voice,
+    /// An image note: title only.
+    Image,
+    /// A sound note: title only.
+    Sound,
+}
+
+/// A message (`MESG`) a script shows (spec 5.9 `ShowMessage`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MessageBox {
+    /// [`super::SimKind::Message`].
+    pub id: SimId,
+    /// Editor id.
+    pub editor_id: String,
+    /// The title.
+    pub title: Option<TextId>,
+    /// The text; `%` format codes are kept as written and reported.
+    pub text: Option<TextId>,
+    /// A message box: waits for a button (a no-head dialogue whose options
+    /// set the pressed button); otherwise a `display_msg` notice.
+    pub message_box: bool,
+    /// The buttons, in order, with the conditions that show them.
+    pub buttons: Vec<(TextId, Cond)>,
 }
 
 #[cfg(test)]

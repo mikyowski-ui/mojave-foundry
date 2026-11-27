@@ -17,7 +17,11 @@ use crate::paths::FormKey;
 ///
 /// 2: actor documents (`actors/`), and `creatures.model` read against the
 /// skeleton's folder.
-pub const SCHEMA_VERSION: u32 = 2;
+///
+/// 3: a reference's primitive volume (`Reference::primitive`, from `XPRM`)
+/// is kept in the cell documents; a directory written before has none, so
+/// no trigger volume has a shape or bounds.
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Version of the tables in `records.sqlite`, within one
 /// [`SCHEMA_VERSION`]. Additions that leave every JSON document as it was
@@ -528,6 +532,52 @@ pub struct Reference {
     /// Absent from the JSON when false.
     #[serde(default, skip_serializing_if = "is_false")]
     pub trigger_volume: bool,
+    /// The reference's primitive volume (`XPRM`), whatever its base is: a
+    /// trigger (see `trigger_volume`), but also the room, collision and
+    /// multibound markers, acoustic spaces and portals. `None` when the
+    /// reference has none or its bounds are not finite numbers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primitive: Option<PrimitiveDoc>,
+}
+
+/// The shape of a primitive volume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrimitiveShape {
+    /// A box (`1`).
+    Box,
+    /// A sphere (`2`).
+    Sphere,
+    /// A portal box (`3`): a box between rooms, which may be flat.
+    PortalBox,
+    /// A shape code no layout is known for.
+    Other(u32),
+}
+
+impl PrimitiveShape {
+    /// The shape a stored code names.
+    pub fn from_code(code: u32) -> Self {
+        match code {
+            1 => PrimitiveShape::Box,
+            2 => PrimitiveShape::Sphere,
+            3 => PrimitiveShape::PortalBox,
+            other => PrimitiveShape::Other(other),
+        }
+    }
+}
+
+/// A primitive volume (`XPRM`) as the MIR keeps it: the extents and the
+/// shape. The editor colour and the unnamed float of the record are not
+/// kept.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PrimitiveDoc {
+    /// Extent along the reference's local X, Y and Z, as stored, in game
+    /// units and before the reference's scale. Public documentation reads
+    /// them as half-extents (a box reaches from `-bounds` to `+bounds`,
+    /// and a sphere's first is its radius); that reading is not verified.
+    pub bounds: [f32; 3],
+    /// The shape.
+    pub shape: PrimitiveShape,
 }
 
 /// Serde helper: skip a `false` flag.
@@ -1190,5 +1240,33 @@ mod tests {
         assert!(flagged.ends_with(r#","trigger_volume":true}"#));
         let back: Reference = serde_json::from_str(&flagged).unwrap();
         assert_eq!(back, reference);
+    }
+
+    /// A document without a primitive reads as `None` and writes the same
+    /// bytes; the shapes round-trip, and a code no layout is known for is
+    /// kept.
+    #[test]
+    fn primitive_is_optional_and_keeps_unknown_shapes() {
+        let old = r#"{"form":"a.esm:000900","kind":"object","group":"temporary","base":"a.esm:000850","transform":{"position":[1.0,2.0,3.0],"rotation":[0.0,0.0,0.5],"scale":1.0},"flags":{"persistent":false,"initially_disabled":false,"deleted":false}}"#;
+        let mut reference: Reference = serde_json::from_str(old).unwrap();
+        assert_eq!(reference.primitive, None);
+        assert_eq!(serde_json::to_string(&reference).unwrap(), old);
+        for (code, text) in [
+            (1, r#""box""#),
+            (2, r#""sphere""#),
+            (3, r#""portal_box""#),
+            (9, r#"{"other":9}"#),
+        ] {
+            let shape = PrimitiveShape::from_code(code);
+            assert_eq!(serde_json::to_string(&shape).unwrap(), text);
+            assert_eq!(serde_json::from_str::<PrimitiveShape>(text).unwrap(), shape);
+        }
+        reference.primitive = Some(PrimitiveDoc {
+            bounds: [64.0, 32.0, 16.0],
+            shape: PrimitiveShape::Box,
+        });
+        let text = serde_json::to_string(&reference).unwrap();
+        assert!(text.ends_with(r#","primitive":{"bounds":[64.0,32.0,16.0],"shape":"box"}}"#));
+        assert_eq!(serde_json::from_str::<Reference>(&text).unwrap(), reference);
     }
 }

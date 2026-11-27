@@ -12,9 +12,13 @@
 //! [`SimConfig::quest_depth`] more levels of the quests their scripts
 //! name); topics; notes; globals; references; enable groups; actors.
 //!
-//! What the build does not do: per-speaker folding, skill checks, the
-//! dialogue's node model (task T5, `dialogue`), quest state globals and
-//! Pip-Boy rows (T5, `quest`), package runners (T6), lowering (T8).
+//! Then the middle passes, each a module of its own taking a [`Pass`]:
+//! [`crate::quest`] (quest state, variables, Pip-Boy rows, ordering
+//! reports), [`crate::state`] (groups from the placement, the per-map
+//! tables, actor globals), [`crate::terminals`] (terminal programs, locks,
+//! holodisks, messages), [`crate::dialogue`] (per-speaker dialogues, checks,
+//! once-flags) and [`crate::packages`] (runners, teams, presence).
+//! Lowering is task T8's.
 
 mod records;
 mod scripts;
@@ -54,6 +58,16 @@ pub fn build_module(
     config: &SimConfig,
 ) -> Result<Module, TranspileError> {
     let mut placement = slice.placement.clone();
+    for object in &mut placement.objects {
+        // A presence copy's reference may still carry the index's
+        // `@<stem>` suffix.
+        if let Some(reference) = &mut object.reference
+            && let Some((form, _)) = reference.0.split_once('@')
+        {
+            *reference = FormKey(form.to_owned());
+            object.presence = true;
+        }
+    }
     placement.sort();
     let mut placed: BTreeMap<FormKey, Vec<PlacedObject>> = BTreeMap::new();
     for object in &placement.objects {
@@ -78,7 +92,77 @@ pub fn build_module(
         uses: Uses::default(),
     };
     builder.run();
-    Ok(builder.finish())
+    let Builder {
+        names,
+        mut texts,
+        mut module,
+        placed,
+        uses,
+        ..
+    } = builder;
+    let mut pass = Pass {
+        source,
+        slice,
+        config,
+        names: &names,
+        placed: &placed,
+        messages: &uses.messages,
+        texts: &mut texts,
+        module: &mut module,
+    };
+    let mut setting_diags = Vec::new();
+    pass.module.settings =
+        crate::dialogue::checks::read_settings(&source.settings, &mut setting_diags);
+    pass.module.diagnostics.extend(setting_diags);
+    crate::quest::compile(&mut pass);
+    crate::state::compile(&mut pass);
+    crate::terminals::compile(&mut pass);
+    crate::dialogue::compile(&mut pass);
+    crate::packages::compile(&mut pass);
+    module.texts = texts.into_texts();
+    module.diagnostics.sort();
+    module.diagnostics.dedup();
+    Ok(module)
+}
+
+/// What a middle pass reads and writes: the source, the slice, the names,
+/// the placements by reference, the text table and the module the front
+/// end built.
+pub struct Pass<'a> {
+    /// What the build read.
+    pub source: &'a SimSource,
+    /// The slice, as given.
+    pub slice: &'a SimSlice,
+    /// The options.
+    pub config: &'a SimConfig,
+    /// The names of the plugin list.
+    pub names: &'a NameTable,
+    /// The slice's references and their placements (one per map),
+    /// sorted; presence copies are placements of the copied reference.
+    pub placed: &'a BTreeMap<FormKey, Vec<PlacedObject>>,
+    /// The messages (`MESG`) the compiled scripts name.
+    pub messages: &'a BTreeSet<FormKey>,
+    /// The text table.
+    pub texts: &'a mut TextTable,
+    /// The module.
+    pub module: &'a mut Module,
+}
+
+impl Pass<'_> {
+    /// Records a finding.
+    pub fn diag(&mut self, diag: Diag) {
+        self.module.diagnostics.push(diag);
+    }
+
+    /// The first placement of a reference.
+    pub fn placement(&self, reference: &FormKey) -> Option<&PlacedObject> {
+        self.placed.get(reference).and_then(|list| list.first())
+    }
+
+    /// A numeric game setting.
+    pub fn setting(&self, name: &str) -> Option<f64> {
+        self.source.settings.get(name).copied()
+    }
 }
 
 /// What the compiled code and conditions name, gathered across phases.
@@ -94,6 +178,8 @@ struct Uses {
     notes: BTreeSet<FormKey>,
     /// References an `Enable` or `Disable` runs on.
     enabled: BTreeSet<FormKey>,
+    /// Messages a script shows.
+    messages: BTreeSet<FormKey>,
 }
 
 impl Uses {
@@ -130,12 +216,5 @@ impl Builder<'_> {
 
     fn diag(&mut self, diag: Diag) {
         self.module.diagnostics.push(diag);
-    }
-
-    fn finish(mut self) -> Module {
-        self.module.texts = std::mem::take(&mut self.texts).into_texts();
-        self.module.diagnostics.sort();
-        self.module.diagnostics.dedup();
-        self.module
     }
 }

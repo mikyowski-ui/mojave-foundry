@@ -36,8 +36,9 @@
 //!
 //! A [`TriggerRef`] is a trigger volume (a primitive on an activator): no
 //! object stands for it, the `sim` stage attaches a spatial script at its
-//! `hex` with its `radius` (hexes), when the MIR carries the primitive's
-//! bounds.
+//! `hex` with its `radius` (hexes) and `shape`, from the primitive the MIR
+//! carries (`mir::Reference::primitive`, schema 3). The radius covers the
+//! footprint whatever the shape; a box is not tested more exactly.
 //!
 //! Both lists hold the references the simulation can use: critters, doors,
 //! containers, items and terminals, and any other reference that is an
@@ -214,6 +215,12 @@ pub struct LockInfo {
     /// The key's base record (a form key), when the lock names one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+    /// The Fallout 2 prototype id of the converted key item, when the
+    /// items catalogue made one for `key`; left out when the lock names no
+    /// key or the key is not in the layer (the note `keys_missing` counts
+    /// those).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_pid: Option<u32>,
 }
 
 fn one() -> u32 {
@@ -398,13 +405,13 @@ pub struct TriggerRef {
     pub hex: i32,
     /// The reference's form key.
     pub reference: String,
-    /// `box` or `sphere`; absent when the MIR does not carry the
-    /// primitive's shape.
+    /// `box` or `sphere`; absent when the reference has no primitive of
+    /// either shape (a MIR written before schema 3 has none).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shape: Option<String>,
     /// The smallest hex radius around `hex` that covers the volume's
-    /// footprint; absent when the MIR does not carry the primitive's
-    /// bounds.
+    /// footprint, with a corner off the map pulled in to the map's edge;
+    /// absent without a box or sphere primitive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub radius: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -422,6 +429,63 @@ pub struct TriggerRef {
     /// The linked reference (`XLKR`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linked_ref: Option<String>,
+}
+
+/// Where a [`MarkerRef`] comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarkerSource {
+    /// A reference of the map's own cells that is not on the map (the
+    /// slicer skips markers, declutter prunes, a static is left out): the
+    /// index lists it in `unplaced` too.
+    Cell,
+    /// A reference of a cell outside the maps' cells, named as a package's
+    /// location or target, whose position lies on the map's window.
+    Outside,
+}
+
+/// A position with no object (task T9): where a reference would stand on
+/// a map, projected with the map stage's own world-to-hex projection
+/// (`map_builder::walk::Frame::hex_of_source`), on the elevation whose
+/// run holds it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarkerRef {
+    /// The map's stem and number.
+    pub map: String,
+    pub map_number: u32,
+    /// The elevation and the hex.
+    pub elevation: u8,
+    pub hex: i32,
+    /// The reference's form key.
+    pub reference: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_editor_id: Option<String>,
+    /// In the map's cells or outside them.
+    pub source: MarkerSource,
+}
+
+/// A projected position the map stage hands [`write_for_stage`]: a
+/// reference, its elevation and hex.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkerSpot {
+    /// The reference's form key.
+    pub reference: String,
+    pub elevation: u8,
+    pub hex: i32,
+}
+
+/// A reference outside the maps' cells, as [`outside_markers`] finds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutsideSpot {
+    /// Where it projects.
+    pub spot: MarkerSpot,
+    /// Its base form key and signature, from the MIR.
+    pub base: Option<String>,
+    pub base_kind: Option<String>,
 }
 
 /// The whole file.
@@ -444,6 +508,13 @@ pub struct PlacementIndex {
     /// The trigger volumes of the maps' cells.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub triggers: Vec<TriggerRef>,
+    /// Positions with no object (task T9): markers and other scenery the
+    /// stage does not place, and references outside the maps' cells that
+    /// a package names, each with the hex and elevation it would stand
+    /// on. An optional addition to schema 2 (absent in a file written
+    /// before it).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub markers: Vec<MarkerRef>,
     /// Things worth knowing about how it was made.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
@@ -499,6 +570,14 @@ impl PlacementIndex {
         self.unplaced
             .sort_by(|a, b| (&a.map, &a.reference).cmp(&(&b.map, &b.reference)));
         self.triggers.sort_by(|a, b| {
+            (&a.map, a.elevation, a.hex, &a.reference).cmp(&(
+                &b.map,
+                b.elevation,
+                b.hex,
+                &b.reference,
+            ))
+        });
+        self.markers.sort_by(|a, b| {
             (&a.map, a.elevation, a.hex, &a.reference).cmp(&(
                 &b.map,
                 b.elevation,
@@ -728,6 +807,9 @@ pub struct MapInput<'a> {
     pub triggers: &'a [TriggerSpot],
     /// Critter references the catalogue marks hostile.
     pub hostile: &'a BTreeSet<String>,
+    /// The PID of each key item the layer holds, by the key's base form
+    /// key ([`key_pids_of`]).
+    pub key_pids: &'a BTreeMap<String, u32>,
 }
 
 fn kind_of(base_kind: Option<&str>, critter: bool, written: Option<&WrittenObject>) -> PlacedKind {
@@ -791,13 +873,16 @@ pub fn build(
             || linked.contains(reference)
             || referenced.contains(reference)
     };
-    let lock_of = |source: Option<&SourceRef>, written: Option<&WrittenObject>| {
+    let lock_of = |source: Option<&SourceRef>,
+                   written: Option<&WrittenObject>,
+                   key_pids: &BTreeMap<String, u32>| {
         source
             .and_then(|s| s.lock.as_ref())
             .map(|(level, key)| LockInfo {
                 locked: written.is_some_and(|w| w.locked),
                 level: *level,
                 key: key.clone(),
+                key_pid: key.as_ref().and_then(|k| key_pids.get(k)).copied(),
             })
     };
     let mut index = PlacementIndex {
@@ -809,6 +894,7 @@ pub fn build(
         placed: Vec::new(),
         unplaced: Vec::new(),
         triggers: Vec::new(),
+        markers: Vec::new(),
         notes: Vec::new(),
     };
     for map in maps {
@@ -905,13 +991,26 @@ pub fn build(
                     .map(group_info),
                 initially_disabled: own && source.is_some_and(|s| s.initially_disabled),
                 hidden: object.is_some_and(|o| o.hidden),
-                lock: lock_of(source.filter(|_| own), object),
+                lock: lock_of(source.filter(|_| own), object, map.key_pids),
                 linked_ref: source.filter(|_| own).and_then(|s| s.linked_ref.clone()),
                 team: object.and_then(|o| o.team),
                 ai_packet: object.and_then(|o| o.ai_packet),
                 hostile: map.hostile.contains(reference),
                 presence_of: original.map(str::to_owned),
             });
+        }
+        let keys_missing = index
+            .placed
+            .iter()
+            .filter(|p| p.map == map.stem)
+            .filter_map(|p| p.lock.as_ref())
+            .filter(|l| l.key.is_some() && l.key_pid.is_none())
+            .count();
+        if keys_missing > 0 {
+            index.notes.push(format!(
+                "{}: keys_missing {keys_missing}: locks name a key item the layer does not hold",
+                map.stem
+            ));
         }
         if unmatched > 0 {
             index.notes.push(format!(
@@ -955,7 +1054,7 @@ pub fn build(
                 enable_parent: source.enable_parent.clone(),
                 group: groups.get(&source.reference).map(group_info),
                 initially_disabled: source.initially_disabled,
-                lock: lock_of(Some(source), None),
+                lock: lock_of(Some(source), None, map.key_pids),
                 linked_ref: source.linked_ref.clone(),
                 reason,
                 detail,
@@ -1139,9 +1238,29 @@ pub struct StageMap<'a> {
     pub triggers: Vec<TriggerSpot>,
     /// Critter references the catalogue marks hostile.
     pub hostile: BTreeSet<String>,
+    /// The PID of each key item the layer holds ([`key_pids_of`]).
+    pub key_pids: BTreeMap<String, u32>,
     /// References whose flag and enable parent the stage changed for the
     /// slicer: what the source says.
     pub originals: BTreeMap<String, Original>,
+    // ---- task T9: what the `sim` stage needs beyond the index
+    /// Where each reference of the map's cells that is on no object of
+    /// the map would stand ([`marker_spots`]); the index lists those that
+    /// are markers ([`MarkerRef`], source `cell`).
+    pub positions: Vec<MarkerSpot>,
+    /// References outside the maps' cells that a package names and that
+    /// project onto this map ([`outside_markers`]).
+    pub outside: Vec<OutsideSpot>,
+    /// The map is an interior.
+    pub interior: bool,
+    /// Per elevation, the walkable hexes as the builder left them (40,000
+    /// entries by hex, passages included: `BuiltMap::walkable`).
+    pub walkable: Vec<(u8, Vec<bool>)>,
+    /// The map's doors that lead to another map ([`ExitFact`]).
+    pub exits: Vec<ExitFact>,
+    /// The PID of every item prototype the items catalogue made, by the
+    /// item's base form key ([`item_pids_of`]).
+    pub items: BTreeMap<String, u32>,
 }
 
 /// A slicer run's skips as [`StageMap::skipped`] takes them.
@@ -1165,6 +1284,370 @@ pub fn hostile_of(report: Option<&crate::catalogue::CatalogueReport>) -> BTreeSe
         .unwrap_or_default()
 }
 
+/// The key items of a build's loot report, by the key's base form key: the
+/// PID of the prototype the items catalogue made for each.
+pub fn key_pids_of(loot: Option<&map_builder::LootReport>) -> BTreeMap<String, u32> {
+    loot.map(|l| {
+        l.items
+            .iter()
+            .filter(|i| i.kind == "key")
+            .map(|i| (i.key.clone(), i.pid))
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// Every item prototype a build's loot report made, by the item's base
+/// form key (keys included): the PIDs the `sim` stage gives `AddItem` and
+/// the other words that name an item that is not placed.
+pub fn item_pids_of(loot: Option<&map_builder::LootReport>) -> BTreeMap<String, u32> {
+    loot.map(|l| l.items.iter().map(|i| (i.key.clone(), i.pid)).collect())
+        .unwrap_or_default()
+}
+
+/// Where every reference of `references` that became no object of the map
+/// would stand: not deleted, with a finite position on the map, not a
+/// trigger volume (the index lists those as triggers), and not in `placed`
+/// (the references the builder made objects of). The hex is the map
+/// stage's own projection (`Frame::hex_of_source`), the elevation the one
+/// `elevation_of` names. Sorted by reference.
+pub fn marker_spots(
+    references: &[mir::Reference],
+    placed: &BTreeSet<&str>,
+    frame: &map_builder::walk::Frame,
+    elevation_of: impl Fn(&mir::Reference) -> u8,
+) -> Vec<MarkerSpot> {
+    let mut out: Vec<MarkerSpot> = references
+        .iter()
+        .filter(|r| !r.flags.deleted && !r.trigger_volume && r.transform.is_finite())
+        .filter(|r| !placed.contains(r.form.to_string().as_str()))
+        .filter_map(|r| {
+            let [x, y, _] = r.transform.position;
+            Some(MarkerSpot {
+                reference: r.form.to_string(),
+                elevation: elevation_of(r),
+                hex: frame.hex_of_source(f64::from(x), f64::from(y))?,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.reference.cmp(&b.reference));
+    out.dedup_by(|a, b| a.reference == b.reference);
+    out
+}
+
+/// The references a package names (its location or target,
+/// `mir::Records::ref_referrals`) that are not among `known` (the
+/// references of the layer's maps) and that stand in the worldspace
+/// `worldspace` at a position the frame puts on the map: each with its
+/// hex on elevation 0. Empty when the MIR cannot say (an extract older
+/// than records revision 1). Sorted by reference.
+pub fn outside_markers(
+    records: &mir::Records,
+    worldspace: &mir::FormKey,
+    frame: &map_builder::walk::Frame,
+    known: &BTreeSet<String>,
+) -> Vec<OutsideSpot> {
+    let Ok(referrals) = records.ref_referrals() else {
+        return Vec::new();
+    };
+    let named: BTreeSet<mir::FormKey> = referrals
+        .into_iter()
+        .filter(|r| {
+            matches!(
+                r.reason,
+                mir::RefReason::PackageLocation | mir::RefReason::PackageTarget
+            )
+        })
+        .map(|r| r.reference)
+        .filter(|r| !known.contains(&r.to_string()))
+        .collect();
+    let mut out = Vec::new();
+    for reference in named {
+        let Ok(Some(row)) = records.placed_ref(&reference) else {
+            continue;
+        };
+        if row.worldspace.as_ref() != Some(worldspace) {
+            continue;
+        }
+        let Some([x, y, _]) = row.position else {
+            continue;
+        };
+        if !(x.is_finite() && y.is_finite()) {
+            continue;
+        }
+        let Some(hex) = frame.hex_of_source(x, y) else {
+            continue;
+        };
+        out.push(OutsideSpot {
+            spot: MarkerSpot {
+                reference: reference.to_string(),
+                elevation: 0,
+                hex,
+            },
+            base: row.base.map(|b| b.to_string()),
+            base_kind: row.base_sig,
+        });
+    }
+    out
+}
+
+// ---- The map stage's facts for `sim`: `map-sim.json` ----------------------
+
+/// The facts file's name, beside the placement index (not in the layer).
+pub const FACTS_FILE: &str = "map-sim.json";
+
+/// The facts file's schema version.
+pub const FACTS_SCHEMA_VERSION: u32 = 1;
+
+/// A door of a map that leads to another map: what a presence copy that
+/// leaves while watched walks to (spec 7.6, `SimSlice::exits`).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ExitFact {
+    /// The door reference's form key.
+    pub door: String,
+    /// The door's elevation and hex on this map.
+    pub elevation: u8,
+    pub hex: i32,
+    /// The destination map's stem.
+    pub to: String,
+}
+
+/// The walkable hexes of one elevation, as inclusive runs: `"a-b c d-e"`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalkRuns {
+    pub elevation: u8,
+    /// How many hexes the runs hold.
+    pub count: u32,
+    /// The runs, ascending, separated by one space; a run of one hex is
+    /// the hex alone.
+    pub runs: String,
+}
+
+impl WalkRuns {
+    /// The runs of a 40,000-entry walkable mask.
+    pub fn of_mask(elevation: u8, mask: &[bool]) -> Self {
+        let mut parts: Vec<String> = Vec::new();
+        let mut count = 0u32;
+        let mut hex = 0usize;
+        while hex < mask.len() {
+            if !mask[hex] {
+                hex += 1;
+                continue;
+            }
+            let start = hex;
+            while hex < mask.len() && mask[hex] {
+                hex += 1;
+            }
+            let end = hex - 1;
+            count += (end - start + 1) as u32;
+            parts.push(if end == start {
+                start.to_string()
+            } else {
+                format!("{start}-{end}")
+            });
+        }
+        Self {
+            elevation,
+            count,
+            runs: parts.join(" "),
+        }
+    }
+
+    /// The hexes, ascending.
+    pub fn hexes(&self) -> Result<Vec<u32>, PlacementError> {
+        let bad = |part: &str| fail(FACTS_FILE, format!("walkable run {part:?} does not parse"));
+        let mut out = Vec::with_capacity(self.count as usize);
+        for part in self.runs.split_ascii_whitespace() {
+            let (a, b) = match part.split_once('-') {
+                Some((a, b)) => (a, b),
+                None => (part, part),
+            };
+            let (a, b): (u32, u32) = (
+                a.parse().map_err(|_| bad(part))?,
+                b.parse().map_err(|_| bad(part))?,
+            );
+            if b < a || b >= 40_000 {
+                return Err(bad(part));
+            }
+            out.extend(a..=b);
+        }
+        Ok(out)
+    }
+}
+
+/// One map's facts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MapFacts {
+    /// The map's stem.
+    pub stem: String,
+    /// An interior (`IsInInterior`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub interior: bool,
+    /// The walkable hexes, per elevation.
+    pub walkable: Vec<WalkRuns>,
+    /// Doors to other maps, sorted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exits: Vec<ExitFact>,
+}
+
+/// `map-sim.json`: what the map stage knows that the `sim` stage needs and
+/// the placement index does not carry (walkable masks, exits, item PIDs,
+/// which maps are interiors). Written by [`write_for_stage`] with the
+/// index; deterministic like it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageFacts {
+    /// [`FACTS_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// The layer's maps that the stage built, by stem.
+    pub maps: Vec<MapFacts>,
+    /// Item base form key to its prototype's PID.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub items: BTreeMap<String, u32>,
+}
+
+impl StageFacts {
+    /// The file's text: pretty JSON and a final newline.
+    pub fn to_text(&self) -> String {
+        let mut text = serde_json::to_string_pretty(self).unwrap_or_default();
+        text.push('\n');
+        text
+    }
+
+    /// Parses the file's text and checks its schema version.
+    pub fn from_text(text: &str) -> Result<Self, PlacementError> {
+        let facts: StageFacts = serde_json::from_str(text).map_err(|e| fail(FACTS_FILE, e))?;
+        if facts.schema_version != FACTS_SCHEMA_VERSION {
+            return Err(fail(
+                FACTS_FILE,
+                format!(
+                    "schema version {} where this build reads {FACTS_SCHEMA_VERSION}; run the \
+                     map stage again",
+                    facts.schema_version
+                ),
+            ));
+        }
+        Ok(facts)
+    }
+}
+
+/// Reads `<out>/map-sim.json`; `None` when there is none.
+pub fn read_facts(out: &Path) -> Result<Option<StageFacts>, PlacementError> {
+    let path = out.join(FACTS_FILE);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| fail(FACTS_FILE, e))?;
+    StageFacts::from_text(&text).map(Some)
+}
+
+/// Adds the markers of `maps` to an index [`build`] made: every unplaced
+/// entry of a map that is scenery, not deleted, in no enable group, and
+/// has a position ([`StageMap::positions`]), then each outside reference
+/// the index does not name yet. Group members are left out (the state
+/// tables would take a marker for an object) and counted in a note.
+fn add_markers(index: &mut PlacementIndex, maps: &[StageMap<'_>]) {
+    let mut known: BTreeSet<String> = index
+        .placed
+        .iter()
+        .filter_map(|p| p.reference.clone())
+        .chain(index.unplaced.iter().map(|u| u.reference.clone()))
+        .chain(index.triggers.iter().map(|t| t.reference.clone()))
+        .collect();
+    for map in maps {
+        let Some(number) = index.map(map.stem).map(|m| m.number) else {
+            continue;
+        };
+        let positions: BTreeMap<&str, &MarkerSpot> = map
+            .positions
+            .iter()
+            .map(|p| (p.reference.as_str(), p))
+            .collect();
+        let mut grouped = 0usize;
+        let mut added = Vec::new();
+        for entry in index.unplaced.iter().filter(|u| u.map == map.stem) {
+            if entry.kind != PlacedKind::Scenery || entry.reason == UnplacedReason::Deleted {
+                continue;
+            }
+            let Some(spot) = positions.get(entry.reference.as_str()) else {
+                continue;
+            };
+            if entry.group.is_some() {
+                grouped += 1;
+                continue;
+            }
+            added.push(MarkerRef {
+                map: map.stem.to_owned(),
+                map_number: number,
+                elevation: spot.elevation,
+                hex: spot.hex,
+                reference: entry.reference.clone(),
+                editor_id: entry.editor_id.clone(),
+                base: entry.base.clone(),
+                base_editor_id: entry.base_editor_id.clone(),
+                source: MarkerSource::Cell,
+            });
+        }
+        let cell = added.len();
+        for outside in &map.outside {
+            if !known.insert(outside.spot.reference.clone()) {
+                continue;
+            }
+            added.push(MarkerRef {
+                map: map.stem.to_owned(),
+                map_number: number,
+                elevation: outside.spot.elevation,
+                hex: outside.spot.hex,
+                reference: outside.spot.reference.clone(),
+                editor_id: None,
+                base: outside.base.clone(),
+                base_editor_id: None,
+                source: MarkerSource::Outside,
+            });
+        }
+        if !added.is_empty() || grouped > 0 {
+            index.notes.push(format!(
+                "{}: {} markers ({cell} of its cells, {} outside them named by a package); \
+                 {grouped} unplaced group members left out of the markers",
+                map.stem,
+                added.len(),
+                added.len() - cell
+            ));
+        }
+        index.markers.extend(added);
+    }
+    index.sort();
+}
+
+/// The facts of `maps` (`map-sim.json`).
+fn stage_facts(maps: &[StageMap<'_>]) -> StageFacts {
+    let mut facts = StageFacts {
+        schema_version: FACTS_SCHEMA_VERSION,
+        ..StageFacts::default()
+    };
+    for map in maps {
+        let mut exits = map.exits.clone();
+        exits.sort();
+        exits.dedup();
+        let mut walkable: Vec<WalkRuns> = map
+            .walkable
+            .iter()
+            .map(|(elevation, mask)| WalkRuns::of_mask(*elevation, mask))
+            .collect();
+        walkable.sort_by_key(|w| w.elevation);
+        facts.maps.push(MapFacts {
+            stem: map.stem.to_owned(),
+            interior: map.interior,
+            walkable,
+            exits,
+        });
+        facts
+            .items
+            .extend(map.items.iter().map(|(k, v)| (k.clone(), *v)));
+    }
+    facts.maps.sort_by(|a, b| a.stem.cmp(&b.stem));
+    facts
+}
+
 /// A trigger volume's primitive: the shape and the extent along the
 /// reference's local X, Y and Z, as stored (`fnv_esm::Primitive`).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1177,18 +1660,29 @@ pub struct TriggerBounds {
     pub half: [f32; 3],
 }
 
-/// The primitive of a trigger reference. The MIR's `Reference` carries
-/// only `trigger_volume` today (the primitive's bounds stay in the ESM
-/// reader), so this finds none: a trigger is listed with its hex and no
-/// radius until the MIR adds the field.
-pub fn trigger_bounds(_reference: &mir::Reference) -> Option<TriggerBounds> {
-    None
+/// The primitive of a trigger reference (`mir::Reference::primitive`): a
+/// box or a sphere. `None` when the reference has no primitive or its shape
+/// is neither (a portal box or a code no layout is known for is not a
+/// trigger), so the trigger is listed with its hex and no radius.
+pub fn trigger_bounds(reference: &mir::Reference) -> Option<TriggerBounds> {
+    let primitive = reference.primitive?;
+    let shape = match primitive.shape {
+        mir::PrimitiveShape::Box => "box",
+        mir::PrimitiveShape::Sphere => "sphere",
+        mir::PrimitiveShape::PortalBox | mir::PrimitiveShape::Other(_) => return None,
+    };
+    Some(TriggerBounds {
+        shape,
+        half: primitive.bounds,
+    })
 }
 
 /// The hex radius around the hex under a volume's centre that covers its
 /// footprint: the largest hex distance from the centre's hex to a corner
 /// of the box (rotated by `yaw`, scaled), or to the four points a sphere's
-/// radius reaches. `None` when the centre or a corner is off the map.
+/// radius reaches. A corner that falls off the map is pulled in along its
+/// line to the centre until it is on the map (bisection to the map's edge),
+/// since nothing can stand beyond it. `None` when the centre is off the map.
 pub fn project_trigger(
     frame: &map_builder::walk::Frame,
     centre: [f32; 2],
@@ -1206,9 +1700,28 @@ pub fn project_trigger(
     };
     let mut radius = 0;
     for [dx, dy] in corners {
-        let x = f64::from(centre[0]) + dx * cos - dy * sin;
-        let y = f64::from(centre[1]) + dx * sin + dy * cos;
-        let to = frame.hex_of_source(x, y)?;
+        let at = |t: f64| {
+            let (dx, dy) = (dx * t, dy * t);
+            let x = f64::from(centre[0]) + dx * cos - dy * sin;
+            let y = f64::from(centre[1]) + dx * sin + dy * cos;
+            frame.hex_of_source(x, y)
+        };
+        let to = match at(1.0) {
+            Some(hex) => hex,
+            None => {
+                // Off the map: the farthest point of the line that is on it.
+                let (mut on, mut off) = (0.0_f64, 1.0_f64);
+                for _ in 0..32 {
+                    let middle = (on + off) / 2.0;
+                    if at(middle).is_some() {
+                        on = middle;
+                    } else {
+                        off = middle;
+                    }
+                }
+                at(on)?
+            }
+        };
         radius = radius.max(vault_formats::HexGrid::lattice_distance(from, to).ok()?);
     }
     u32::try_from(radius).ok()
@@ -1263,7 +1776,14 @@ impl<'a> StageMap<'a> {
             copies: Vec::new(),
             triggers: Vec::new(),
             hostile: BTreeSet::new(),
+            key_pids: BTreeMap::new(),
             originals: BTreeMap::new(),
+            positions: Vec::new(),
+            outside: Vec::new(),
+            interior: false,
+            walkable: Vec::new(),
+            exits: Vec::new(),
+            items: BTreeMap::new(),
         }
     }
 }
@@ -1309,6 +1829,7 @@ struct Owned {
     copies: Vec<(String, String)>,
     triggers: Vec<TriggerSpot>,
     hostile: BTreeSet<String>,
+    key_pids: BTreeMap<String, u32>,
 }
 
 /// The map stage's one call, after it has written the layer to
@@ -1367,6 +1888,7 @@ pub fn write_for_stage(
             copies: map.copies.clone(),
             triggers: map.triggers.clone(),
             hostile: map.hostile.clone(),
+            key_pids: map.key_pids.clone(),
         });
     }
     let inputs: Vec<MapInput<'_>> = owned
@@ -1381,6 +1903,7 @@ pub fn write_for_stage(
             copies: &o.copies,
             triggers: &o.triggers,
             hostile: &o.hostile,
+            key_pids: &o.key_pids,
         })
         .collect();
     let mut index = build(&layer_name, game.id(), &inputs, &referenced);
@@ -1405,6 +1928,10 @@ pub fn write_for_stage(
         ));
         index.sort();
     }
+    add_markers(&mut index, maps);
+    let facts = stage_facts(maps);
+    let facts_path = out.join(FACTS_FILE);
+    std::fs::write(&facts_path, facts.to_text()).map_err(|e| fail(FACTS_FILE, e))?;
     write(out, &index)
 }
 
@@ -1420,10 +1947,13 @@ pub fn referenced_of(mir: &mir::Mir) -> (BTreeSet<mir::FormKey>, Option<String>)
     }
 }
 
-/// Whether `<out>/map-placements.json` is there and of this schema: the map
-/// stage reuses its output only then.
+/// Whether `<out>/map-placements.json` is there and of this schema, and
+/// `<out>/map-sim.json` beside it: the map stage reuses its output only
+/// then (a run from before task T9 has no facts file and no markers, and
+/// is made again).
 pub fn is_current(out: &Path) -> bool {
     matches!(read(out), Ok(Some(index)) if index.origin == Origin::Stage)
+        && matches!(read_facts(out), Ok(Some(_)))
 }
 
 // ---- The fallback ------------------------------------------------------------
@@ -1456,6 +1986,7 @@ pub fn reconstruct(
         placed: Vec::new(),
         unplaced: Vec::new(),
         triggers: Vec::new(),
+        markers: Vec::new(),
         notes: vec![
             "reconstructed from the written maps: no references, bases or enable parents, and \
              the kinds are read off the objects"

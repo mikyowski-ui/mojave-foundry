@@ -86,6 +86,78 @@ columns), `armors`, `ingestibles`, `ammo`, `npcs`, `creatures`,
 1 added the game, terminals, notes, packages, actor packages, the script
 and quest-target references and the weapon combat columns.
 
+**Versions (2026-11-24).** `mir::SCHEMA_VERSION` covers the directory layout,
+the JSON documents and the SQLite schema, and is 3: version 3 added
+`Reference::primitive` to the cell documents (below). A directory of another
+version is refused by `Mir::open` (`MirError::SchemaVersion`) and rebuilt by
+`extract`, which is how an older cache of cells is replaced. The records
+revision (`mir::RECORDS_REVISION`, 2) covers only the tables of
+`records.sqlite` within one schema version.
+
+**Primitive volumes (schema 3).** A reference's `primitive` is
+`{ bounds: [x, y, z], shape }`, left out of the JSON when the reference has
+none or a bound is not a finite number. It comes from the `XPRM` subrecord
+(32 bytes in every reference of both retail masters: bounds, an editor
+colour, an unnamed float and the shape code) and is kept for every reference
+that has one, not only triggers: room, collision and multibound markers,
+acoustic spaces and portals carry them too. `shape` is `"box"` (code 1),
+`"sphere"` (2), `"portal_box"` (3) or `{"other": code}` (any other code;
+`mir::PrimitiveShape`). `bounds` are the extents along the reference's local
+axes, as stored, before the reference's scale; public documentation reads them
+as half-extents (a box reaches from `-bounds` to `+bounds`, and a sphere's
+first is its radius), and the converter uses that reading. The colour and the
+unnamed float are not kept. `trigger_volume` is unchanged: a primitive on an
+`ACTI` or `TACT` base. Counts in the retail masters (2026-11-24, from
+`cargo run -p fnv-esm --example triggers`): Fallout 3, 4,137 references with a
+primitive (1,111 on activators: 1,101 boxes and 10 spheres, 17 of them with a
+stand-in model), no `XPRM` of another size; New Vegas, 5,677 (1,266 on
+activators: 1,261 boxes and 5 spheres, 66 with a stand-in model), none of
+another size.
+
+**Tables, revision 2** (`docs/simulation-layer-spec.md`, appendix A; the
+queries are in `crates/mir/src/simlogic.rs` and `logic.rs`). A reader of any
+of them on a file written before revision 2 returns `MirError::MissingTable`.
+New tables and what reads them (all methods are on `mir::Records`):
+
+| Table | Columns | Typed query |
+|---|---|---|
+| `globals` | `form`, `editor_id`, `type_code`, `kind`, `value` | `globals()`, `global(&FormKey)`, `global_by_name(&str)` return `GlobalRow { form, editor_id, kind: Option<GlobalType>, value: Option<f32> }` (the initial value, whatever the type) |
+| `game_settings` | `form`, `editor_id`, `kind`, `int_value`, `float_value`, `text_value` | `game_settings()`, `game_setting(&str)`, `game_setting_f32(&str)`, `game_setting_i64(&str)`; `GameSettingRow { form, name, value: Option<GameSettingValue> }`, typed by the name's first letter |
+| `messages` | `form`, `editor_id`, `title`, `text`, `icon`, `flags`, `display_time`, `buttons` | `messages()`, `message(&FormKey)` return `MessageRow { form, editor_id, title, text, icon, flags, display_time, buttons }` with `is_message_box()` and `is_auto_display()` |
+| `message_buttons` | `message`, `seq`, `text`, `conditions` | the `buttons` of a `MessageRow`: `MessageButtonRow { seq, text, conditions: Vec<ConditionRow> }` |
+| `factions` | `form`, `editor_id`, `name`, `flags`, `flags2`, `relations` | `factions()`, `faction(&FormKey)`, `faction_by_name(&str)` return `FactionRow { form, editor_id, name, flags, relations }` with `reaction_towards(&FormKey)`, `is_hidden_from_pc()`, `is_evil()`, `tracks_crime()` |
+| `faction_relations` | `faction`, `seq`, `other`, `modifier`, `reaction` | the `relations` of a `FactionRow`: `FactionRelationRow { other, modifier, combat_reaction }` with `reaction()` |
+| `actor_ai` | `actor`, `kind`, `aggression`, `confidence`, `energy_level`, `responsibility`, `mood`, `services`, `trained_skill`, `trainer_level`, `assistance`, `aggro_radius_behaviour`, `aggro_radius`, `ai_from`, `voice`, `voice_from` | `actor_ais()`, `actor_ai(&FormKey)` return `ActorAiRow { actor, kind ("npc" or "creature"), ai: Option<AiData>, ai_from, voice, voice_from }`, resolved through the template flags (AI data flag `0x0010`, traits flag `0x0001`); `ai_from` and `voice_from` name the actor read |
+| `actor_factions` | `actor`, `seq`, `faction`, `rank`, `from_actor` | `actor_factions(&FormKey)` returns `[ActorFactionRow { faction: Option<FormKey>, rank, from }]`, through the factions flag (`0x0004`) |
+| `info_links` | `info`, `kind`, `seq`, `topic` | read into `InfoRow`: kind `choice` (`choices`), `link_from` (`link_from`), `follow_up` (`follow_up`), `add_topic` (`add_topics`); `info(&FormKey)` and `topic_info_rows(&FormKey)` return `InfoRow`, with `data()` for the flag accessors |
+| `package_events` | `package`, `event`, `idle`, `topic`, `script_source` | the `events` of a `PackageRow` (`logic.rs`): `PackageEventRow { event ("on begin", "on end" or "on change"), idle, topic, script_source }` |
+| `script_contexts` | `owner`, `context`, `script_type`, `flags`, `ref_count`, `compiled_size`, `variable_count`, `has_source`, `has_compiled` | `script_contexts(&FormKey)`, `script_context(&FormKey, &str)` return `ScriptContextRow` (those columns, `source`, `references`, `locals`) with `local(&str)` and `form_at(u32)` |
+| `script_ref_list` | `owner`, `context`, `seq`, `kind`, `form`, `raw` | the `references` of a `ScriptContextRow`: `ScriptRefRow { index (1-based, as compiled code names it), resolved, entry: ScriptRefKind::Form(raw id) or Local(index) }` |
+| `script_locals` | `owner`, `context`, `idx`, `name`, `flags` | the `locals` of a `ScriptContextRow`: `ScriptLocalRow { index, name, flags }` with `is_integer()` (flag bit 0) |
+| `decode_skips` | `area`, `reason`, `count` | `decode_skips()` returns `[DecodeSkipRow { area ("PACK/PKDT"), reason, count }]`: what the decoders could not use, over the whole plugin list |
+
+Columns revision 2 added to older tables: `infos.flag_bytes`, `knam`,
+`knam_sig` and `speech_challenge` (`InfoRow` fields of the same names);
+`packages.pkdt_size`, `behaviour_flags`, `behaviour_raw` and `type_flags`
+(`PackageRow::pkdt_size`, `behaviour_flags`, `behaviour_flags_raw`,
+`type_flags`; the raw word keeps the uninitialised fill and the plain one is
+`None` when `PKDT` stores it) and `conditions.param1_ref`, `param2_ref`
+(`ConditionRow::param1_ref`, `param2_ref`: the placed reference a parameter
+names, for the functions in `fnv_esm::REFERENCE_PARAMETER_FUNCTIONS`).
+
+`Records::ref_referrals` (and `referenced_ref_reasons`, grouped by reference)
+gives each reference something points at with a `RefReason`: `QuestTarget`,
+`Script`, `Condition`, `LinkedRef`, `EnableParent`, `EnableChild`,
+`PackageTarget`, `PackageLocation` and, new in revision 2, two more: `RefReason::ConditionParam` (a condition's parameter
+names the reference) and `RefReason::TeleportDestination` (the destination
+door of a teleport door). `referenced_refs()` keeps the set it always
+returned: only the reasons for which `RefReason::is_legacy()` is true, so
+declutter output is unchanged. `referenced_refs_all()` adds the two new
+reasons, and is what a consumer that wants every reference something points
+at calls.
+
+Row counts of the retail masters are in `docs/handoff-pass-1.md`, section 13.
+
 **Paths.** `mir` owns path normalisation, and nothing else does it:
 lowercase ASCII, `/` to `\`, a leading `data\` dropped, and the root
 prefix added when missing (`meshes\` for a record's model path,
@@ -829,10 +901,78 @@ one-map path of 9.4 to 9.6, byte for byte. The code is
   were left off, each with the stage's reason, and the stub maps listed with
   no references. Schema in section 11.2. The stage reuses its output only
   when this file is present (`placements::is_current`: it reads, is of this
-  schema version and has origin `stage`). Items the builder moved off link
-  hexes are matched to their object by the nearest free item object within
-  12 steps (`placements::MOVED_RADIUS`), a heuristic; the file's notes count
-  them.
+  schema version and has origin `stage`). Each entry is joined to its object
+  by the builder's exact reference-to-object map (below), not by position,
+  and read back against the written maps; the file's notes count any
+  disagreement.
+- **Pass 2 options (2026-11-24; spec 7.6, 8.3).** Three keys, all off or
+  as before by default, change what the map stage writes so that the `sim`
+  stage has something to attach scripts to:
+  - `enable_groups = true` (slice key, `config::SliceSpec::enable_groups`, default off;
+    on a layer it applies per map, and `Inputs::enable_groups_on()` is what
+    the stages ask). For every non-actor member of an enable group in the
+    scene's cells (a reference with an enable parent, or one that is a
+    parent; chains are flattened to their root by
+    `placements::group_members`, cycles cut), `map::apply_enable_groups`
+    hands the slicer the reference as the group's initial state says: a
+    member that starts enabled is handed on enabled (a child follows its
+    parent, its own flag is not read); one that starts disabled is handed on
+    enabled too and written hidden (`BuildOptions::hidden`), but only when the
+    slicer would draw it as an object (a sprite, strips or a landmark). A
+    member the slicer would bake into the ground, or skip (a marker, a
+    light), stays off the map and is listed (`GroupsReport::left`, reason
+    "starts disabled; ..."; the index lists it as `unplaced`, reason
+    `skipped`). Actors are the critter pass's: a group member that is an
+    actor follows its group there (`map::` people placement): placed hidden
+    when the group starts it disabled, placed as usual when the group starts
+    it enabled whatever its own flag says. What the pass changed is kept in
+    `GroupsReport::originals` (the source's own flag and enable parent,
+    `placements::Original`), so the index keeps describing the source. The
+    report has `## Enable groups`.
+  - `presence_copies = true` (layer file key, `LayerSpec::presence_copies`,
+    spec 7.6). A named actor whose AI packages lead to another map of the
+    layer gets one hidden copy on that map (`layer::add_presence_copies`):
+    from the first package of its list whose location is understood, a
+    reference (type 0), a cell (type 1, near the centre of the map built from
+    that cell) or the actor's own linked reference (type 6); "near the editor
+    location" (3) leads nowhere. The copy shares the original's sprite set,
+    name and figures, is `CritterPlacement::hidden` with
+    `CritterPlacement::presence_of`, and is placed on the nearest walkable hex
+    to the location, clear of every link's keep-clear hexes. None where the
+    map already places a reference to the actor. The index lists the copy as
+    a placed entry whose `reference` is `<original>@<map stem>` and
+    `presence_of` is the original's. The key is part of the layer's cache key.
+  - `hostile_packet = <n>` (slice key): the AI packet number hostile people
+    take when `loot` is on, instead of the rebalance table's (the packet
+    named by `convert.hostility.hostile_packet`, "Merc Raider" by default,
+    then `hostile_packet_number`, 136). It must be a packet of the base
+    `ai.txt`: another number is a `ConvertError::Slice` that stops the stage.
+    The index marks each critter the catalogue made hostile with `hostile`.
+- **Hidden objects.** `BuildOptions::hidden` names placements, by reference,
+  that are written with the hidden flag `0x01`. The planner ignores a hidden
+  placement entirely: it keeps its prototype's blocking and light flags (the
+  engine's movement rule skips hidden objects), but it blocks no hex, opens
+  no door grid, covers no figure and counts for no readability, footprint or
+  reach figure. It is written after every other object of its elevation and
+  is still moved off link hexes. A hidden critter
+  (`CritterPlacement::hidden`) is placed after the visible critters on the
+  nearest walkable hex within three times `critters::CRITTER_RADIUS` steps,
+  clear of exit grids, doors, the entrance, arrivals, passages, keep-clear
+  hexes and every visible critter; it is a bare critter (its catalogue entry
+  is ignored), listed in `BuildReport::hidden_critters` instead of
+  `BuildReport::critters`, so it is no perch, no critter lost to closing and
+  no person of the map. `BuildReport::hidden_objects` lists the other hidden
+  objects as (reference, elevation, hex), in write order.
+- **The reference-to-object map** (`map_builder::BuiltMap::objects`, and
+  `Built::objects` on the one-map path). Exactly the objects the map's
+  placements and critters became, in write order: `ObjectRef { reference,
+  elevation, id, hex, pid, hidden }`, where `reference` is the source
+  reference (a placement's, a critter's, a presence copy's own key), `id` the
+  object's id in the map file, and `hidden` whether it carries the flag. Exit
+  grids, blockers and inventory records are not listed. A reference that became
+  several objects (a landmark's pieces, ammunition packs) has an entry for
+  each. The placement index is made from this list and read back against the
+  written maps, never from positions; a mismatch is counted in the notes.
 - **Reach** (`map_builder::reach`). Every walkable component of an
   elevation other than the main one is diagnosed against the elevation's own
   ground rule with nothing blocked (`reach::IslandDiagnosis`, in
@@ -1037,7 +1177,7 @@ As built (`nif`):
   "use all", which gives every entry, so the result never depends on a
   random draw. Files are `actors/<plugin>_<6 hex>.json`, listed in the
   manifest (`Mir::actors`, `Mir::actor`). The document also records the
-  race, the template chains followed and its schema version (2). `appearance` keys the sprite set: two actors with equal
+  race, the template chains followed and its schema version (`mir::SCHEMA_VERSION`, 3 since 2026-11-24). `appearance` keys the sprite set: two actors with equal
   parts, texture overrides, tint and sex share one. Until the skeleton
   and animation stores exist the document names their source paths
   (`skeleton_path`, `stand_path`, `walk_path`); links that did not
@@ -1411,13 +1551,132 @@ transpile::build(mir: &mir::Mir, slice: &SimSlice, config: &SimConfig)
 transpile::lower(&Module, &Placement, &BaseFiles) -> Result<Lowered, TranspileError>
 ```
 
-The spec names but does not define these types, which the first agent to
-build `transpile::ir` (task T2) settles and adds here: `Global`, `Actor`,
-`Diag`, `FuncId`, `UnOp`, `BinOp`, `CmpOp`, `ActorValue`, `RefUses`,
-`SimSlice`, `SimConfig`, `BaseFiles`, `Lowered`, `TranspileError`. The
-`Placement` that `lower` takes is a plain copy, made by the `sim` stage, of
-the fields of 11.2 that lowering uses (map, hex, elevation, PID, object id,
-kind, hidden); `transpile` does not depend on `mojave-convert`.
+**Helper types settled by wave S1** (2026-11-24; the code is
+`crates/transpile/src/ir/` at `d3fa22f`; field lists below are copied from
+it). The spec named these without defining them.
+
+```rust
+// ir/expr.rs
+pub struct FuncId(&'static str);   // a function of obscript::functions::TABLE, by canonical name
+                                   //   (as the public function list spells it: "GetStage").
+                                   //   FuncId::named(&str) (case-insensitive) -> Option, .name(), .signature().
+                                   //   Serialises as that name; reading a name the table lacks is an error.
+pub enum UnOp  { Neg, Not }        // -x ; !x (1 when x is 0, else 0)
+pub enum BinOp { Add, Sub, Mul, Div, Mod, And, Or, Cmp(CmpOp) }
+                                   // Mod is not in the spec's grammar, kept because the source compiler accepts it;
+                                   // And/Or give 1 or 0; Cmp gives 1 when it holds, else 0
+pub enum CmpOp { Eq, Ne, Lt, Le, Gt, Ge }   // parse("==") / as_str() / holds(f64, f64) / negated()
+// All three serialise snake_case. Func is Known(FuncId) | Unsupported { name: String }.
+
+// ir/dialogue.rs
+pub struct ActorValue(pub u32);    // a source actor value by its stored number (5..=11 SPECIAL, 16 Health,
+                                   //   23 Karma, 32..=45 skills); serialised as the number (serde transparent)
+
+// ir/world.rs
+pub struct RefUses(pub u8);        // why a placed reference is needed: a bit set, serialised as the sorted
+                                   //   list of the names of its bits
+//   SCRIPT 0x01 "script" (its base has a script, or a script names it) | CONDITION 0x02 "condition"
+//   | PACKAGE 0x04 "package" | QUEST_TARGET 0x08 "quest_target" | ENABLE_PARENT 0x10 "enable_parent"
+//   | LINKED 0x20 "linked"; NONE = 0; contains / insert / is_empty / names. An unknown name is an error.
+pub struct RefEntry { pub form: FormKey, pub editor_id: Option<String>, pub base: FormKey,
+                      pub area: String /* the placement's map stem */, pub mobile: bool /* a critter */,
+                      pub why: RefUses }
+
+pub enum ActorKind { Npc, Creature, Leveled }  // NPC_ | CREA | LVLN or LVLC (a leveled list of actors); snake_case
+pub struct AiData { pub aggression: u8, pub confidence: u8, pub energy: u8, pub responsibility: u8,
+                    pub mood: u8, pub services: u32, pub assistance: u8 }   // AIDT after templates; Default is all 0
+pub struct Actor {
+    pub base: FormKey, pub editor_id: Option<String>, pub kind: ActorKind,
+    pub script: Option<SimId>,                  // its object script (SimKind::Script)
+    pub packages: Vec<SimId>,                   // in PKID order (SimKind::Package)
+    pub factions: Vec<(FormKey, i8)>,           // faction and rank, in file order
+    pub voice: Option<FormKey>, pub race: Option<FormKey>, pub class: Option<FormKey>,
+    pub female: bool,
+    pub essential: bool,                        // ignored by Pass 2 and reported (owner decision 12)
+    pub ai: Option<AiData>,
+    pub placements: Vec<FormKey>,               // its placed references in the slice, sorted
+}
+
+pub enum GlobalPurpose { QuestState, QuestVar, Glob, Group, Note, OnceFlag, Actor }
+//   Declaration order is the allocation order of spec 10.2: by purpose, then by SimId.
+//   Module::globals_in_allocation_order() returns them so.
+//   QuestState: stage, flags, done and pending bits, objectives (spec 6.1); QuestVar: a quest variable (5.4);
+//   Glob: a source GLOB; Group: an enable group's state (8.2); Note: a holodisk global (9.2);
+//   OnceFlag: say-once and say-once-a-day flags, topics given, challenge outcomes (4.5);
+//   Actor: per-actor globals (dead, faction overrides, kill counters, hoisted variables).
+pub struct Global { pub id: SimId,           // the key in Module::globals: the source thing it stores
+                    pub purpose: GlobalPurpose,
+                    pub name: String,        // the <NAME> of MF_<KIND>_<NAME>: editor id uppercased, anything
+                                             //   outside A-Z0-9_ replaced by _ (ir::global_name)
+                    pub ty: VarTy,
+                    pub initial: i32 }       // as stored: a float is times 1,000, rounded (ir::fixed_point)
+
+// diag.rs
+pub struct Span { pub line: u32, pub column: u32 }                 // from 1; the column counts characters
+pub enum Severity { Error, Warning, Note }                         // lost something / approximated / only counted
+pub enum Category { /* 40 kinds, grouped by Category::group(): "lex" (BadCharacter, UnterminatedString,
+    BadNumber), "parse" (UnexpectedToken ... AssignAsCompare), "name" (UnresolvedName ... BadAssignment),
+    "function" (UnknownFunction, DroppedFunction, ArgumentCount, ArgumentKind), "block" (UnsupportedBlock,
+    EmptyBlock), "condition" (ConditionFallback, ConditionUnknownFunction, ConditionBadParameter,
+    ConditionRunOn, ConditionComparison), "build" (MissingRecord, RefOutsideSlice, IgnoredFlag, QuestDepth) */ }
+pub struct Diag { pub severity: Severity, pub category: Category,
+                  pub owner: Option<SimId>,   // left out of the JSON when None
+                  pub at: Option<Span>,       // left out when None
+                  pub subject: String,        // the name, function or token concerned: the key the report counts by;
+                                              //   left out when empty
+                  pub message: String }
+// Diag::{new, error, warning, note} build one; owned_by, at, about set the rest.
+// Malformed source is never an error: it is a Diag.
+
+// ir/module.rs
+pub enum PlacedKind { Critter, Door, Container, Item, Terminal, Scenery }   // snake_case; as 11.2's `kind`
+pub struct PlacedObject { pub map: String, pub map_number: u32, pub elevation: u8, pub hex: u32,
+                          pub kind: PlacedKind, pub object_id: Option<u32>, pub pid: Option<u32>,
+                          pub reference: Option<FormKey>, pub base: Option<FormKey>, pub hidden: bool }
+pub struct Placement { pub objects: Vec<PlacedObject> }   // sorted (map, elevation, object id (none last), hex,
+                                                          //   reference); sort(), of_reference(&FormKey)
+pub struct SimSlice { pub name: String, pub placement: Placement }
+pub struct SimConfig { pub sfall: bool,          // owner decision 6: false
+                       pub hello_barks: bool,    // owner decision 14: false
+                       pub quest_depth: u32 }    // quests followed beyond those the slice's code names; default 1
+pub struct BaseFiles {                           // the base copies of spec 10.1, each file's text or None
+    pub scripts_lst: Option<String>,   // scripts/scripts.lst
+    pub vault13_gam: Option<String>,   // data/vault13.gam
+    pub quests_txt: Option<String>,    // data/quests.txt
+    pub holodisk_txt: Option<String>,  // data/holodisk.txt
+    pub quests_msg: Option<String>,    // text/english/game/quests.msg
+    pub pipboy_msg: Option<String>,    // text/english/game/pipboy.msg
+    pub map_msg: Option<String> }      // text/english/game/map.msg
+pub struct Lowered { pub files: BTreeMap<String, Vec<u8>>,   // layer path -> bytes, sorted
+                     pub diagnostics: Vec<Diag> }
+
+// error.rs
+pub enum TranspileError {
+    Mir(mir::MirError),                          // "reading the MIR"
+    Query { query: &'static str, message: String },   // a records.sqlite table or column missing, or a row malformed
+    Slice(String) }                              // inconsistent slice: a reference placed twice on one map, a
+                                                 //   placement of another game
+```
+
+`SimConfig` derives `Default` and is read with `#[serde(default)]` (the
+`[sim]` table of `foundry.toml`). `SimId` serialises as the text
+`<kind>/<form>/<sub>`, for example `stage/fallout3.esm:01a2b3/10`, with the
+kind as `SimKind::name()` (`topic`, `info`, `quest`, `stage`, `objective`,
+`quest_var`, `global`, `script`, `script_var`, `package`, `group`,
+`terminal`, `menu_item`, `note`, `actor`, `ref`, `text`), so that it can key
+a JSON object; the form is split off at the last `/` when parsing, and a
+text that does not read is `ir::BadSimId`. `SimKind` is declared in that
+order, which is the order of `SimId` and of every numbering derived from it.
+
+Differences from the text above and from the spec, as built:
+`PlacedObject::hex` is a `u32` where 11.2's `hex` is an `i32` in the file
+(the `sim` stage converts); `PlacedObject` also carries `map_number`,
+`reference` and `base`, which the plain copy of "map, hex, elevation, PID,
+object id, kind, hidden" did not list. `Placement` is the sorted list of
+objects, and `SimSlice` is `{ name, placement }`. At `d3fa22f`
+`transpile::build` and `transpile::build_module` exist; `transpile::lower`
+does not yet (task T8), so `Lowered` and `BaseFiles` are defined and
+unused. `ActorKind` has a third value, `Leveled` (a leveled list of actors).
 
 ### 11.2 The placement index (`map-placements.json`)
 
@@ -1432,23 +1691,30 @@ warns. The spec's `Placement` of `transpile::lower` is built from it
 (11.1). Two builds from the same inputs give the same bytes: no time, host
 or path is in the file.
 
-**Schema, version 1** (`placements::SCHEMA_VERSION`; a reader refuses another
-version and says to run the map stage again). The text is pretty-printed
-JSON with a final newline. A field marked "left out" is absent from the JSON
-when it has its default; a reader treats an absent field as that default.
+**Schema, version 2** (`placements::SCHEMA_VERSION`, 2026-11-24). The text is
+pretty-printed JSON with a final newline; an optional field is omitted, never
+`null` (a test checks the text has no `null`); a reader treats an absent field
+as its default. **A version-1 file is refused**: `PlacementIndex::from_text`
+(and so `placements::read`) fails with "schema version 1 where this build
+reads 2; run the map stage again", `is_current` is false for it (the map stage
+does not reuse its output), and `sim` stops with that message. The fields
+`key_pid` of a lock and `shape` and `radius` of a trigger were added to schema
+2 as optional fields after it was first written; a reader of an earlier
+schema-2 file sees them absent.
 
-Top level, all fields always present except `notes`:
+Top level, all fields always present except `triggers` and `notes`:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `schema_version` | integer | 1 |
+| `schema_version` | integer | 2 |
 | `origin` | `"stage"` or `"reconstructed"` | who made it |
 | `layer` | string | the layer's name, from its manifest |
 | `game` | string | `mir::GameVariant::id` (`fallout3`); `sim` refuses a MIR of another game |
-| `maps` | `[MapEntry]` | the layer's maps, sorted by stem; includes the stub maps standing in for interiors outside the build (they place no reference; a note counts them) |
+| `maps` | `[MapEntry]` | the layer's maps, sorted by (stem, file, number); includes the stub maps standing in for interiors outside the build (they place no reference; a note counts them) |
 | `placed` | `[PlacedRef]` | references that became objects of a written map |
 | `unplaced` | `[UnplacedRef]` | references of the maps' cells that are not on them |
-| `notes` | `[string]` | how it was made (matches by distance, objects not found, stubs); left out when empty |
+| `triggers` | `[TriggerRef]` | the maps' trigger volumes; left out when empty |
+| `notes` | `[string]` | how it was made; left out when empty |
 
 `MapEntry`: `stem` (the file stem), `file` (`maps/<stem>.map`), `number` (the
 map's number in the layer's manifest). `sim` checks that every entry is
@@ -1461,58 +1727,119 @@ registered in the manifest with that number.
 | `map` | string | no | the map's stem |
 | `map_number` | integer | no | the map's number |
 | `elevation` | integer 0 to 2 | no | |
-| `hex` | integer 0 to 39,999 | no | the written object's hex when one was found, else the placement's |
-| `kind` | `critter`, `door`, `container`, `item`, `terminal`, `scenery` | no | what it is (`PlacedKind`); `scenery` is listed only for an enable parent or child, or a reference the caller names (a script, quest or package points at it) |
+| `hex` | integer 0 to 39,999 | no | the written object's hex when one was found, else the builder's |
+| `kind` | `critter`, `door`, `container`, `item`, `terminal`, `scenery` | no | what it is (`PlacedKind`): a critter when the source is an actor or the written object is one; else by the base's signature (`NPC_`/`CREA` critter, `DOOR`, `CONT`, `TERM`, and `WEAP ARMO AMMO MISC ALCH BOOK KEYM NOTE CLOT INGR CHIP CMNY CCRD CDCK IMOD RCPE` item); else by the written object (a door, a critter, an item-category object with an inventory or room for one a container, any other item-category object an item); else `scenery` |
 | `critter` | boolean | no | `kind == critter` |
 | `object_id` | integer | left out when no object was found | the object's id in the written map |
 | `pid` | integer | left out when no object was found | the object's PID |
 | `pieces` | integer | left out when 1 | how many objects the reference became (a landmark is several pieces, ammunition several packs); the entry describes the first |
-| `reference` | string | absent in a reconstruction (except a person named by `features/<stem>.json`) | the reference's form key |
+| `piece_ids` | `[integer]` | left out for one object | every object id of such a reference, the first included, in write order |
+| `reference` | string | absent in a reconstruction (except a person named by `features/<stem>.json`) | the reference's form key; for a presence copy `<original>@<map stem>` |
 | `editor_id` | string | left out when unknown | |
 | `base` | string | left out when unknown | the base record's form key |
 | `base_kind` | string | left out when unknown | the base record's signature (`DOOR`, `NPC_`) |
 | `base_editor_id` | string | left out when unknown | |
-| `enable_parent` | `{ reference, opposite }` | left out when none | the parent's form key; `opposite`: the child is enabled when the parent is disabled |
-| `initially_disabled` | boolean | left out when false | the source starts it disabled |
-| `hidden` | boolean | left out when false | the written object carries the hidden flag |
+| `enable_parent` | `{ reference, opposite }` | left out when none | the source's parent; `opposite`: the child is enabled when the parent is disabled |
+| `group` | `{ root, opposite, initially_enabled }` | left out when the reference is in no enable group | spec 8.1: `root` is the group's root reference (chains flattened; a cycle is cut and counts as enabled); `opposite` (left out when false) the opposite flags multiplied along the chain to the root; `initially_enabled` whether it starts enabled: the root's own flag, flipped by `opposite` for a child (a child follows its parent, not its own flag) |
+| `initially_disabled` | boolean | left out when false | the source's own flag (not the group's state) |
+| `hidden` | boolean | left out when false | the written object carries the hidden flag (9.7) |
+| `lock` | `{ locked, level, key, key_pid }` | left out when the source has no lock | `locked`: the written object carries the lock bit (the lock is written with the catalogue, `loot = true`); `level`: the source's level as stored, 0 very easy to 255 key only; `key`: the key's base record form key, left out when the lock names none; `key_pid`: the Fallout 2 prototype id of the converted key item, when the items catalogue made one for `key` (`placements::key_pids_of`, from `LootReport::items` of kind `key`), left out when the lock names no key or the key is not in the layer |
+| `linked_ref` | string | left out when none | the source's `XLKR` |
 | `team` | integer | critters only, left out when unknown | the critter's team in the written map |
 | `ai_packet` | integer | critters only, left out when unknown | the critter's AI packet number |
+| `hostile` | boolean | left out when false | the catalogue made the critter hostile (its packet is the hostile packet, `hostile_packet` of 9.7) |
+| `presence_of` | string | left out unless a presence copy | the form key of the actor the copy copies (spec 7.6) |
 
-`UnplacedRef`: `map` (stem), `reference`, `kind`, `reason` (all always
-present); `editor_id`, `base`, `base_kind`, `base_editor_id`,
-`enable_parent`, `initially_disabled` and `detail` as above (left out when
-empty or false). `reason` is one of `disabled` (the source starts it
-disabled and the stage left it out), `deleted` (the winning plugin deleted
-it), `skipped` (the stage names a reason in `detail`: a critter without art,
-say) and `not_placed` (it is in the map's cells and nowhere on the map:
-pruned by declutter, off the level, outside the window's budget, or not
-something the stage places, such as items with loot off). Until task T7 of
-the spec, children that start disabled are left out, so they appear here
-with reason `disabled`, and `hidden` does not yet mark them.
+A presence copy is a placed entry of its own, described as its original with the
+original's `enable_parent`, `group`, `initially_disabled`, `lock` and
+`linked_ref` left off.
 
-**What is listed.** Critters, doors, containers, items and terminals, and any
-other reference that is an enable parent or child or that the caller names.
-Plain scenery is not listed.
+`UnplacedRef`: `map`, `reference`, `kind` and `reason` always present;
+`editor_id`, `base`, `base_kind`, `base_editor_id`, `enable_parent`, `group`,
+`initially_disabled` (left out when false), `lock` (`locked` is always false;
+`key` and `key_pid` as above), `linked_ref` and `detail` as for `PlacedRef`
+(left out when empty). `reason` is one of `skipped` (the stage names a reason in
+`detail`: a critter without art, a slicer skip, an enable-group child it could
+not place; the first reason given for a reference is kept), `deleted` (the
+winning plugin deleted it), `disabled` (the source starts it disabled and the
+stage left it out: always so with `enable_groups` off; with it on, a member
+the pass could not place is `skipped`) and
+`not_placed` (it is in the map's cells and nowhere on the map: pruned by
+declutter, off the level, outside the window's budget, or not something the
+stage places, such as items with loot off); tested in that order. A reference
+the builder placed is never listed here.
 
-**Order.** `maps` by (stem, file, number). `placed` by (map, elevation,
-object id with "none" last, hex, reference). `unplaced` by (map, reference).
+`TriggerRef` (a primitive on an activator, `mir::Reference::trigger_volume`; no
+object stands for it, and `sim` attaches a spatial script at its hex, spec
+5.7): `map`, `map_number`, `elevation`, `hex`, `reference` always present;
+`shape`, `radius`, `editor_id`, `base`, `base_kind`, `base_editor_id`,
+`enable_parent`, `group` and `linked_ref` as for `PlacedRef`, left out when
+unknown or none. `hex` is the hex under the volume's centre. `elevation` is the
+elevation of the run whose interior band holds the volume's height (an interior
+with storeys), else 0; the one-map path always gives 0. `shape` is `"box"` or
+`"sphere"` (`mir::PrimitiveShape::Box` or `Sphere`; a portal box or an unknown
+shape gives neither shape nor radius). `radius` is the smallest hex radius
+around `hex` that covers the volume's footprint, in hexes
+(`placements::project_trigger`): for a box, the largest hex distance from the
+centre's hex to the hex under any of the four corners of the box, taken with
+the half-extents `bounds[0]` and `bounds[1]` scaled by the reference's scale and
+turned by its yaw (a corner off the map is pulled in along its line to the
+centre, to the map's edge, since nothing can stand beyond it); for a sphere, the largest to the four points `bounds[0]`
+(scaled) reaches along the ground axes. The height is not used. `radius` is
+left out when the reference has no box or sphere primitive. A trigger of a
+deleted reference, or whose centre is off the map, is not listed. The radius is a covering circle, which is what a
+spatial script's range is; the box's exact footprint (half-extents and yaw) is
+not in the index, so a script is not told when the player is inside the circle
+but outside a thin or turned box. The bounds are read as half-extents, which is
+documented publicly and not verified here.
 
-**How an object is matched.** The n-th placement at an elevation and hex
-takes the n-th written object there that fits its class; an item takes the
-packs written after it (same hex, same PID, next ids) into `pieces`. Items
-and containers the builder moved off a link are matched to the nearest free
-item object within 12 steps (`placements::MOVED_RADIUS`) at a hex no
-placement names, a heuristic; the notes count them, and the placements that
-find no object.
+**Who is listed.** Critters, doors, containers, items and terminals, every
+presence copy, and any other reference that is an enable parent or child
+(a member of a group), that is linked by `XLKR` (either end), or that the
+caller names (`referenced_of`: `mir::Records::referenced_refs()`, the legacy set
+of section 2: a quest objective target, a script's reference list, a condition's
+run-on reference, a linked reference, an enable parent or child, a package's
+target or location; not the two reasons of revision 2). Plain scenery is not listed.
+
+**Order.** `maps` by (stem, file, number). `placed` by (map, elevation, object
+id with "none" last, hex, reference). `unplaced` by (map, reference).
+`triggers` by (map, elevation, hex, reference). `notes` in the order made: for
+each map, `<stem>: keys_missing N: locks name a key item the layer does not
+hold` (the number of placed entries whose lock names a key with no `key_pid`;
+none when N is 0), `<stem>: N references name an object id the written map does
+not hold` and `<stem>: N references name an object whose hex or PID the written
+map does not bear out`; then, for the whole file, `N stub map(s) place no
+source reference`. A reconstructed index has one note saying so.
+
+**How an object is matched.** Exactly, not by position: the builder returns
+every object each placement and critter became (`map_builder::BuiltMap::objects`,
+`Built::objects`: reference, elevation, object id, hex, PID, hidden), the first
+object of a reference gives the entry's `object_id`, `pid` and `hex` (taken from
+the written map, which must bear them out: the notes count an id the map does
+not hold and one whose hex or PID differs), and the count gives `pieces`.
+Nothing is guessed from distances; the `MOVED_RADIUS` search of the first
+schema is gone.
+
+**Reconstruction** (`placements::reconstruct`, origin `reconstructed`, used by
+`sim` only when the file is absent). Made from the written maps alone: every
+critter, door and container or item with an inventory (or room for one) becomes
+a `PlacedRef` with `map`, `map_number`, `elevation`, `hex`, `object_id`, `pid`,
+`kind`, `critter`, `hidden`, and for critters `team` and `ai_packet`; no
+`reference`, bases, enable data, locks or links, except that a critter on a hex
+`features/<stem>.json` lists a person for gets that person's `reference`. An
+item lying on the ground with no inventory is listed as an item, and a
+container with room as a container, both guesses. Terminals and scenery are not
+listed; `unplaced` and `triggers` are empty.
 
 **Differences from spec 10.4.** The spec lists "map, hex, elevation, PID,
 object id and whether it is a critter" per placed reference. The index adds
-`map_number`, `kind`, `pieces`, the source identity (`reference`,
-`editor_id`, `base`, `base_kind`, `base_editor_id`), the enable-parent
-fields, `hidden`, `team`, `ai_packet`, and the `maps`, `unplaced` and `notes`
-lists. Spec 12 names `map-builder` as the writer in T7; the writer is
-`mojave-convert` (`placements.rs`), which holds the join. Locked bits,
-presence copies and the hostile packet option of T7 are not in it yet.
+`map_number`, `kind`, `pieces`, `piece_ids`, the source identity (`reference`,
+`editor_id`, `base`, `base_kind`, `base_editor_id`), the enable-parent and group
+fields, `hidden`, `lock`, `linked_ref`, `team`, `ai_packet`, `hostile`,
+`presence_of`, and the `maps`, `unplaced`, `triggers` and `notes` lists. Spec 12
+names `map-builder` as the writer in T7; the writer is `mojave-convert`
+(`placements.rs`), which holds the join, with the builder supplying the exact
+object map.
 
 ### 11.3 The `sim` stage (`mojave_convert::sim`, spec 10)
 
@@ -1653,3 +1980,140 @@ provides locally until the engine brief lands.
 | `SkillCheck::Threshold { shown_when_failed, partner }` | G (greyed options) | shown with a "25/50" label, selectable (decision 15) |
 | `Response`, `NoteBody::Voice` | V (speech audio and lip sync) | text only; the response's sound field stays empty |
 | `VarRef::Hoisted` | R (reading another instance's local) | hoisting to globals, allowed only for a persistent reference with one placement |
+
+### 11.7 The `emit` interfaces the transpiler calls (2026-11-24)
+
+Everything below is in `crates/emit` and re-exported at its root where noted;
+`transpile` produces text and rows, `emit` writes bytes and checks them with
+the engine's own parsers. Signatures are copied from `d3fa22f`.
+
+**The INT assembler** (`emit::int`; the stand-in for the engine's own
+assembler, gap A; the text format is `docs/vault-engine-briefs/int-assembler.md`
+and the crate's module notes; verified against the engine's loader,
+`vault_vm::IntProgram::parse_in`, by `crates/emit/tests/int_vm.rs`).
+
+```rust
+pub fn assemble(source: &str, words: &Words) -> Result<Vec<u8>, AsmError>;
+pub fn procedure_names(image: &[u8]) -> Result<Vec<Vec<u8>>, AsmError>;
+
+pub struct AsmError { pub line: usize, pub message: String }   // one-based line; 0 = the whole program (its size)
+pub enum Game { Fallout1, Fallout2 }                           // host words 0x8000..=0x8155 / ..=0x8183
+pub struct Words { pub game: Game, pub mods: bool, pub enhanced: bool }
+impl Words {
+    pub const FALLOUT1: Self;  pub const FALLOUT2: Self;       // mods and enhanced off
+    pub const fn with_mods(self, mods: bool) -> Self;          // the manifest scripting words 0x8300..=0x8309
+    pub const fn with_enhanced(self, enhanced: bool) -> Self;  // the enhanced range 0x8200..=0x82FF
+    pub fn accepts(&self, word: u16) -> bool;                  // as the loader's WordSet does
+    pub fn word_named(&self, name: &str) -> Option<u16>;
+    pub fn name_of(&self, word: u16) -> Option<&'static str>;
+}
+```
+
+`assemble` is deterministic (the bytes depend on the source text and the word
+set alone), never panics, and names the source line of a refusal; a word outside
+`words` is an error at its line. The sfall word set is not supported. Source
+statements: `.procedure <name> [args=<n>] [flags=<f>] [deadline=<n>]
+[condition=<label>] [body=<label>]`, `.import`, `.name`, `.literal <label>
+"<text>"`, `.entry <label>` (required), `<label>:`, the pushes `push.i`,
+`push.f`, `push.s`, `push.n`, `push.a`, `push.p`, `push.raw`, a mnemonic (a core
+word of `emit::int::CORE_WORDS` or a host word of the set) or `op <word>`.
+`flags=` is a number or names joined by `|`: `timed`, `conditional`, `import`,
+`export`, `critical` (`emit::int::flags`); the conditional flag is the caller's
+to set. The image is the 42-byte bootstrap, the procedure records, one
+identifier record per distinct name, one literal record per distinct text, then
+the code. Limits: `MAX_PROCEDURES` 65,536, `MAX_ARGUMENTS` 341,
+`MAX_STRING_BYTES` 65,533, `MAX_IMAGE_BYTES` 64 MiB. `procedure_names` reads
+only the procedure records and identifier table, for the layer's hook check
+below.
+
+**The appenders** (`emit::append`; each keeps the base file byte for byte,
+adds rows after it, re-reads the result with the engine's own parser and refuses
+a base the engine would refuse). Rows are `(key, row)` and are **numbered in
+ascending key order whatever order they arrive in**, so a caller keying rows by
+`SimId` gets the same numbers and bytes from any input order (spec 10.2); two
+rows with one key are refused (`EmitError::Append`). Every function returns
+`Appended<K, N> { bytes: Vec<u8>, numbers: Vec<(K, N)> }`, `numbers` in key
+order.
+
+| Function | File | Row | Number given |
+|---|---|---|---|
+| `append_messages<K>(base: &[u8], first_id: i32, rows: &[(K, Vec<u8>)]) -> Result<Appended<K, i32>, EmitError>` | a `.msg` | raw text bytes in the game's encoding, no sound | `first_id + rank`; an id the base holds is refused (a collision means two layers claim one range); at most `MSG_MAX_RECORDS` rows |
+| `append_message_entries(base: &[u8], entries: &[MsgEntry]) -> Result<Vec<u8>, EmitError>` | a `.msg` | `MsgEntry { id: i32, sound: Vec<u8>, text: Vec<u8> }` with chosen ids | the entry's own id, in ascending order; a base id or a repeated id is refused. Text rules are the writer's: no `}`, LF, NUL or `0x1A`, at most 1,023 bytes |
+| `append_globals<K>(base: &[u8], rows: &[(K, GamVar)]) -> Result<Appended<K, usize>, EmitError>` | `data/vault13.gam` | `GamVar { name: String, value: i32 }` | the global's index, from the base's count; the base must hold the `GAME_GLOBAL_VARS` marker unless empty (an empty base gets it) |
+| `append_script_rows<K>(base: &[u8], rows: &[(K, ScriptRow)]) -> Result<Appended<K, u32>, EmitError>` | `scripts/scripts.lst` | `ScriptRow { stem: String, editor_id: Option<String>, local_vars: u32 }`, written as `<stem>.int ; <editor id> # local_vars=<n>` | the row index, from the base's row count; a stem the base or another row already uses (compared without case) is refused |
+| `append_quests<K>(base: &[u8], rows: &[(K, QuestRow)]) -> Result<Appended<K, usize>, EmitError>` | `data/quests.txt` | `QuestRow { location, description, global, display, completed: i32 }`, one `a, b, c, d, e` line | the ordinal among the valid records |
+| `append_holodisks<K>(base: &[u8], rows: &[(K, HolodiskRow)]) -> Result<Appended<K, usize>, EmitError>` | `data/holodisk.txt` | `HolodiskRow { global, title, text: i32 }`, one `a, b, c` line | the ordinal among the valid records |
+
+A layer that grows `vault13.gam` changes the campaign's global count, so saves
+made without it do not load with it (spec 10.2).
+
+**Attaching scripts to a built map** (`emit::map`, re-exported at the crate
+root: `attach_scripts`, `attach_scripts_to`, `ScriptAttachment`, `ScriptSite`,
+`ObjectScript`).
+
+```rust
+pub enum ObjectScript { Item, Critter }     // SPEC-003 section 2.9 category 3 (every object but a critter) / 4
+pub enum ScriptSite {
+    Object  { id: u32, kind: ObjectScript },                 // the object with this unique id, top level or in an inventory
+    Spatial { hex: i32, elevation: u8, radius: i32 } }       // category 1: fires on a hex within radius
+pub struct ScriptAttachment { pub site: ScriptSite, pub script_index: u32 /* 0 ..= 0x00FF_FFFF */,
+                              pub local_vars: u32 /* 0 ..= 1,000,000 */ }
+
+pub fn attach_scripts_to(map: &mut MapFile, attachments: &[ScriptAttachment],
+                         map_script: Option<u32>) -> Result<(), EmitError>;
+pub fn attach_scripts(map: &[u8], prototypes: &impl PrototypeLookup,
+                      attachments: &[ScriptAttachment], map_script: Option<u32>)
+                      -> Result<Vec<u8>, EmitError>;
+```
+
+An object attachment adds one record to category 3 or 4 with the lowest free
+serial from 1 in that category, and sets the object's script id and cached
+script file; a spatial attachment adds a category-1 record. Records are
+appended after the map's own in a fixed order (by object id; spatial ones by
+place), so the order of `attachments` does not matter. **Re-runs change
+nothing**: an object that already has a record of the same script index keeps
+it, a spatial record with the same hex, elevation, radius and script is not
+added again, and `attach_scripts` on its own output returns the same bytes. The
+map script is a script index; the header stores it plus one (SPEC-003 3.3) and
+no system-category record is written. A saved map keeps a record's local count;
+any other map reads it back as 0 and the engine takes the count from the script
+list row. `attach_scripts` parses the bytes as a Fallout 2 map with the given
+prototypes (the records need their prototypes' sizes) and writes through
+`MapFile::write`. **Refused, with the map left as it was** (`EmitError::Map`):
+an id on no object (named), an id on several objects, a critter category on a
+non-critter or the reverse, a script index over `0x00FF_FFFF`, over 1,000,000
+local variables, a spatial hex outside 0 to 39,999, an elevation above 2, a
+negative radius, a map script index over `0x00FF_FFFF`, and an object that
+already has a different script.
+
+**Registering scripts in the layer** (`emit::ModLayer`; `ModLayer::new(id, name,
+version)` sets the manifest's `id` and `api`). The manifest is changed through
+an amend that keeps the change only if the manifest still writes to TOML and
+parses back and its registrations do not conflict (`ModRegistry::build`);
+otherwise `EmitError::Manifest` and the layer is as it was. File names are
+lowercased.
+
+```rust
+pub fn register_script(&mut self, file: &str, index: u32, local_vars: u32) -> Result<(), EmitError>;
+pub fn add_global_script(&mut self, file: &str, repeat: u32, kind: u32) -> Result<(), EmitError>;
+pub fn add_hook(&mut self, point: &str, file: &str, procedure: &str) -> Result<(), EmitError>;
+```
+
+- `register_script`: `scripts/<file>` becomes script-list row `index`
+  (`[[scripts]]`, `local_vars` locals) without replacing `scripts.lst`.
+- `add_global_script`: a `[[global_scripts]]` entry (SPEC-024a): its `start`
+  runs once at setup and then every `repeat` steps (0: never again); its
+  `map_enter_p_proc`, `map_exit_p_proc` and `map_update_p_proc` run at those
+  events; `kind` is 0 to 3.
+- `add_hook`: `procedure` of `scripts/<file>` on the engine hook `point`
+  (`[[hooks]]`, a public hook name such as `HOOK_CALCAPCOST`).
+
+**Write-time checks** (`ModLayer::write`, through `check_scripts`; a layer with
+a violation is not written): every registered file (`[[scripts]]`,
+`[[global_scripts]]`, `[[hooks]]`) is in the layer as `scripts/<file>`; no
+`[[scripts]]` index is a row of the layer's own `scripts/scripts.lst` when it
+has one (the engine refuses such an index, so a layer that ships a whole list
+needs no `[[scripts]]` rows: the transpiler ships a whole list, decision 7); and
+every hook's program is readable by `emit::int::procedure_names` and holds the
+named procedure (compared without case). `write` replaces a previous output
+directory and gives byte-identical folders for identical layers.

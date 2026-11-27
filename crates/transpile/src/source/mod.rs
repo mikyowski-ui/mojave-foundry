@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 pub use corpus::{Corpus, EmbeddedScript};
+pub use load::FAILURE_TOPIC;
 pub use load::{load, load_corpus};
 pub use resolve_form::FormResolver;
 
@@ -177,8 +178,15 @@ pub struct SourceInfo {
     pub end: Option<SourceBody>,
     /// `DNAM`, as stored.
     pub challenge: Option<u32>,
-    /// `KNAM`: the check's label actor value (task T1; `None` today).
+    /// `KNAM`: the check's label actor value, by its stored number, when
+    /// it names an actor value record whose editor id the build knows.
     pub label: Option<u32>,
+    /// `KNAM` as stored: the label record (an actor value or a perk).
+    #[serde(default)]
+    pub knam: Option<FormKey>,
+    /// The signature of the `KNAM` record (`AVIF`, `PERK`).
+    #[serde(default)]
+    pub knam_sig: Option<String>,
 }
 
 /// A dialogue topic (`DIAL`).
@@ -250,6 +258,10 @@ pub struct SourceQuest {
     pub stages: Vec<SourceStage>,
     /// Objectives, in order.
     pub objectives: Vec<SourceObjective>,
+    /// The quest's own conditions (`CTDA` of the `QUST`), which every INFO
+    /// of the quest must also pass.
+    #[serde(default)]
+    pub conditions: Vec<SourceCondition>,
 }
 
 /// A global (`GLOB`).
@@ -433,6 +445,51 @@ pub struct SourceRef {
     pub initially_disabled: bool,
     /// Persistent.
     pub persistent: bool,
+    /// The lock level (255 key only) and the key, when locked.
+    #[serde(default)]
+    pub lock: Option<(u8, Option<FormKey>)>,
+    /// The cell it stands in.
+    #[serde(default)]
+    pub cell: Option<FormKey>,
+}
+
+/// A message (`MESG`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceMessage {
+    /// Editor id.
+    pub editor_id: Option<String>,
+    /// Title.
+    pub title: Option<String>,
+    /// Text.
+    pub text: Option<String>,
+    /// Flags (`DNAM`): `0x01` message box, `0x02` auto display.
+    pub flags: u32,
+    /// Buttons, in order, with their conditions.
+    pub buttons: Vec<(String, Vec<SourceCondition>)>,
+}
+
+/// One relation of a faction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceRelation {
+    /// The other faction.
+    pub other: FormKey,
+    /// Disposition modifier.
+    pub modifier: i32,
+    /// Group combat reaction: 0 neutral, 1 enemy, 2 ally, 3 friend.
+    pub reaction: Option<u32>,
+}
+
+/// A faction (`FACT`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceFaction {
+    /// Editor id.
+    pub editor_id: Option<String>,
+    /// First flag byte: `0x01` hidden from the player, `0x02` evil.
+    pub flags: u8,
+    /// Second flag byte: `0x01` tracks crime.
+    pub flags2: u8,
+    /// Relations, in order.
+    pub relations: Vec<SourceRelation>,
 }
 
 /// One editor id of the plugin list.
@@ -484,6 +541,19 @@ pub struct SimSource {
     pub notes: BTreeMap<FormKey, SourceNote>,
     /// The packages of the slice's actors.
     pub packages: BTreeMap<FormKey, SourcePackage>,
+    /// The numeric game settings, by name (`fSpeechChallengeMultiplier`).
+    #[serde(default)]
+    pub settings: BTreeMap<String, f64>,
+    /// Every message.
+    #[serde(default)]
+    pub messages: BTreeMap<FormKey, SourceMessage>,
+    /// Every faction.
+    #[serde(default)]
+    pub factions: BTreeMap<FormKey, SourceFaction>,
+    /// The response lines of each voice note's topic, in file order (spec
+    /// 9.2: holotapes as text), by topic.
+    #[serde(default)]
+    pub voice_lines: BTreeMap<FormKey, Vec<String>>,
 }
 
 impl SimSource {

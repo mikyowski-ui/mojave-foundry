@@ -1,31 +1,365 @@
-//! The `sim` scaffold on a synthetic output directory: the mini Super-Duper
-//! Mart run through the whole pipeline (`common::mini_mart`, read only),
-//! then the source install and the Fallout 2 install deleted, then the
-//! stage run on what is left.
+//! The simulation stage (task T9) on synthetic output directories.
+//!
+//! The main test runs the linked two-storey mini mart with the Pass 2
+//! records (`common::mini_mart::write_sim`: a clerk with a greeting that
+//! sets a quest stage, a top-level topic, an enable group, a locked door
+//! with a key, a placed terminal, a sandbox package on a marker the slicer
+//! skips) through `all` with `sim = true`, then checks the layer: every
+//! program loads and passes the stack model of the engine's own VM, the
+//! tables parse back, the maps carry the script records, a second run is a
+//! cache hit, a forced one is byte-identical, `--report-only` writes
+//! nothing in the layer, and a run with `sim` off gives the map stage's
+//! layer exactly.
 
 mod common;
 
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use common::mini_mart::{self, key};
-use mojave_convert::placements::{self, Origin, PlacedKind};
-use mojave_convert::sim::{self, SimInputs};
+use mojave_convert::placements::{self, MarkerSource, Origin};
+use mojave_convert::sim::{self, SimInputs, SimOptions};
 use mojave_convert::{Inputs, Install, pipeline};
+use vault_formats::map::MapFile;
+use vault_formats::{ByteSource, GameProfile, LayeredVfs, LocalPrototypeCatalog, MemoryDir, Vfs};
 
-struct Built {
-    _fixture: common::Fixture,
-    inputs: Inputs,
+fn tree_of(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+    common::tree(dir).into_iter().collect()
 }
 
-impl Built {
-    fn out(&self) -> PathBuf {
-        self.inputs.out.clone()
+fn writing(f2: &Path) -> SimOptions {
+    SimOptions {
+        f2: Some(f2.to_owned()),
+        ..SimOptions::default()
     }
 }
 
-/// The mini mart converted to an output directory, with both installs
-/// removed afterwards: nothing but `--out` is left to read.
-fn built() -> Built {
+/// Every `.int` of a layer through `vault_vm`: loaded under the Fallout 2
+/// word set and checked by the stack model. Returns the failures.
+fn check_programs(layer: &BTreeMap<String, Vec<u8>>) -> (usize, Vec<String>) {
+    use vault_vm::stack_check::{self, Table};
+    use vault_vm::{IntProgram, WordSet};
+    let mut count = 0;
+    let mut failures = Vec::new();
+    for (path, bytes) in layer {
+        if !path.ends_with(".int") {
+            continue;
+        }
+        count += 1;
+        match IntProgram::parse_in(bytes, &WordSet::FALLOUT2, false) {
+            Err(e) => failures.push(format!("{path}: refused: {e}")),
+            Ok(program) => {
+                let findings =
+                    stack_check::check(path, &program, &Table::new(WordSet::FALLOUT2), &[]);
+                if !findings.is_empty() {
+                    failures.push(format!("{path}: {}", stack_check::summary(&findings)));
+                }
+            }
+        }
+    }
+    (count, failures)
+}
+
+/// The layer's maps, parsed with the layer's prototypes.
+fn maps_of(layer: &BTreeMap<String, Vec<u8>>, files: &[&str]) -> BTreeMap<String, MapFile> {
+    let tree = |files: Vec<(String, Vec<u8>)>| {
+        MemoryDir::new(
+            files
+                .into_iter()
+                .map(|(path, bytes)| (path, ByteSource::new(bytes).expect("bytes"))),
+        )
+        .expect("a tree")
+    };
+    let files_in: Vec<(String, Vec<u8>)> =
+        layer.iter().map(|(p, b)| (p.clone(), b.clone())).collect();
+    let vfs = LayeredVfs::new(
+        Arc::new(tree(Vec::new())),
+        vec![vault_formats::ModLayer::from_tree("test", tree(files_in))],
+    );
+    let catalog = LocalPrototypeCatalog::for_game(&vfs, GameProfile::Fallout2);
+    files
+        .iter()
+        .map(|file| {
+            let bytes = vfs.read(file).expect("the map");
+            let map = MapFile::parse_for(&bytes, &catalog, GameProfile::Fallout2).expect("parses");
+            ((*file).to_owned(), map)
+        })
+        .collect()
+}
+
+struct Run {
+    _fixture: common::Fixture,
+    f2: PathBuf,
+    on: Inputs,
+}
+
+fn run_pipeline(fixture: &common::Fixture, layer_file: &Path, out: &str) -> Inputs {
+    let mart_data = fixture.root.path().join("sim").join("Data");
+    let mut inputs = Inputs::from_args(
+        &Install::any(&mart_data, None),
+        Some(layer_file.to_str().expect("utf-8")),
+        &fixture.f2,
+        &fixture.root.path().join(out),
+        2,
+    )
+    .expect("inputs");
+    inputs.standalone = true;
+    inputs
+}
+
+fn built() -> (Run, mojave_convert::pipeline::AllSummary) {
+    let fixture = common::fixture();
+    let mart = mini_mart::write_sim(&fixture.root.path().join("sim"));
+    let on = run_pipeline(&fixture, &mart.layer_file, "out-sim");
+    let summary = pipeline::all(&on).expect("the pipeline runs");
+    (
+        Run {
+            f2: fixture.f2.clone(),
+            _fixture: fixture,
+            on,
+        },
+        summary,
+    )
+}
+
+#[test]
+fn all_with_sim_writes_a_layer_the_engine_loads_and_reruns_change_nothing() {
+    let (run, summary) = built();
+    let out = run.on.out.clone();
+    let layer_dir = run.on.mod_dir();
+
+    // The map stage's new inputs: markers, walk masks, exits.
+    let index = placements::read(&out).expect("reads").expect("the index");
+    assert_eq!(index.origin, Origin::Stage);
+    let marker = index
+        .markers
+        .iter()
+        .find(|m| m.reference == key(mini_mart::R_MARKER))
+        .unwrap_or_else(|| panic!("the skipped marker has a hex: {:?}", index.markers));
+    assert_eq!(marker.source, MarkerSource::Cell);
+    assert_eq!(marker.map, "mmstore");
+    let facts = placements::read_facts(&out)
+        .expect("reads")
+        .expect("map-sim.json");
+    let store = facts
+        .maps
+        .iter()
+        .find(|m| m.stem == "mmstore")
+        .expect("the store");
+    assert!(store.interior);
+    assert!(store.walkable.iter().any(|w| w.count > 0), "{store:?}");
+    let hexes = store.walkable[0].hexes().expect("runs parse");
+    assert_eq!(hexes.len() as u32, store.walkable[0].count);
+    assert!(
+        facts.maps.iter().any(|m| !m.exits.is_empty()),
+        "a door leads to the other map: {facts:?}"
+    );
+    assert!(
+        !out.join("mods/mojave")
+            .join(placements::FACTS_FILE)
+            .exists()
+    );
+
+    // The stage ran inside `all` and wrote the layer.
+    let outcome = summary.sim.expect("sim ran");
+    assert!(!outcome.cached);
+    let report = outcome.report.expect("a report");
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert!(report.program_count > 0, "{report:?}");
+    let layer = tree_of(&layer_dir);
+    let (programs, failures) = check_programs(&layer);
+    assert_eq!(programs, report.program_count);
+    assert!(failures.is_empty(), "{failures:#?}");
+    assert!(layer.contains_key("scripts/mfquest.int"), "the dispatcher");
+    assert!(
+        layer
+            .keys()
+            .any(|p| p.starts_with("text/english/dialog/md")),
+        "the clerk's dialogue file"
+    );
+
+    // The tables parse back through the engine's own parsers.
+    use vault_formats::fallout2::lines;
+    use vault_formats::fallout2::text::Diagnostics;
+    use vault_formats::{GamFile, GamSection, LstKind, LstTable};
+    let lst = LstTable::parse(&layer["scripts/scripts.lst"], LstKind::Script).expect("lst");
+    assert!(lst.entries().len() >= report.program_count);
+    GamFile::parse(&layer["data/vault13.gam"], GamSection::Campaign).expect("gam");
+    let quests =
+        lines::quests(&layer["data/quests.txt"], &mut Diagnostics::default()).expect("quests.txt");
+    assert!(!quests.is_empty(), "MMQuest's Pip-Boy row");
+    if let Some(holodisks) = layer.get("data/holodisk.txt") {
+        lines::holodisks(holodisks, &mut Diagnostics::default()).expect("holodisk.txt");
+    }
+    for (path, bytes) in &layer {
+        if path.ends_with(".msg") {
+            vault_formats::msg::MsgCatalog::parse_strict(bytes)
+                .unwrap_or_else(|e| panic!("{path}: {e}"));
+        }
+    }
+    let manifest = vault_formats::mod_manifest::ModManifest::parse(
+        &String::from_utf8(layer["vault-mod.toml"].clone()).expect("utf-8"),
+    )
+    .expect("manifest");
+    assert_eq!(manifest.global_scripts.len(), 1, "{manifest:?}");
+    assert_eq!(manifest.hooks.len(), 1);
+
+    // The clerk's object carries its program; the store has its map
+    // script.
+    let maps = maps_of(&layer, &["maps/mmstore.map", "maps/mmlot.map"]);
+    let store_map = &maps["maps/mmstore.map"];
+    let clerk = index
+        .placed
+        .iter()
+        .find(|p| p.reference.as_deref() == Some(key(mini_mart::R_CLERK).as_str()))
+        .expect("the clerk is placed");
+    let object = store_map.objects.elevations[usize::from(clerk.elevation)]
+        .iter()
+        .find(|o| Some(o.id) == clerk.object_id)
+        .expect("the clerk's object");
+    assert!(object.script_id >= 0, "the clerk has a script record");
+    let attached = report
+        .maps
+        .iter()
+        .find(|m| m.map == "mmstore")
+        .expect("attachments on the store");
+    assert!(attached.objects > 0);
+    assert!(attached.map_script.is_some());
+    assert_eq!(
+        store_map.header.script_reference,
+        attached.map_script.expect("a map script") as i32 + 1,
+        "the header stores the map script's row plus one"
+    );
+
+    // The report: sections, no path.
+    let text = std::fs::read_to_string(out.join(sim::REPORT_FILE)).expect("report");
+    for needle in [
+        "# Simulation layer report",
+        "## Sections (the lowering)",
+        "| dialogue |",
+        "| packages |",
+        "## Tables written",
+        "## Attachments per map",
+        "## Engine gaps hit",
+        "## Cache key",
+        &outcome.cache_key,
+    ] {
+        assert!(text.contains(needle), "no {needle:?} in\n{text}");
+    }
+    let root = run._fixture.root.path().to_string_lossy().into_owned();
+    assert!(!text.contains(&root), "a path in the report");
+
+    // A second run: a cache hit that changes nothing.
+    let started = std::time::Instant::now();
+    let again = sim::sim(&out, &writing(&run.f2)).expect("again");
+    assert!(again.cached, "a cache hit");
+    assert!(started.elapsed().as_secs_f64() < 5.0);
+    assert_eq!(again.cache_key, outcome.cache_key);
+    assert_eq!(tree_of(&layer_dir), layer);
+
+    // `all` again: the map stage reuses its output, sim is a cache hit.
+    let summary = pipeline::all(&run.on).expect("all again");
+    assert!(summary.map.reused);
+    assert!(summary.sim.expect("sim").cached);
+    assert_eq!(tree_of(&layer_dir), layer);
+
+    // A forced run: byte-identical layer and report.
+    let report_before = std::fs::read(out.join(sim::REPORT_FILE)).expect("report");
+    let forced = sim::sim(
+        &out,
+        &SimOptions {
+            force: true,
+            ..writing(&run.f2)
+        },
+    )
+    .expect("forced");
+    assert!(!forced.cached);
+    assert_eq!(forced.cache_key, outcome.cache_key);
+    assert_eq!(tree_of(&layer_dir), layer, "attaching does not stack");
+    assert_eq!(
+        std::fs::read(out.join(sim::REPORT_FILE)).expect("report"),
+        report_before
+    );
+
+    // `--report-only`: no install, nothing in the layer or the cache.
+    let cache_before = tree_of(&out.join("cache"));
+    std::fs::remove_file(out.join(sim::REPORT_FILE)).expect("remove the report");
+    let only = sim::sim(
+        &out,
+        &SimOptions {
+            report_only: true,
+            ..SimOptions::default()
+        },
+    )
+    .expect("report only");
+    assert!(!only.cached);
+    let only_report = only.report.expect("a report");
+    assert!(only_report.errors.is_empty(), "{:?}", only_report.errors);
+    assert!(only_report.program_count > 0);
+    assert!(out.join(sim::REPORT_FILE).is_file());
+    assert_eq!(tree_of(&layer_dir), layer);
+    assert_eq!(tree_of(&out.join("cache")), cache_before);
+
+    // Writing without an install is refused before anything is touched.
+    let error = sim::sim(
+        &out,
+        &SimOptions {
+            force: true,
+            ..SimOptions::default()
+        },
+    )
+    .expect_err("no --f2");
+    assert!(error.to_string().starts_with("--f2"), "{error}");
+
+    // With `sim` off, the layer is the map stage's alone: no scripts, and
+    // every file the stage replaced is the map stage's own copy.
+    let off_file = run.on.slice_file.clone().expect("the layer file");
+    let off_text = std::fs::read_to_string(&off_file)
+        .expect("layer file")
+        .replace("sim = true\n", "");
+    let off_path = off_file.with_file_name("nosim.layer.toml");
+    std::fs::write(&off_path, off_text).expect("write");
+    let off = run_pipeline(&run._fixture, &off_path, "out-nosim");
+    let off_summary = pipeline::all(&off).expect("the pipeline runs");
+    assert!(off_summary.sim.is_none());
+    let off_layer = tree_of(&off.mod_dir());
+    assert!(!off_layer.keys().any(|p| p.starts_with("scripts/")));
+    let mut expected = layer.clone();
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out.join(sim::STATE_DIR).join("state.json")).expect("state"),
+    )
+    .expect("json");
+    for path in state["written"].as_object().expect("written").keys() {
+        expected.remove(path);
+    }
+    // `README.txt` is written from the manifest, which lists the scripts.
+    expected.insert("README.txt".into(), off_layer["README.txt"].clone());
+    assert!(
+        !String::from_utf8_lossy(&off_layer["README.txt"]).contains("mfquest"),
+        "no script in the sim-off README"
+    );
+    for (path, bytes) in tree_of(&out.join(sim::STATE_DIR).join("pristine")) {
+        expected.insert(path, bytes);
+    }
+    assert_eq!(
+        off_layer.keys().collect::<Vec<_>>(),
+        expected.keys().collect::<Vec<_>>()
+    );
+    let differ: Vec<&String> = off_layer
+        .iter()
+        .filter(|(p, b)| expected.get(*p) != Some(*b))
+        .map(|(p, _)| p)
+        .collect();
+    assert!(
+        differ.is_empty(),
+        "the sim-off layer is the map stage's: {differ:?}"
+    );
+}
+
+/// The fallback path: no placement index, no install, report only.
+#[test]
+fn report_only_runs_on_a_reconstructed_index_and_bad_indexes_are_refused() {
     let fixture = common::fixture();
     let mart = mini_mart::write(&fixture.root.path().join("mart"));
     let mut inputs = Inputs::for_install(
@@ -37,329 +371,68 @@ fn built() -> Built {
     )
     .expect("inputs");
     inputs.standalone = true;
-    pipeline::all(&inputs).expect("the pipeline runs");
-    std::fs::remove_dir_all(fixture.root.path().join("mart")).expect("remove the source install");
+    let summary = pipeline::all(&inputs).expect("the pipeline runs");
+    assert!(summary.sim.is_none(), "sim is off by default");
+    let out = inputs.out.clone();
+    let layer_before = common::tree(&inputs.mod_dir());
+    std::fs::remove_dir_all(fixture.root.path().join("mart")).expect("remove the source");
     std::fs::remove_dir_all(&fixture.f2).expect("remove the Fallout 2 install");
-    Built {
-        _fixture: fixture,
-        inputs,
-    }
-}
 
-fn count(index: &placements::PlacementIndex, kind: PlacedKind) -> usize {
-    index.placed.iter().filter(|p| p.kind == kind).count()
-}
-
-#[test]
-fn the_scaffold_runs_on_the_output_alone_and_changes_nothing() {
-    let built = built();
-    let out = built.out();
-    let layer_before = common::tree(&built.inputs.mod_dir());
-    assert!(!layer_before.is_empty());
-    // The map stage wrote the index; without it the stage reconstructs one.
-    assert!(out.join(placements::FILE_NAME).is_file());
+    let good = SimInputs::load(&out, &SimOptions::default())
+        .expect("loads")
+        .index;
     std::fs::remove_file(out.join(placements::FILE_NAME)).expect("remove the index");
-    assert!(!out.join(sim::REPORT_FILE).exists());
-
-    let inputs = SimInputs::load(&out).expect("loads without the install");
-    assert!(!inputs.from_file);
-    assert_eq!(inputs.index.origin, Origin::Reconstructed);
-    assert_eq!(inputs.game, mojave_convert::GameVariant::Fallout3);
+    let options = SimOptions {
+        report_only: true,
+        ..SimOptions::default()
+    };
+    let loaded = SimInputs::load(&out, &options).expect("loads without the install");
+    assert!(!loaded.from_file);
     assert!(
-        inputs
+        loaded
             .warnings
             .iter()
-            .any(|w| w.starts_with(placements::FILE_NAME) && w.contains("reconstructed")),
+            .any(|w| w.starts_with(placements::FILE_NAME)),
         "{:?}",
-        inputs.warnings
+        loaded.warnings
     );
-
-    // The reconstruction sees what the map test sees: four people, the two
-    // filled containers, the rifle and the rounds on the floor, doors.
-    let index = &inputs.index;
-    assert_eq!(count(index, PlacedKind::Critter), 4, "{index:?}");
-    assert_eq!(count(index, PlacedKind::Container), 2);
-    assert!(count(index, PlacedKind::Item) >= 2);
-    assert!(count(index, PlacedKind::Door) >= 1);
-    assert!(index.placed.iter().all(|p| p.reference.is_none()));
-    assert!(
-        index
-            .placed
-            .iter()
-            .all(|p| p.object_id.is_some() && p.pid.is_some())
-    );
-    assert!(index.unplaced.is_empty());
-    let critters: Vec<_> = index.placed.iter().filter(|p| p.critter).collect();
-    assert!(
-        critters
-            .iter()
-            .all(|c| c.team.is_some() && c.ai_packet.is_some())
-    );
-    let ids: Vec<(u8, Option<u32>)> = index
-        .placed
-        .iter()
-        .map(|p| (p.elevation, p.object_id))
-        .collect();
-    let mut sorted = ids.clone();
-    sorted.sort();
-    assert_eq!(ids, sorted, "sorted by elevation and object id");
-
-    let report = sim::run(&inputs);
-    assert_eq!(report.critters.placed, 4);
-    assert_eq!(
-        report.critters.unresolved, 4,
-        "no references without the file"
-    );
-    assert_eq!(report.logic.scripts, 0);
-    assert!(report.cache_key.starts_with("sim-1:"));
-    assert_eq!(report.cache_key.len(), "sim-1:".len() + 64);
-
-    sim::write_report(&out, &report).expect("writes the report");
+    let outcome = sim::sim(&out, &options).expect("report only");
+    let report = outcome.report.expect("report");
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert!(outcome.cache_key.starts_with("sim-1:"));
+    assert_eq!(outcome.cache_key.len(), "sim-1:".len() + 64);
+    assert_eq!(common::tree(&inputs.mod_dir()), layer_before);
     let first = std::fs::read(out.join(sim::REPORT_FILE)).expect("report");
-    let text = String::from_utf8(first.clone()).expect("utf-8");
-    for needle in [
-        "# Simulation layer report (scaffold)",
-        "No scripts, dialogue or packages are compiled yet",
-        "- Programs compiled: 0 (Pass 2)",
-        "- Game: Fallout 3",
-        "- Placement index: reconstructed from the built maps",
-        "## Warnings",
-        "## Source logic for the placed set",
-        "## Whole extract (for scale)",
-        "| critters | 4 |",
-        &report.cache_key,
-    ] {
-        assert!(text.contains(needle), "no {needle:?} in\n{text}");
-    }
-    let root = built._fixture.root.path().to_string_lossy().into_owned();
-    assert!(!text.contains(&root), "a path in the report");
-
-    // A second run: same key, same bytes.
-    let again = SimInputs::load(&out).expect("loads again");
-    let second_report = sim::run(&again);
-    assert_eq!(second_report.cache_key, report.cache_key);
-    sim::write_report(&out, &second_report).expect("writes again");
+    sim::sim(&out, &options).expect("again");
     assert_eq!(
         std::fs::read(out.join(sim::REPORT_FILE)).expect("report"),
         first
     );
 
-    // The layer is as it was.
-    assert_eq!(common::tree(&built.inputs.mod_dir()), layer_before);
-
-    // The key follows its inputs: the map stage's key.
+    // The key follows the map stage's key.
+    let key = SimInputs::load(&out, &options).expect("loads").cache_key();
     std::fs::write(out.join("cache").join("map.key"), "another map run\n").expect("key");
-    let changed = SimInputs::load(&out).expect("loads");
-    assert_ne!(changed.cache_key(), report.cache_key);
-}
-
-#[test]
-fn a_placement_file_wins_and_resolves_references_through_the_mir() {
-    let built = built();
-    let out = built.out();
-    std::fs::remove_file(out.join(placements::FILE_NAME)).expect("the stage's index");
-    let fallback = SimInputs::load(&out).expect("fallback");
-    let fallback_key = fallback.cache_key();
-
-    // A stage-style file: the four people get the fixture's references.
-    let mut index = fallback.index.clone();
-    index.origin = Origin::Stage;
-    let people = [
-        mini_mart::R_GUNNER,
-        mini_mart::R_RAIDERS[0],
-        mini_mart::R_RAIDERS[1],
-        mini_mart::R_CLERK,
-    ];
-    let mut next = people.iter();
-    for entry in index.placed.iter_mut().filter(|p| p.critter) {
-        entry.reference = Some(key(*next.next().expect("four people")));
-    }
-    placements::write(&out, &index).expect("writes the index");
-
-    let inputs = SimInputs::load(&out).expect("loads with the file");
-    assert!(inputs.from_file);
-    assert!(inputs.warnings.is_empty(), "{:?}", inputs.warnings);
-    assert_eq!(inputs.index.placed.len(), index.placed.len());
-    // The bases came from the MIR's placed references.
-    let report = sim::run(&inputs);
-    assert_eq!(report.critters.placed, 4);
-    assert_eq!(report.critters.unresolved, 0, "{:?}", inputs.index.placed);
-    assert!(
-        inputs.index.placed.iter().filter(|p| p.critter).all(|p| {
-            p.base.is_some() && matches!(p.base_kind.as_deref(), Some("NPC_" | "CREA"))
-        })
+    assert_ne!(
+        SimInputs::load(&out, &options).expect("loads").cache_key(),
+        key
     );
-    assert_eq!(report.objects.unresolved, report.objects.placed);
-    assert_ne!(report.cache_key, fallback_key);
-    let text = report.to_markdown();
-    assert!(
-        text.contains("- Placement index: `map-placements.json`"),
-        "{text}"
-    );
-    assert!(!text.contains("## Warnings"));
-}
-
-#[test]
-fn an_index_from_another_run_is_refused() {
-    let built = built();
-    let out = built.out();
-    let good = SimInputs::load(&out).expect("fallback").index;
 
     let mut stale = good.clone();
     stale.maps[0].stem = "elsewhere".to_owned();
     placements::write(&out, &stale).expect("writes");
-    let error = SimInputs::load(&out).expect_err("a map the layer does not have");
+    let error = SimInputs::load(&out, &options).expect_err("a map the layer does not have");
     assert!(
         error.to_string().contains("not in the layer's manifest"),
         "{error}"
     );
-
     let mut other_game = good;
     other_game.game = "fnv".to_owned();
     placements::write(&out, &other_game).expect("writes");
-    let error = SimInputs::load(&out).expect_err("another game");
+    let error = SimInputs::load(&out, &options).expect_err("another game");
     assert!(error.to_string().contains("mixes two runs"), "{error}");
 
     std::fs::remove_file(out.join(placements::FILE_NAME)).expect("remove");
     std::fs::remove_dir_all(out.join("mir")).expect("remove the MIR");
-    let error = SimInputs::load(&out).expect_err("no MIR");
+    let error = SimInputs::load(&out, &options).expect_err("no MIR");
     assert!(error.to_string().starts_with("mir:"), "{error}");
-}
-
-/// The linked two-storey mini mart through the whole pipeline: the map
-/// stage writes `map-placements.json` (origin `stage`) beside its report,
-/// every placed object id is the written map's object at that elevation and
-/// hex with that PID, and `sim` reads the file and resolves every critter.
-#[test]
-fn the_layer_stage_writes_the_index_and_sim_reads_it() {
-    use std::collections::BTreeMap;
-    use std::sync::Arc;
-    use vault_formats::map::MapFile;
-    use vault_formats::{
-        ByteSource, GameProfile, LayeredVfs, LocalPrototypeCatalog, MemoryDir, Vfs,
-    };
-
-    let fixture = common::fixture();
-    let mart = mini_mart::write_linked(&fixture.root.path().join("linked"));
-    let mut inputs = Inputs::from_args(
-        &Install::any(&mart.data_dir, None),
-        Some(mart.layer_file.to_str().expect("utf-8")),
-        &fixture.f2,
-        &fixture.root.path().join("out-linked"),
-        2,
-    )
-    .expect("inputs");
-    inputs.standalone = true;
-    pipeline::all(&inputs).expect("the pipeline runs");
-    let out = inputs.out.clone();
-    let text = std::fs::read_to_string(out.join(placements::FILE_NAME)).expect("the index");
-    assert!(
-        !inputs.mod_dir().join(placements::FILE_NAME).exists(),
-        "not in the layer"
-    );
-    let index = placements::PlacementIndex::from_text(&text).expect("parses");
-    assert_eq!(index.origin, Origin::Stage);
-    assert_eq!(index.game, mojave_convert::GameVariant::Fallout3.id());
-    let stems: Vec<&str> = index.maps.iter().map(|m| m.stem.as_str()).collect();
-    assert!(
-        stems.contains(&"mmlot") && stems.contains(&"mmstore"),
-        "{stems:?}"
-    );
-
-    // Every object id is the written map's, at the same elevation and hex,
-    // with the same PID.
-    let layer = map_builder::read_layer(&inputs.mod_dir()).expect("reads back");
-    let tree = |files: Vec<(String, Vec<u8>)>| {
-        MemoryDir::new(
-            files
-                .into_iter()
-                .map(|(path, bytes)| (path, ByteSource::new(bytes).expect("bytes"))),
-        )
-        .expect("a tree")
-    };
-    let mut files: Vec<(String, Vec<u8>)> = layer
-        .files()
-        .iter()
-        .map(|(p, b)| (p.clone(), b.clone()))
-        .collect();
-    files.push((
-        "vault-mod.toml".into(),
-        layer.manifest_text().expect("manifest").into_bytes(),
-    ));
-    let vfs = LayeredVfs::new(
-        Arc::new(tree(Vec::new())),
-        vec![vault_formats::ModLayer::from_tree("test", tree(files))],
-    );
-    let catalog = LocalPrototypeCatalog::for_game(&vfs, GameProfile::Fallout2);
-    let mut objects: BTreeMap<(String, u8, u32), (i32, u32)> = BTreeMap::new();
-    for entry in &index.maps {
-        let bytes = vfs.read(&entry.file).expect("the map");
-        let map = MapFile::parse_for(&bytes, &catalog, GameProfile::Fallout2).expect("parses");
-        for (e, list) in map.objects.elevations.iter().enumerate() {
-            for o in list {
-                if let Some(hex) = o.hex {
-                    objects.insert((entry.stem.clone(), e as u8, o.id), (hex, o.pid));
-                }
-            }
-        }
-    }
-    assert!(!index.placed.is_empty());
-    for p in &index.placed {
-        let id = p.object_id.unwrap_or_else(|| panic!("{p:?} has an object"));
-        let (hex, pid) = objects
-            .get(&(p.map.clone(), p.elevation, id))
-            .unwrap_or_else(|| panic!("{p:?} is not on its map"));
-        assert_eq!((*hex, Some(*pid)), (p.hex, p.pid), "{p:?}");
-        assert!(p.reference.is_some(), "{p:?}");
-        assert_eq!(p.critter, *pid >> 24 == 1, "{p:?}");
-    }
-    let people = [
-        mini_mart::R_GUNNER,
-        mini_mart::R_RAIDERS[0],
-        mini_mart::R_RAIDERS[1],
-        mini_mart::R_CLERK,
-    ];
-    for person in people {
-        let reference = key(person);
-        let placed = index
-            .placed
-            .iter()
-            .find(|p| p.reference.as_deref() == Some(reference.as_str()))
-            .unwrap_or_else(|| panic!("{reference} placed"));
-        assert_eq!(placed.kind, PlacedKind::Critter);
-        assert!(placed.team.is_some() && placed.ai_packet.is_some());
-    }
-    assert!(count(&index, PlacedKind::Container) >= 1, "{index:?}");
-    assert!(count(&index, PlacedKind::Door) >= 1, "{index:?}");
-    // The raider upstairs is on the store's elevation 1.
-    assert!(
-        index
-            .placed
-            .iter()
-            .any(|p| p.critter && p.map == "mmstore" && p.elevation == 1),
-        "{index:?}"
-    );
-
-    // `sim` reads it: from the file, every critter's base known.
-    let sim_inputs = SimInputs::load(&out).expect("loads");
-    assert!(sim_inputs.from_file);
-    assert_eq!(sim_inputs.index.origin, Origin::Stage);
-    let report = sim::run(&sim_inputs);
-    assert!(report.critters.placed >= 5, "{:?}", report.critters);
-    assert_eq!(report.critters.unresolved, 0);
-    assert!(
-        !sim_inputs
-            .warnings
-            .iter()
-            .any(|w| w.contains("not in the index")),
-        "{:?}",
-        sim_inputs.warnings
-    );
-
-    // A rerun reuses the stage and keeps the file.
-    assert!(mojave_convert::map::map(&inputs).expect("again").reused);
-    assert_eq!(
-        std::fs::read_to_string(out.join(placements::FILE_NAME)).expect("the index"),
-        text
-    );
 }
