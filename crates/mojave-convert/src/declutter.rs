@@ -449,9 +449,140 @@ pub fn profile(
     Ok(Some(out))
 }
 
+/// Lays two readability dials (the `[readability]` table's
+/// `ground_calm`, `foreground_kerb_narrow` and `narrow_width_hexes`) over
+/// a run's declutter profile:
+///
+/// - `ground_calm` (0 to 1) calms the floor tone
+///   (`foundry_render::ClassTones::calmed`): the baked floor, the floor
+///   overlays and, where the terrain takes the floor tone, the terrain.
+///   Props, walls and figures keep their tones. 0 changes nothing.
+/// - `foreground_kerb_narrow` (units, 0 to the cutaway's kerb) cuts the
+///   cutaway's strips beside a walkable band at most `narrow_width_hexes`
+///   (at least 1) hexes across to that kerb
+///   (`map_slicer::Cutaway::narrow_kerb_height`). `None` changes nothing.
+///   Indoors, and outdoors with `cutaway_exteriors = true`, it lowers the
+///   kerb of those cut strips; outdoors without `cutaway_exteriors` the
+///   cutaway runs for it alone and cuts only those strips (a catwalk's
+///   railing), leaving every other exterior strip whole.
+///
+/// Both belong to the readable pass: with `profile` `None` (the pass off)
+/// a dial away from its default is an error naming the way out. At their
+/// defaults the profile is left exactly as it was.
+pub fn apply_readability(
+    profile: Option<&mut map_slicer::DeclutterProfile>,
+    ground_calm: f64,
+    foreground_kerb_narrow: Option<f64>,
+    narrow_width_hexes: u32,
+) -> Result<(), String> {
+    if !(ground_calm.is_finite() && (0.0..=1.0).contains(&ground_calm)) {
+        return Err(format!(
+            "readability ground_calm {ground_calm} is outside [0, 1]"
+        ));
+    }
+    if narrow_width_hexes < 1 {
+        return Err("readability narrow_width_hexes must be at least 1".to_owned());
+    }
+    let calm = ground_calm > 0.0;
+    let Some(profile) = profile else {
+        if calm || foreground_kerb_narrow.is_some() {
+            return Err(
+                "readability ground_calm and foreground_kerb_narrow act on the declutter pass, \
+                 which is off; pass --declutter readable or set profile = \"readable\""
+                    .to_owned(),
+            );
+        }
+        return Ok(());
+    };
+    if calm {
+        profile.tones = profile.tones.calmed(ground_calm as f32);
+    }
+    if let Some(kerb) = foreground_kerb_narrow {
+        let Some(cutaway) = profile.cutaway.as_mut() else {
+            return Err(
+                "readability foreground_kerb_narrow needs the cutaway, which the slice turns off \
+                 (cutaway = false)"
+                    .to_owned(),
+            );
+        };
+        if !(kerb.is_finite() && kerb >= 0.0 && kerb <= f64::from(cutaway.kerb_height)) {
+            return Err(format!(
+                "readability foreground_kerb_narrow {kerb} must be from 0 to the kerb ({})",
+                cutaway.kerb_height
+            ));
+        }
+        cutaway.narrow_kerb_height = Some(kerb as f32);
+        cutaway.narrow_max_width = narrow_width_hexes;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_readability_dials_at_their_defaults_change_nothing() {
+        let none = BTreeSet::new();
+        let preset = profile(GameVariant::Fallout3, "readable", None, None, &none)
+            .unwrap()
+            .unwrap();
+        let mut dialled = preset.clone();
+        apply_readability(Some(&mut dialled), 0.0, None, 3).unwrap();
+        assert_eq!(dialled, preset);
+        // Off with the defaults: fine; with a dial set: refused.
+        assert_eq!(apply_readability(None, 0.0, None, 3), Ok(()));
+        assert!(apply_readability(None, 0.5, None, 3).is_err());
+        assert!(apply_readability(None, 0.0, Some(16.0), 3).is_err());
+    }
+
+    #[test]
+    fn the_readability_dials_calm_the_floor_and_lower_the_narrow_kerb() {
+        let none = BTreeSet::new();
+        let preset = profile(GameVariant::Fallout3, "readable", None, None, &none)
+            .unwrap()
+            .unwrap();
+        let mut dialled = preset.clone();
+        apply_readability(Some(&mut dialled), 0.5, Some(16.0), 2).unwrap();
+        assert_eq!(dialled.tones, preset.tones.calmed(0.5));
+        assert_eq!(dialled.tones.props, preset.tones.props);
+        assert!(dialled.tones.floor.gain < preset.tones.floor.gain);
+        let cutaway = dialled.cutaway.as_ref().unwrap();
+        assert_eq!(cutaway.narrow_kerb_height, Some(16.0));
+        assert_eq!(cutaway.narrow_max_width, 2);
+        // Everything else as the preset.
+        let mut back = dialled.clone();
+        back.tones = preset.tones;
+        if let Some(c) = back.cutaway.as_mut() {
+            c.narrow_kerb_height = None;
+            c.narrow_max_width = 3;
+        }
+        assert_eq!(back, preset);
+        // Out of range.
+        for (calm, kerb, width) in [
+            (1.5, None, 3),
+            (f64::NAN, None, 3),
+            (0.0, Some(40.0), 3),
+            (0.0, Some(-1.0), 3),
+            (0.0, Some(16.0), 0),
+        ] {
+            let mut p = preset.clone();
+            assert!(
+                apply_readability(Some(&mut p), calm, kerb, width).is_err(),
+                "{calm} {kerb:?} {width}"
+            );
+        }
+        // The cutaway off: the narrow kerb has nothing to act on.
+        let spec = DeclutterSpec {
+            cutaway: Some(false),
+            ..DeclutterSpec::default()
+        };
+        let mut uncut = profile(GameVariant::Fallout3, "readable", Some(&spec), None, &none)
+            .unwrap()
+            .unwrap();
+        assert!(apply_readability(Some(&mut uncut), 0.0, Some(16.0), 3).is_err());
+        assert!(apply_readability(Some(&mut uncut), 0.5, None, 3).is_ok());
+    }
 
     #[test]
     fn off_is_no_profile_and_refuses_settings() {

@@ -14,6 +14,7 @@ pub mod map;
 pub mod pipeline;
 pub mod placements;
 pub mod probe;
+pub mod readability;
 pub mod rebalance;
 pub mod replay;
 pub mod route;
@@ -23,6 +24,7 @@ pub mod sim;
 pub mod source;
 pub mod sprites;
 pub mod timings;
+pub mod view_fit;
 
 pub use config::{ConvertError, Inputs, SliceSpec};
 pub use mir::GameVariant;

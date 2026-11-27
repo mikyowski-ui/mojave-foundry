@@ -350,8 +350,10 @@ pub struct Perch {
 /// made not walkable, and recorded on its elevation
 /// ([`ElevationPlan::closed`]) with what it held, except a component a
 /// critter would stand on, judged from the critter's own source position
-/// before anything is closed: that stays walkable and is recorded as a
-/// [`Perch`]. The sealing border is laid again. Returns the hexes closed.
+/// before anything is closed, or one holding a link's exit grid: that
+/// stays walkable and is recorded as a [`Perch`] (holding the people's
+/// names, or the link). The sealing border is laid again. Returns the
+/// hexes closed.
 pub(crate) fn close_unreached(plans: &mut [MapPlan]) -> usize {
     let Some(reached) = planned_reach(plans) else {
         return 0;
@@ -383,12 +385,28 @@ pub(crate) fn close_unreached(plans: &mut [MapPlan]) -> usize {
                 continue;
             }
             let comps = islands::components(|h| open[h as usize]);
+            // A link's grids: a component holding one is kept walkable, so
+            // that no exit grid leads onto, or stands on, land outside the
+            // sealing border (two unreached ends of one stair would
+            // otherwise each arrive on an unsealed hex).
+            let link_grids: Vec<(i32, String)> = elevation
+                .links
+                .iter()
+                .flat_map(|link| {
+                    let label = match link.kind {
+                        LinkKind::Door => format!("door {}", link.from),
+                        LinkKind::Stairs => format!("stairs {}", link.from),
+                    };
+                    link.grid.iter().map(move |hex| (*hex, label.clone()))
+                })
+                .collect();
             for id in 0..comps.len() {
                 let Some(first_hex) = comps.first_hex(id) else {
                     continue;
                 };
                 let mut who: Vec<String> = names
                     .iter()
+                    .chain(link_grids.iter())
                     .filter(|(hex, _)| comps.of(*hex) == Some(id))
                     .map(|(_, who)| who.clone())
                     .collect();

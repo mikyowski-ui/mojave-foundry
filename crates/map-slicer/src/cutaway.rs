@@ -25,6 +25,11 @@ pub(crate) struct Trim<'a> {
     /// The origin's height above the wall's foot: the lowest point of its
     /// placed bounds, but not below the floor band (the terrain outdoors).
     pub lift: f32,
+    /// Only the strips beside a narrow walkway are cut (to the narrow
+    /// kerb), every other strip is left whole: the cutaway outdoors when
+    /// only [`Cutaway::narrow_kerb_height`] asks for it
+    /// (`Cutaway::exteriors` off).
+    pub narrow_only: bool,
 }
 
 /// What the cutaway did to one reference.
@@ -37,8 +42,159 @@ pub(crate) struct Trimmed {
     pub emptied: Vec<i32>,
     /// The hexes of every strip cut.
     pub cut_hexes: Vec<i32>,
+    /// Of the strips cut, those cut to the narrow-walkway kerb
+    /// ([`Cutaway::narrow_kerb_height`]).
+    pub narrow: usize,
     pub covered_before: BTreeSet<i32>,
     pub covered_after: BTreeSet<i32>,
+}
+
+/// Hexes that are not walkable a band measurement steps over before the
+/// band starts: the wall's own footprint.
+const WALL_SKIP: u32 = 2;
+
+/// Strips of the same wall within this many hex steps give the wall's line
+/// at a strip ([`band_behind`]).
+const WALL_LINE_REACH: i32 = 4;
+
+/// `sqrt(3) / 2`: a hex row's height in hex steps.
+const ROW: f64 = 0.866_025_403_784_438_6;
+
+/// Map screen space to the regular hex lattice: every hex step is one
+/// unit long (`(32, 0)` and `(16, 12)` on screen).
+fn lattice(p: [i64; 2]) -> [f64; 2] {
+    [p[0] as f64 / 32.0, p[1] as f64 * ROW / 12.0]
+}
+
+fn screen_of_lattice(l: [f64; 2]) -> [f64; 2] {
+    [l[0] * 32.0, l[1] * 12.0 / ROW]
+}
+
+/// The unit normal, pointing away from the camera (up on screen), of the
+/// line through the hex centres `points` (lattice space): the principal
+/// axis of their spread, turned a quarter. `None` for fewer than two
+/// distinct points.
+fn behind_normal(points: &[[f64; 2]]) -> Option<[f64; 2]> {
+    let n = points.len() as f64;
+    if points.len() < 2 {
+        return None;
+    }
+    let mean = points
+        .iter()
+        .fold([0.0, 0.0], |m, p| [m[0] + p[0] / n, m[1] + p[1] / n]);
+    let (mut a, mut b, mut c) = (0.0, 0.0, 0.0);
+    for p in points {
+        let d = [p[0] - mean[0], p[1] - mean[1]];
+        a += d[0] * d[0];
+        b += d[0] * d[1];
+        c += d[1] * d[1];
+    }
+    if a + c < 1.0e-9 {
+        return None;
+    }
+    // The larger eigenvalue's eigenvector of [[a, b], [b, c]].
+    let half = (a - c) / 2.0;
+    let lambda = (a + c) / 2.0 + (half * half + b * b).sqrt();
+    let axis = if a >= c {
+        [lambda - c, b]
+    } else {
+        [b, lambda - a]
+    };
+    let len = (axis[0] * axis[0] + axis[1] * axis[1]).sqrt();
+    if len < 1.0e-12 {
+        return None;
+    }
+    let mut normal = [-axis[1] / len, axis[0] / len];
+    if normal[1] > 0.0 || (normal[1] == 0.0 && normal[0] < 0.0) {
+        normal = [-normal[0], -normal[1]];
+    }
+    Some(normal)
+}
+
+/// Counts the band along a sequence of hexes leaving the strip: past at
+/// most [`WALL_SKIP`] hexes outside `walkers`, the walkable hexes up to the
+/// next one outside them, at most `cap + 1`. `None` when no walkable hex
+/// comes within the skip.
+fn count_band(hexes: impl Iterator<Item = i32>, walkers: &BTreeSet<i32>, cap: u32) -> Option<u32> {
+    let (mut skipped, mut run) = (0u32, 0u32);
+    for h in hexes {
+        if walkers.contains(&h) {
+            run += 1;
+            if run > cap {
+                break;
+            }
+        } else if run == 0 {
+            skipped += 1;
+            if skipped > WALL_SKIP {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    (run > 0).then_some(run)
+}
+
+/// The walkable band behind the strip on hex `strip` (the `declutter`
+/// module, rule 4, narrow walkways), counted to at most `cap + 1` hexes.
+///
+/// With other strips of the same wall near it (`wall`, hexes within
+/// [`WALL_LINE_REACH`] steps), across the wall: from the strip's centre
+/// along the normal of their line pointing away from the camera, every
+/// hex the line enters. A lone strip measures along both up-screen hex
+/// directions and takes the narrower. `None` when no walkable hex lies
+/// just behind the strip.
+pub(crate) fn band_behind(
+    strip: i32,
+    wall: &[i32],
+    walkers: &BTreeSet<i32>,
+    cap: u32,
+) -> Option<u32> {
+    let centre = hex::center(strip)?;
+    let mut points: Vec<[f64; 2]> = vec![lattice(centre)];
+    for &h in wall {
+        if h != strip
+            && hex::distance(h, strip) <= WALL_LINE_REACH
+            && let Some(c) = hex::center(h)
+        {
+            points.push(lattice(c));
+        }
+    }
+    if let Some(normal) = behind_normal(&points) {
+        let start = lattice(centre);
+        let reach = f64::from(WALL_SKIP + cap + 2);
+        let mut seen = BTreeSet::from([strip]);
+        let mut along = Vec::new();
+        let mut t = 0.0;
+        while t <= reach {
+            let p = screen_of_lattice([start[0] + normal[0] * t, start[1] + normal[1] * t]);
+            match hex::pick(p) {
+                Some(h) => {
+                    if seen.insert(h) {
+                        along.push(h);
+                    }
+                }
+                None => break,
+            }
+            t += 0.125;
+        }
+        return count_band(along.into_iter(), walkers, cap);
+    }
+    // A lone strip: the up-screen hex directions.
+    let mut best: Option<u32> = None;
+    for (o, first) in hex::neighbours(strip).into_iter().enumerate() {
+        if !first
+            .and_then(hex::center)
+            .is_some_and(|c| c[1] < centre[1])
+        {
+            continue;
+        }
+        let steps = std::iter::successors(first, |&h| hex::neighbours(h)[o]);
+        if let Some(run) = count_band(steps, walkers, cap) {
+            best = Some(best.map_or(run, |b| b.min(run)));
+        }
+    }
+    best
 }
 
 /// The height above the foot of the surface each canvas pixel shows
@@ -287,12 +443,48 @@ pub(crate) fn trim(
             }
         }
     }
+    // Beside a narrow walkway, the lower kerb: the cut strips with a narrow
+    // band behind them, and the cut strips with no band at all (a wall's
+    // end past the walkway) within [`WALL_LINE_REACH`] (or `spread`) steps
+    // of one, so the cut line stays level along the wall.
+    let mut narrow: BTreeSet<i32> = BTreeSet::new();
+    if trim.settings.narrow_kerb_height.is_some() {
+        let wall: Vec<i32> = by_strip.keys().copied().collect();
+        let cap = trim.settings.narrow_max_width;
+        let mut bandless = Vec::new();
+        for &strip in &cut {
+            match band_behind(strip, &wall, trim.walkers, cap) {
+                Some(w) if w <= cap => {
+                    narrow.insert(strip);
+                }
+                Some(_) => {}
+                None => bandless.push(strip),
+            }
+        }
+        let spread = trim.settings.spread.max(WALL_LINE_REACH);
+        let follow: Vec<i32> = bandless
+            .into_iter()
+            .filter(|&s| narrow.iter().any(|&n| hex::distance(s, n) <= spread))
+            .collect();
+        narrow.extend(follow);
+    }
+    // Outdoors on the narrow rule alone: the other strips stay whole.
+    if trim.narrow_only {
+        cut.retain(|s| narrow.contains(s));
+    }
     for (strip, pixels) in by_strip {
         let before = hides.remove(&strip).unwrap_or_default();
         if !cut.contains(&strip) {
             out.covered_after.extend(before);
             continue;
         }
+        let kerb = match trim.settings.narrow_kerb_height {
+            Some(low) if narrow.contains(&strip) => {
+                out.narrow += 1;
+                f64::from(low)
+            }
+            _ => kerb,
+        };
         // Column by column, from the bottom up: the first pixel above the
         // kerb and everything drawn above it leave, so the cut line is
         // clean (a lower surface seen past an edge does not stick out).

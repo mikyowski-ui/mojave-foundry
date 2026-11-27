@@ -6,7 +6,11 @@
 //! 1. **Ground colour**, per screen pixel of map screen space
 //!    (`HexGrid::default()`): the pixel centre is taken to the ground plane
 //!    through the projection's screen vectors and its `tile_from_source`,
-//!    so yaw and units come from [`Projection`] alone. At the source point,
+//!    so units come from [`Projection`] alone. A world turned by the
+//!    readability yaw (`GroundSampler::yaw`) is drawn by turning that ground
+//!    point back to source space before the land is read: the textures, the
+//!    opacity masks and the vertex colours turn with the world, and the
+//!    sampler's normal is turned forward into the map. At the source point,
 //!    the quadrant's base layer is blended with each alpha layer in
 //!    ascending layer order (opacity bilinear over the quadrant's 17 × 17
 //!    grid), multiplied by the vertex colour (bilinear over 33 × 33) and by
@@ -622,7 +626,7 @@ pub fn build_ground_from(
         // Only the dither phase repeats: by the parity of s.
         (f64::from(options.texture_repeat_units), [2, 1])
     };
-    let land = terrain::Terrain::load(source, &geometry, options, repeat)?;
+    let land = terrain::Terrain::load(source, &geometry, options, repeat, sampler.yaw())?;
     let load_time = started.elapsed();
 
     let started = Instant::now();

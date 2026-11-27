@@ -261,6 +261,23 @@ pub struct SlicerConfig {
     /// holds one of 69 triangles), which the key light draws as a blank
     /// white plane. Default `false`: every shape drawn, as before.
     pub skip_flat_fills: bool,
+    /// Readability dial `wall_z_scale`: the height of every sliced
+    /// reference whose base kind is in [`SlicerConfig::wall_kinds`] (walls
+    /// and building shells; never a landmark, a sprite, a door, an item or
+    /// relief) is drawn scaled by this about its anchor (the terrain under
+    /// its origin, or the floor indoors), so its roofs and upper storeys
+    /// move down with it. The ceiling cut and the floor bake work on the
+    /// source heights first; the cutaway's kerb keeps its drawn height.
+    /// Walkability does not change. 1 (the default): drawn as before.
+    pub wall_z_scale: f32,
+    /// The base kinds whose sliced references [`SlicerConfig::wall_z_scale`]
+    /// compresses: `STAT` and `SCOL`.
+    pub wall_kinds: Vec<String>,
+    /// Readability dial `units_per_hex`: the horizontal scale an item sprite
+    /// (`Role::Item`) is drawn with, so that it keeps its size when the
+    /// projection spreads the ground out (the map's units per hex over the
+    /// calibration's). 1 (the default): drawn as before.
+    pub item_scale: f32,
 }
 
 /// Whether a material blends by multiplying what is behind it: blending
@@ -467,6 +484,9 @@ impl Default for SlicerConfig {
             flat_references: BTreeSet::new(),
             skip_blend_shapes: false,
             skip_flat_fills: false,
+            wall_z_scale: 1.0,
+            wall_kinds: strings(&["STAT", "SCOL"]),
+            item_scale: 1.0,
         }
     }
 }
@@ -515,6 +535,11 @@ impl SlicerConfig {
         }
         if self.landmark_max_pieces == 0 {
             return bad("landmark_max_pieces must be at least 1");
+        }
+        if !(self.wall_z_scale.is_finite() && self.wall_z_scale > 0.0)
+            || !(self.item_scale.is_finite() && self.item_scale > 0.0)
+        {
+            return bad("wall_z_scale and item_scale must be finite and positive");
         }
         let [left, top, right, bottom] = self.landmark_reach.map(u64::from);
         let [width, height] = self.landmark_piece_max.map(u64::from);

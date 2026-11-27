@@ -209,6 +209,68 @@ fn elevation_for(plan: &MapPlan, point: [f32; 3]) -> Option<(usize, f32)> {
 }
 
 /// Phase B over every plan (module notes).
+/// A stair landing whose walkable component holds at most this many hexes,
+/// and nothing else to go to, is a dead end
+/// ([`crate::LayerOptions::prune_dead_end_stairs`]).
+pub(crate) const DEAD_END_HEXES: usize = 60;
+
+/// Drops the stairs with a dead-end landing (the option's notes).
+fn prune_dead_end_stairs(plans: &mut [MapPlan], layer: &LayerInput) {
+    let mut dead: BTreeMap<usize, String> = BTreeMap::new();
+    for plan in plans.iter() {
+        for (e, elevation) in plan.elevations.iter().enumerate() {
+            if elevation.stair_grids.is_empty() {
+                continue;
+            }
+            let walkable = &elevation.walkable;
+            let comps = islands::components(|h| walkable[h as usize]);
+            for (s, grid, _) in &elevation.stair_grids {
+                let Some(id) = grid.iter().find_map(|h| comps.of(*h)) else {
+                    continue;
+                };
+                let size = comps.sizes()[id];
+                if size > DEAD_END_HEXES {
+                    continue;
+                }
+                let other_stair = elevation
+                    .stair_grids
+                    .iter()
+                    .any(|(t, g, _)| t != s && g.iter().any(|h| comps.of(*h) == Some(id)));
+                let door = elevation.doors.iter().any(|d| {
+                    std::iter::once(d.door_hex)
+                        .chain(crate::walk::neighbours(d.door_hex))
+                        .any(|h| comps.of(h) == Some(id))
+                });
+                if !other_stair && !door {
+                    dead.entry(*s).or_insert_with(|| {
+                        format!(
+                            "its landing on elevation {e} is a dead end ({size} walkable hexes, no other stair or door there)"
+                        )
+                    });
+                }
+            }
+        }
+    }
+    if dead.is_empty() {
+        return;
+    }
+    for plan in plans.iter_mut() {
+        for elevation in &mut plan.elevations {
+            let mut kept = Vec::new();
+            for entry in std::mem::take(&mut elevation.stair_grids) {
+                match dead.get(&entry.0) {
+                    Some(why) => elevation.skipped.push(SkippedTeleport {
+                        door: format!("stairs {}", layer.stairs[entry.0].label),
+                        reason: format!("dropped: {why}"),
+                    }),
+                    None => kept.push(entry),
+                }
+            }
+            elevation.stair_grids = kept;
+        }
+    }
+}
+
 pub(crate) fn resolve(
     plans: &mut [MapPlan],
     layer: &LayerInput,
@@ -247,6 +309,9 @@ pub(crate) fn resolve(
                 }),
             }
         }
+    }
+    if layer.options.prune_dead_end_stairs {
+        prune_dead_end_stairs(plans, layer);
     }
     // Stub exits, their returns avoiding every grid of the elevation.
     for plan in plans.iter_mut() {

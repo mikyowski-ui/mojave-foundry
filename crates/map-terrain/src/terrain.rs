@@ -3,7 +3,9 @@
 use std::collections::BTreeMap;
 
 use foundry_render::{Calibration, Projection};
-use mir::{CELL_UNITS, GroundSampler, Image, LAND_GRID, LAND_SPACING, LandDoc, LandLayer, Mir};
+use mir::{
+    CELL_UNITS, GroundSampler, Image, LAND_GRID, LAND_SPACING, LandDoc, LandLayer, Mir, WorldYaw,
+};
 
 use crate::texture::Prefiltered;
 use crate::{TerrainError, TerrainOptions};
@@ -352,6 +354,9 @@ pub(crate) struct Terrain {
     vertex_floor: f32,
     /// Sub-sample offsets in source units, relative to the pixel centre.
     offsets: Vec<[f64; 2]>,
+    /// Map space (the world as turned, `GroundSampler::yaw`) back to
+    /// source space, where the land lies; `None` for no turn.
+    to_source: Option<WorldYaw>,
     pub cells_with_land: usize,
     pub cells_without_land: usize,
     pub missing_layers: usize,
@@ -378,12 +383,18 @@ impl Terrain {
     /// Loads every cell under the map's squares (tile space `-2..102` on
     /// both axes) and the textures their layers name, prefiltered for a
     /// texture repeat of `repeat` source units.
+    ///
+    /// `yaw` is the turn of the world the map draws (the sampler's,
+    /// `GroundSampler::yaw`): the geometry gives map points, which are
+    /// turned back to source space before any land is read.
     pub fn load(
         source: &dyn LandSource,
         geometry: &Geometry,
         options: &TerrainOptions,
         repeat: f64,
+        yaw: Option<WorldYaw>,
     ) -> Result<Self, TerrainError> {
+        let to_source = yaw.filter(|y| !y.is_identity()).map(|y| y.inverse());
         let corners = [[-2.0, -2.0], [102.0, -2.0], [-2.0, 102.0], [102.0, 102.0]];
         let mut lo = [f64::INFINITY; 2];
         let mut hi = [f64::NEG_INFINITY; 2];
@@ -391,6 +402,10 @@ impl Terrain {
             let p = geometry
                 .source_of_tile(st)
                 .ok_or(TerrainError::Projection)?;
+            let p = match &to_source {
+                Some(back) => back.apply_xy64(p[0], p[1]),
+                None => p,
+            };
             for k in 0..2 {
                 lo[k] = lo[k].min(p[k]);
                 hi[k] = hi[k].max(p[k]);
@@ -474,6 +489,7 @@ impl Terrain {
             fallback_rgb: options.fallback_rgb.map(f32::from),
             vertex_floor: options.vertex_color_floor,
             offsets: Vec::new(),
+            to_source,
             cells_with_land: 0,
             cells_without_land: 0,
             missing_layers: 0,
@@ -503,7 +519,11 @@ impl Terrain {
                     (f64::from(i) + 0.5) / f64::from(n) - 0.5,
                     (f64::from(j) + 0.5) / f64::from(n) - 0.5,
                 ];
-                terrain.offsets.push(geometry.source_delta(d));
+                let delta = geometry.source_delta(d);
+                terrain.offsets.push(match &terrain.to_source {
+                    Some(back) => back.apply_offset(delta),
+                    None => delta,
+                });
             }
         }
         Ok(terrain)
@@ -678,18 +698,24 @@ impl Terrain {
         Some((cell, u, v))
     }
 
-    /// The ground colour of the screen pixel whose centre is at source
-    /// `(x, y)`: layers sampled at every sub-sample, everything smooth
-    /// (opacity, vertex colour, relief) at the centre.
+    /// The ground colour of the screen pixel whose centre is at map
+    /// `(x, y)` (source space unless the world is turned): layers sampled
+    /// at every sub-sample, everything smooth (opacity, vertex colour,
+    /// relief) at the centre.
     pub fn ground(
         &self,
         scratch: &mut Scratch,
         sampler: &GroundSampler,
         geometry: &Geometry,
         shading: &Shading,
-        x: f64,
-        y: f64,
+        map_x: f64,
+        map_y: f64,
     ) -> Sample {
+        // The land is read in source space; the sampler takes map points.
+        let [x, y] = match &self.to_source {
+            Some(back) => back.apply_xy64(map_x, map_y),
+            None => [map_x, map_y],
+        };
         let Some((cell, u, v)) = self.locate(x, y) else {
             return Sample {
                 rgb: self.fallback_rgb,
@@ -771,7 +797,7 @@ impl Terrain {
                 };
             }
         }
-        if let Some(n) = sampler.normal(x as f32, y as f32) {
+        if let Some(n) = sampler.normal(map_x as f32, map_y as f32) {
             let factor = shading.factor(geometry.map_normal(n));
             for c in &mut rgb {
                 *c *= factor;

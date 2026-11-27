@@ -289,6 +289,7 @@ pub(crate) fn build(input: &BuildInput) -> Result<Built, BuildError> {
         link_doors: false,
         catalogue: options.catalogue.clone(),
         close_unreached: options.close_unreached,
+        prune_dead_end_stairs: false,
     };
     let layer = LayerInput {
         layer_id: input.layer_id,
@@ -485,6 +486,10 @@ pub(crate) fn build_layer(input: &LayerInput) -> Result<BuiltLayer, BuildError> 
         crate::clearance::move_off_links(plan);
         crate::clearance::move_hidden_off_links(plan);
     }
+    // Link cues in the floor art, when asked (crate::marks).
+    let cue_grounds = crate::marks::draw(&mut plans, &builder);
+    let cue_inputs = crate::marks::inputs(&plans, &cue_grounds);
+    crate::marks::apply(&mut plans, &cue_inputs);
     // The catalogue, checked against every plan before anything is
     // written.
     let mut loot = match &options.catalogue {

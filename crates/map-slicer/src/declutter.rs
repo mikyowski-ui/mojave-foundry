@@ -67,7 +67,21 @@
 //!    (outlined as before; a teleport door keeps enough pixels to click);
 //!    doors are placed after every wall so the cut strips are known.
 //!    Strips no rule changes are byte-identical to a run without the door
-//!    rule.
+//!    rule. **Narrow walkways** (`narrow_kerb_height`, off by default): a
+//!    cut strip whose walkable band behind it is at most
+//!    `narrow_max_width` hexes across is cut to that lower kerb instead.
+//!    The band is measured from the strip's hex away from the camera,
+//!    across the wall: along the normal of the line through the wall's
+//!    strips within 4 hex steps (on the regular hex lattice), past at most
+//!    two hexes that are not walkable (the wall's own), then across
+//!    walkable hexes to the next one that is not (a blocker, a drop, the
+//!    map's edge). A strip alone on its wall measures along the two
+//!    up-screen hex directions and takes the narrower. A cut strip with no
+//!    walkable hex just behind it (a wall's end past the walkway) follows a
+//!    narrow cut strip within `spread` steps (at least 4), so the cut line
+//!    stays level, and keeps the normal kerb otherwise. A corridor or a
+//!    catwalk keeps its walkers in view; a plaza's facades keep the normal
+//!    kerb. Blocking, doors and every exception above are unchanged.
 //! 5. **Figure-ground** ([`foundry_render::ClassTones`],
 //!    [`quantize::RimOptions`]). The floor tone is applied to the baked
 //!    floor and the flat overlays, the props tone to every upright render
@@ -365,6 +379,13 @@ pub struct Cutaway {
     /// Doors standing in a cut wall ([`DoorStub`]); `None` leaves them
     /// whole.
     pub doors: Option<DoorStub>,
+    /// The kerb of a cut strip beside a narrow walkway (module
+    /// documentation, rule 4): at most `kerb_height`. `None` (the default)
+    /// cuts every strip to `kerb_height`, as before.
+    pub narrow_kerb_height: Option<f32>,
+    /// A walkway is narrow when its walkable band behind the strip is at
+    /// most this many hexes across (default 3).
+    pub narrow_max_width: u32,
 }
 
 impl Default for Cutaway {
@@ -404,6 +425,8 @@ impl Default for Cutaway {
             cut_tolerance: 16.0,
             room_height_ratio: 0.75,
             doors: Some(DoorStub::default()),
+            narrow_kerb_height: None,
+            narrow_max_width: 3,
         }
     }
 }
@@ -623,6 +646,19 @@ impl DeclutterProfile {
                  least the kerb"
                     .into(),
             );
+        }
+        if let Some(c) = &self.cutaway
+            && let Some(narrow) = c.narrow_kerb_height
+            && !(narrow.is_finite()
+                && narrow >= 0.0
+                && narrow <= c.kerb_height
+                && c.narrow_max_width >= 1)
+        {
+            return Err(format!(
+                "declutter narrow-walkway kerb {narrow} must be finite, from 0 to the kerb \
+                 ({}), with a narrow width of at least 1 hex (got {})",
+                c.kerb_height, c.narrow_max_width
+            ));
         }
         if let Some(r) = &self.roof_cut
             && !(r.clearance.is_finite()

@@ -230,6 +230,12 @@ pub struct SliceSpec {
     /// Default: the table's, as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostile_packet: Option<i32>,
+    /// `[readability]`: the readability dials (`crate::readability`), each
+    /// key optional and at today's behaviour when absent. `--readability`
+    /// wins key by key. Not hashed into the map stage's key as written: the
+    /// effective dials are, when any differs from its default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readability: Option<crate::readability::ReadabilitySpec>,
 }
 
 /// `game = "fo3" | "fnv"` (the longer ids `fallout3` and `falloutnv` are
@@ -307,6 +313,7 @@ impl Default for SliceSpec {
             enable_groups: None,
             sim: None,
             hostile_packet: None,
+            readability: None,
         }
     }
 }
@@ -449,6 +456,9 @@ impl SliceSpec {
         }
         if let Some(declutter) = &self.declutter {
             declutter.validate(self.tone.as_ref())?;
+        }
+        if let Some(readability) = &self.readability {
+            crate::readability::Readability::from_spec(readability)?;
         }
         self.critter_settings()?;
         self.validate_interior()
@@ -870,6 +880,9 @@ pub struct Inputs {
     /// The `[sim]` table of the `--config` file (`foundry.toml`): the
     /// simulation stage's build options. Defaults: the owner decisions.
     pub sim: transpile::ir::SimConfig,
+    /// `--readability KEY=VALUE` (repeatable, later wins): the readability
+    /// dials over every file's (`crate::readability`). Empty: the files'.
+    pub readability_cli: crate::readability::ReadabilitySpec,
 }
 
 impl Inputs {
@@ -923,6 +936,26 @@ impl Inputs {
             with_interiors: false,
             cache_dir: None,
             sim: transpile::ir::SimConfig::default(),
+            readability_cli: crate::readability::ReadabilitySpec::default(),
+        })
+    }
+
+    /// The readability dials of this run's slice (one map's, through
+    /// [`Inputs::for_map`]): the slice's `[readability]` (a layer's
+    /// top-level, `[all_maps]` and `[[maps]]` tables merged into it), with
+    /// `--readability` over it, key by key. All at their defaults when
+    /// nothing sets them. This is what the map stage and every pass that
+    /// reads a dial asks.
+    pub fn readability(&self) -> Result<crate::readability::Readability, ConvertError> {
+        let spec = self
+            .slice
+            .readability
+            .clone()
+            .unwrap_or_default()
+            .over(&self.readability_cli);
+        crate::readability::Readability::from_spec(&spec).map_err(|reason| ConvertError::Slice {
+            name: self.slice.name.clone(),
+            reason,
         })
     }
 
@@ -1464,6 +1497,7 @@ interior = "TestRoomInterior"
             with_interiors: false,
             cache_dir: None,
             sim: transpile::ir::SimConfig::default(),
+            readability_cli: crate::readability::ReadabilitySpec::default(),
         };
         let error = inputs.check_mode().expect_err("refused").to_string();
         assert!(error.contains("--standalone"), "{error}");
@@ -1498,6 +1532,7 @@ interior = "TestRoomInterior"
             with_interiors: false,
             cache_dir: None,
             sim: transpile::ir::SimConfig::default(),
+            readability_cli: crate::readability::ReadabilitySpec::default(),
         };
         let look = |i: &Inputs| i.critter_settings().expect("settings").look;
         // Declutter off: nothing set, at any level.

@@ -3,11 +3,13 @@
 
 mod classes;
 mod declutter;
+mod dials;
 mod fixes;
 mod interior;
 mod ladder;
 mod landmarks;
 mod overlays;
+mod readability;
 mod slicing;
 mod town;
 mod visibility;

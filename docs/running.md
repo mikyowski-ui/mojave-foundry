@@ -725,3 +725,39 @@ installs or baselines the last step prints a SKIP line and the gate still
 passes, unless `GATE_REQUIRE_REAL=1`; `--fast` skips it on purpose.
 `scripts/gate.sh briefs` runs only the brief linter, and
 `scripts/gate.sh briefs --self-test` checks the linter itself.
+
+## Readability dials
+
+`[readability]` in a slice file, at the top level of a layer file, in
+`[all_maps]` or a `[[maps]]` entry, or `--readability KEY=VALUE` on `map`,
+`all` and `estimate` (the flag wins, key by key). Every key defaults to
+today's map, byte for byte; a changed key is part of the map stage's cache
+key, so a warm output directory rebuilds what it must.
+
+| Key | Default | What |
+|---|---|---|
+| `world_yaw_deg` | 0 | Turns the world clockwise, seen from above, about the window's centre (an interior's `map_center`) before anything else. Quarter turns are exact. |
+| `units_per_hex` | 70 | Source units per hex along the ground. A smaller value spreads the map out; figures and items keep their size. |
+| `wall_z_scale` | 1 | Draws walls and building shells lower about their feet. Landmarks, doors, items and figures keep their height. |
+| `fit_view_border` | false | Exterior: moves the window so the navmesh extent is centred in the engine's view border, and reports any overflow. |
+| `lower_level_dim` | 0 | On a level or storey above the ground, the elevation below is shown as floor context at this brightness (0.35 is 35 %). Floor tiles only: never walkable, never an object. |
+| `lower_level_desaturate` | 0 | 0 to 1: colour taken out of that context. |
+| `lower_level_reach` | 12 | Context only within this many hexes of the elevation's walkable hexes. |
+| `lower_level_tiles` | 256 | Most tiles one elevation's context may take. |
+| `ground_calm` | 0 | 0 to 1: calms the floor and terrain tone against walls and props. Needs the readable declutter pass. |
+| `foreground_kerb_narrow`, `narrow_width_hexes` | none, 3 | Camera-facing wall strips beside a walkway at most that wide are cut to this kerb, outdoors too. Needs the readable pass. |
+| `mark_links`, `link_cue_strength` | false, 0.45 | Floor cues under door and stair links: amber frames for doors, grey treads for stairs. |
+
+The engine's camera can only centre on the middle of the map: mirrored
+columns 44 to 154 and rows 45 to 154 of the 200 by 200 hex grid. Ground
+outside it can be walked but not centred on, and an entrance there fails
+the load. `map-report.md` lists, under `## Readability dials`, what a
+spread clipped and how many walkable hexes lie outside that border, and
+under `## FID budget` the tiles, walls and scenery each map and elevation
+uses against 4,096. With any dial set, a stair into a dead-end pocket (at
+most 60 walkable hexes, no other stair or door) is dropped and listed.
+
+`scripts/readability-ab.sh` builds the variants of `scripts/ab/variants.conf`
+from warm output directories into `out/readability-ab/`, runs the engine
+checks, takes the same viewpoints in each (named by reference, not hex)
+and writes the contact sheets and `summary.md`.

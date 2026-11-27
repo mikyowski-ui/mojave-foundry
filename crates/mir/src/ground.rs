@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use crate::error::MirError;
 use crate::model::{CELL_UNITS, LAND_GRID, LAND_SPACING, LandDoc};
 use crate::reader::Mir;
+use crate::yaw::WorldYaw;
 
 /// Floor squares along one side of a Fallout 2 map.
 pub const MAP_SIDE_SQUARES: f32 = 100.0;
@@ -86,11 +87,18 @@ struct Grid {
 /// floor under every point that no loaded cell covers: an interior cell,
 /// which has no land, then still gives every consumer a height (the floor),
 /// a zero gradient and slope and an upright normal everywhere.
+///
+/// A sampler [`GroundSampler::turned`] by a [`WorldYaw`] answers in the
+/// turned world (the map's): each query point is turned back to source
+/// space before the land is read, and gradients and normals are turned
+/// forward again. Heights and slopes do not change under a turn.
 #[derive(Default)]
 pub struct GroundSampler {
     cells: BTreeMap<(i32, i32), Grid>,
     /// The height of the flat floor under points no cell covers.
     flat: Option<f32>,
+    /// Source to map, and back; `None` for no turn.
+    yaw: Option<(WorldYaw, WorldYaw)>,
 }
 
 impl GroundSampler {
@@ -122,6 +130,42 @@ impl GroundSampler {
         Self {
             cells: BTreeMap::new(),
             flat: z.is_finite().then_some(z),
+            yaw: None,
+        }
+    }
+
+    /// This sampler, answering in the world `yaw` turns the source into
+    /// (type notes). No turn leaves it as it was.
+    pub fn turned(mut self, yaw: WorldYaw) -> Self {
+        self.yaw = (!yaw.is_identity()).then(|| (yaw, yaw.inverse()));
+        self
+    }
+
+    /// The turn from source space to the space this sampler answers in;
+    /// `None` for none.
+    pub fn yaw(&self) -> Option<WorldYaw> {
+        self.yaw.map(|(forward, _)| forward)
+    }
+
+    /// The source point of a query point.
+    fn source_point(&self, x: f32, y: f32) -> (f32, f32) {
+        match &self.yaw {
+            Some((_, back)) => {
+                let [x, y] = back.apply_xy(x, y);
+                (x, y)
+            }
+            None => (x, y),
+        }
+    }
+
+    /// A source-space horizontal vector turned into the query space.
+    fn forward(&self, v: [f32; 2]) -> [f32; 2] {
+        match &self.yaw {
+            Some((forward, _)) => {
+                let [x, y, _] = forward.apply_direction([v[0], v[1], 0.0]);
+                [x, y]
+            }
+            None => v,
         }
     }
 
@@ -160,6 +204,15 @@ impl GroundSampler {
                 hasher.update(z.to_bits().to_le_bytes());
             }
             None => hasher.update([0]),
+        }
+        // Only a turned sampler hashes its turn, so every digest made
+        // before turns existed stays valid.
+        if let Some((forward, _)) = &self.yaw {
+            hasher.update(b"yaw");
+            hasher.update(forward.degrees().to_bits().to_le_bytes());
+            for c in forward.centre() {
+                hasher.update(c.to_bits().to_le_bytes());
+            }
         }
         hasher.update((self.cells.len() as u64).to_le_bytes());
         for ((x, y), grid) in &self.cells {
@@ -226,6 +279,7 @@ impl GroundSampler {
     /// Terrain height at a source point, or `None` where no land was
     /// extracted (and there is no flat floor).
     pub fn height(&self, x: f32, y: f32) -> Option<f32> {
+        let (x, y) = self.source_point(x, y);
         if let Some(z) = self.flat_at(x, y) {
             return Some(z);
         }
@@ -244,6 +298,12 @@ impl GroundSampler {
     /// The height gradient `(dz/dx, dz/dy)` of the grid square under a
     /// point; `[0, 0]` on the flat floor.
     pub fn gradient(&self, x: f32, y: f32) -> Option<[f32; 2]> {
+        let (x, y) = self.source_point(x, y);
+        self.source_gradient(x, y).map(|g| self.forward(g))
+    }
+
+    /// [`GroundSampler::gradient`] at a source point, in source axes.
+    fn source_gradient(&self, x: f32, y: f32) -> Option<[f32; 2]> {
         if self.flat_at(x, y).is_some() {
             return Some([0.0, 0.0]);
         }
@@ -269,6 +329,14 @@ impl GroundSampler {
     /// blended bilinearly, or the normal of the height gradient when the
     /// cell stores none; straight up on the flat floor.
     pub fn normal(&self, x: f32, y: f32) -> Option<[f32; 3]> {
+        let (x, y) = self.source_point(x, y);
+        let n = self.source_normal(x, y)?;
+        let [nx, ny] = self.forward([n[0], n[1]]);
+        Some([nx, ny, n[2]])
+    }
+
+    /// [`GroundSampler::normal`] at a source point, in source axes.
+    fn source_normal(&self, x: f32, y: f32) -> Option<[f32; 3]> {
         if self.flat_at(x, y).is_some() {
             return Some([0.0, 0.0, 1.0]);
         }
@@ -292,7 +360,7 @@ impl GroundSampler {
         if length > 1e-3 {
             return Some(normal.map(|v| v / length));
         }
-        let [dx, dy] = self.gradient(x, y)?;
+        let [dx, dy] = self.source_gradient(x, y)?;
         let length = (dx * dx + dy * dy + 1.0).sqrt();
         Some([-dx / length, -dy / length, 1.0 / length])
     }
@@ -456,6 +524,42 @@ mod tests {
         assert_eq!(sampler.flat_height(), None);
         assert_eq!(sampler.height(0.0, 0.0), None);
         assert!(GroundSampler::default().is_empty());
+    }
+
+    #[test]
+    fn a_turned_sampler_answers_in_the_turned_world() {
+        // A plane rising east at 0.5 per unit over two cells.
+        let build = || {
+            let mut sampler = GroundSampler::default();
+            sampler.insert(0, 0, &land(|_, c| c as f32 * LAND_SPACING * 0.5));
+            sampler.insert(
+                1,
+                0,
+                &land(|_, c| (CELL_UNITS + c as f32 * LAND_SPACING) * 0.5),
+            );
+            sampler
+        };
+        let plain = build();
+        let yaw = WorldYaw::new([2048.0, 2048.0], 90.0);
+        let turned = build().turned(yaw);
+        assert_eq!(turned.yaw(), Some(yaw));
+        // A source point and its turned image have one height.
+        for p in [[2000.0f32, 2100.0], [3000.0, 1500.0], [4500.0, 2500.0]] {
+            let [mx, my] = yaw.apply_xy(p[0], p[1]);
+            assert_eq!(turned.height(mx, my), plain.height(p[0], p[1]));
+            assert_eq!(turned.slope(mx, my), plain.slope(p[0], p[1]));
+        }
+        // East turns south: the slope now rises to the south.
+        let g = turned.gradient(2048.0, 2048.0).unwrap();
+        assert!(g[0].abs() < 1e-6 && (g[1] + 0.5).abs() < 1e-6, "{g:?}");
+        let n = turned.normal(2048.0, 2048.0).unwrap();
+        assert!(n[0].abs() < 1e-4 && n[1] > 0.0, "{n:?}");
+        // The digest follows the turn; no turn keeps it.
+        assert_ne!(turned.digest(), plain.digest());
+        assert_eq!(
+            build().turned(WorldYaw::identity()).digest(),
+            plain.digest()
+        );
     }
 
     #[test]

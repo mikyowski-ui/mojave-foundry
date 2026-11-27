@@ -279,6 +279,7 @@
 mod assemble;
 mod budget;
 pub mod clearance;
+pub mod context;
 pub mod cover;
 pub mod critters;
 mod error;
@@ -290,6 +291,7 @@ pub mod levels;
 mod links;
 pub mod loot;
 mod loot_build;
+pub mod marks;
 mod names;
 mod passages;
 mod plan;
@@ -308,6 +310,7 @@ pub use loot::{
     Catalogue, CritterLoot, GroundArt, Held, ItemDef, ItemIcon, ItemKind, LootReport, LootSkip,
     MapLoot, PlacedLoot,
 };
+pub use plan::{VIEW_BORDER_COLUMNS, VIEW_BORDER_ROWS, inside_view_border};
 pub use verify::{
     ClearanceCheck, LinkCheck, LootCheck, VerifyReport, read_layer, verify_clearance, verify_layer,
     verify_links, verify_loot,
@@ -607,6 +610,9 @@ pub struct BuildOptions {
     /// it is written after every other object of its elevation. Default
     /// empty: nothing changes.
     pub hidden: BTreeSet<String>,
+    /// Link cues in the floor art under exit grids and arrival hexes
+    /// ([`marks`]). Default `None`: no cue, the layer byte-identical.
+    pub mark_links: Option<marks::LinkCues>,
 }
 
 /// One level of a multi-level exterior map ([`levels::LevelSplit::exterior_level`]):
@@ -739,6 +745,7 @@ impl Default for BuildOptions {
             coverage_bridges: true,
             close_unreached: true,
             hidden: BTreeSet::new(),
+            mark_links: None,
         }
     }
 }
@@ -1559,6 +1566,15 @@ pub struct LayerOptions {
     /// ([`ElevationReport::perches`]). Default `true`; the reach is reported
     /// either way ([`ElevationReport::reached`]).
     pub close_unreached: bool,
+    /// Drop every stair whose landing on one of its elevations is a dead
+    /// end (`links::DEAD_END_HEXES` walkable hexes or fewer in its walkable
+    /// component, and no other stair's grid and no door there): such a
+    /// stair only carries a walker into a pocket whose one way out is back
+    /// down, and its grid at the other end can stand across the only lane
+    /// (a turned or spread-out town). Each is reported as a skipped
+    /// teleport on both elevations. Default `false`: every stair kept, as
+    /// before.
+    pub prune_dead_end_stairs: bool,
 }
 
 impl Default for LayerOptions {
@@ -1572,6 +1588,7 @@ impl Default for LayerOptions {
             link_doors: true,
             catalogue: None,
             close_unreached: true,
+            prune_dead_end_stairs: false,
         }
     }
 }

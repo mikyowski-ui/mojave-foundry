@@ -169,7 +169,7 @@ pub enum Origin {
 }
 
 /// One map of the layer.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MapEntry {
     /// The file stem (`sdmart` for `maps/sdmart.map`).
     pub stem: String,
@@ -177,6 +177,31 @@ pub struct MapEntry {
     pub file: String,
     /// The map's number in the layer's manifest.
     pub number: u32,
+    /// The readability turn the map was built with, degrees clockwise
+    /// seen from above (`world_yaw_deg`): its hexes are the turned world's.
+    /// Left out for none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub world_yaw_deg: Option<f64>,
+}
+
+impl Eq for MapEntry {}
+
+impl Ord for MapEntry {
+    /// By stem, file and number (then the turn, by its bits).
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (&self.stem, &self.file, self.number)
+            .cmp(&(&other.stem, &other.file, other.number))
+            .then_with(|| {
+                let bits = |v: Option<f64>| v.map(f64::to_bits);
+                bits(self.world_yaw_deg).cmp(&bits(other.world_yaw_deg))
+            })
+    }
+}
+
+impl PartialOrd for MapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// An enable parent, as the source states it.
@@ -499,6 +524,12 @@ pub struct PlacementIndex {
     pub layer: String,
     /// The source game, as `mir::GameVariant::id` names it (`fallout3`).
     pub game: String,
+    /// The readability turn of the start map (the first), degrees
+    /// clockwise seen from above, when any map was built turned
+    /// (`MapEntry::world_yaw_deg` gives each map's): its hexes are those of
+    /// the turned world. Left out when no map is turned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub world_yaw_deg: Option<f64>,
     /// The layer's maps, by number.
     pub maps: Vec<MapEntry>,
     /// The references on the maps, by map, elevation and object id.
@@ -890,6 +921,7 @@ pub fn build(
         origin: Origin::Stage,
         layer: layer.to_owned(),
         game: game.to_owned(),
+        world_yaw_deg: None,
         maps: Vec::new(),
         placed: Vec::new(),
         unplaced: Vec::new(),
@@ -902,6 +934,7 @@ pub fn build(
             stem: map.stem.to_owned(),
             file: format!("maps/{}.map", map.stem),
             number: map.number,
+            world_yaw_deg: None,
         });
         let sources: BTreeMap<&str, &SourceRef> = map
             .references
@@ -1261,6 +1294,10 @@ pub struct StageMap<'a> {
     /// The PID of every item prototype the items catalogue made, by the
     /// item's base form key ([`item_pids_of`]).
     pub items: BTreeMap<String, u32>,
+    /// The readability dial `world_yaw_deg` the map was built with
+    /// (`mir::WorldYaw::degrees`): its hexes are those of the turned
+    /// world. 0 for none.
+    pub world_yaw_deg: f64,
 }
 
 /// A slicer run's skips as [`StageMap::skipped`] takes them.
@@ -1341,11 +1378,15 @@ pub fn marker_spots(
 /// `worldspace` at a position the frame puts on the map: each with its
 /// hex on elevation 0. Empty when the MIR cannot say (an extract older
 /// than records revision 1). Sorted by reference.
+///
+/// The records hold source positions: each is turned by `yaw`, the map's
+/// readability turn (`world_yaw_deg`), before it is projected.
 pub fn outside_markers(
     records: &mir::Records,
     worldspace: &mir::FormKey,
     frame: &map_builder::walk::Frame,
     known: &BTreeSet<String>,
+    yaw: &mir::WorldYaw,
 ) -> Vec<OutsideSpot> {
     let Ok(referrals) = records.ref_referrals() else {
         return Vec::new();
@@ -1375,6 +1416,7 @@ pub fn outside_markers(
         if !(x.is_finite() && y.is_finite()) {
             continue;
         }
+        let [x, y] = yaw.apply_xy64(x, y);
         let Some(hex) = frame.hex_of_source(x, y) else {
             continue;
         };
@@ -1784,6 +1826,7 @@ impl<'a> StageMap<'a> {
             walkable: Vec::new(),
             exits: Vec::new(),
             items: BTreeMap::new(),
+            world_yaw_deg: 0.0,
         }
     }
 }
@@ -1907,6 +1950,16 @@ pub fn write_for_stage(
         })
         .collect();
     let mut index = build(&layer_name, game.id(), &inputs, &referenced);
+    // The readability turn of each map, and the start map's in the header,
+    // only when some map is turned: the file is otherwise as it was.
+    for map in maps.iter().filter(|m| m.world_yaw_deg != 0.0) {
+        for entry in index.maps.iter_mut().filter(|e| e.stem == map.stem) {
+            entry.world_yaw_deg = Some(map.world_yaw_deg);
+        }
+    }
+    if maps.iter().any(|m| m.world_yaw_deg != 0.0) {
+        index.world_yaw_deg = maps.first().map(|m| m.world_yaw_deg);
+    }
     // The layer's other maps (the stubs standing in for interiors outside
     // the build) are listed too: they place no source reference.
     let stubs: Vec<&WrittenMap> = written
@@ -1919,6 +1972,7 @@ pub fn write_for_stage(
                 stem: stub.stem.clone(),
                 file: format!("maps/{}.map", stub.stem),
                 number: stub.number,
+                world_yaw_deg: None,
             });
         }
         index.notes.push(format!(
@@ -1982,6 +2036,7 @@ pub fn reconstruct(
         origin: Origin::Reconstructed,
         layer: layer_name,
         game: game.to_owned(),
+        world_yaw_deg: None,
         maps: Vec::new(),
         placed: Vec::new(),
         unplaced: Vec::new(),
@@ -1998,6 +2053,7 @@ pub fn reconstruct(
             stem: map.stem.clone(),
             file: format!("maps/{}.map", map.stem),
             number: map.number,
+            world_yaw_deg: None,
         });
         let people = out.map(|o| people_of(o, &map.stem)).unwrap_or_default();
         for object in &map.objects {

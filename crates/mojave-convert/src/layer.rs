@@ -91,14 +91,24 @@ fn check_sim_options(table: &toml::Table) -> Result<(), String> {
 /// The layer file's text without its `[sim_options]` table (from its
 /// header to the next table header, and the blank lines just before it),
 /// so that a simulation option does not rebuild the maps: a file with the
-/// table at its end has the key of the same file without it.
+/// table at its end has the key of the same file without it. The
+/// `[readability]` tables (top level, `[all_maps.readability]`,
+/// `[maps.readability]`) are left out the same way: each map's effective
+/// dials are in its own key when they differ from the defaults.
 fn without_sim_options(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut skipping = false;
     for line in text.split_inclusive('\n') {
         let head = line.trim_start();
         if head.starts_with('[') {
-            skipping = head.starts_with("[sim_options]");
+            skipping = [
+                "[sim_options]",
+                "[readability]",
+                "[all_maps.readability]",
+                "[maps.readability]",
+            ]
+            .iter()
+            .any(|t| head.starts_with(t));
             if skipping {
                 while out.ends_with("\n\n") {
                     out.pop();
@@ -189,6 +199,10 @@ struct LayerFile {
     all_maps: toml::Table,
     #[serde(default)]
     maps: Vec<toml::Table>,
+    /// `[readability]` at the top level: laid under every map's own slice
+    /// keys (`[all_maps]` and a `[[maps]]` entry's go over them).
+    #[serde(default)]
+    readability: Option<toml::Table>,
 }
 
 /// Keys of an exterior slice an interior made from it does not take.
@@ -319,6 +333,15 @@ impl LayerSpec {
                     interior_table(base, &id)
                 }
             };
+            if let Some(readability) = &file.readability {
+                let mut under = toml::Table::new();
+                under.insert(
+                    "readability".into(),
+                    toml::Value::Table(readability.clone()),
+                );
+                merge(&mut under, &table);
+                table = under;
+            }
             merge(&mut table, &file.all_maps);
             merge(&mut table, &over);
             if !table.contains_key("interior") && base.is_none() {
@@ -545,10 +568,15 @@ fn interior_table(base: &toml::Table, id: &str) -> toml::Table {
 /// The interiors (editor ids) the exterior slice's window doors lead to,
 /// in door form-key order, each once.
 fn door_interiors(inputs: &Inputs, mir: &Mir) -> Result<Vec<String>, ConvertError> {
-    let projection = Projection::new(&inputs.calibration).map_err(stage)?;
-    let window = MapWindow::from_center(inputs.slice.center(), projection.tile_units());
+    // The window the map draws: turned and spread out by its readability
+    // dials (a door they leave off leads to no interior of the layer).
+    let readability = inputs.readability()?;
+    let projection =
+        Projection::new(&readability.map_calibration(&inputs.calibration)).map_err(stage)?;
+    let yaw = readability.yaw(inputs.slice.center(), &inputs.calibration);
+    let (window, _) = map::placed_window(inputs, mir, &readability, &projection, &yaw)?;
     let worldspace = inputs.slice.worldspace.to_ascii_lowercase();
-    let (xs, ys) = window.cells(0);
+    let (xs, ys) = crate::readability::source_window(&window, &yaw).cells(0);
     let mut doors: Vec<(String, mir::FormKey)> = Vec::new();
     for y in ys {
         for x in xs.clone() {
@@ -556,7 +584,7 @@ fn door_interiors(inputs: &Inputs, mir: &Mir) -> Result<Vec<String>, ConvertErro
                 continue;
             };
             for r in &doc.references {
-                let [px, py, _] = r.transform.position;
+                let [px, py] = yaw.apply_xy(r.transform.position[0], r.transform.position[1]);
                 if !window.contains(px, py) || r.flags.deleted {
                     continue;
                 }
@@ -666,6 +694,31 @@ struct Run {
     art: Vec<map_builder::ArtImage>,
     placements: Vec<map_builder::Placement>,
     doors_demoted: usize,
+    /// The lower-level context this elevation draws (`lower_level_dim`);
+    /// `None`: none, as before.
+    context: Option<ContextPlan>,
+}
+
+/// One elevation's lower-level context (`map_builder::context`), planned.
+#[derive(Debug, Clone)]
+struct ContextPlan {
+    /// The run of the same map whose picture it shows.
+    source: usize,
+    /// The squares within the reach of its walkable hexes.
+    squares: BTreeSet<i32>,
+    /// Pixels the picture moves down the screen, and the height (storeys)
+    /// it comes from, with what that height is.
+    shift: i64,
+    storeys: f64,
+    from: String,
+    /// Floor tiles the context may take ([`Readability::lower_level_tiles`],
+    /// at most one per square), reserved from the layer's tile list.
+    ///
+    /// [`Readability::lower_level_tiles`]: crate::readability::Readability::lower_level_tiles
+    tiles: usize,
+    /// Filled by the ground pass: squares painted, opaque pixels.
+    painted: usize,
+    pixels: usize,
 }
 
 /// One map of the layer, planned.
@@ -696,6 +749,15 @@ struct MapRun {
     /// For a building spilled over several maps: the z band of its
     /// storeys, to give each map only its own people.
     critter_band: Option<[f32; 2]>,
+    /// The map's readability dials (`Inputs::readability`), its turn of the
+    /// world, the calibration it is projected with, and what its window
+    /// leaves off (`map::Scene`'s).
+    pub(crate) readability: crate::readability::Readability,
+    pub(crate) yaw: mir::WorldYaw,
+    pub(crate) calibration: foundry_render::Calibration,
+    pub(crate) clip: crate::readability::Clip,
+    /// The window's placement for the view border (`fit_view_border`).
+    pub(crate) view_fit: Option<crate::view_fit::ViewFit>,
 }
 
 /// The planned layer.
@@ -788,7 +850,43 @@ fn empty_run(label: String, what: String, elevation: u8) -> Run {
         art: Vec::new(),
         placements: Vec::new(),
         doors_demoted: 0,
+        context: None,
     }
+}
+
+/// The lower-level context of an elevation (`lower_level_dim` above 0;
+/// `crate::readability`): the squares within `lower_level_reach` of its
+/// walkable hexes (`walkers`), the picture of run `source` moved down by
+/// `storeys` storeys.
+fn context_plan(
+    readability: &crate::readability::Readability,
+    walkers: &BTreeSet<i32>,
+    source: usize,
+    storeys: f64,
+    from: String,
+) -> Option<ContextPlan> {
+    if readability.lower_level_dim <= 0.0 {
+        return None;
+    }
+    let mut mask = vec![false; 40_000];
+    for &h in walkers {
+        if let Some(m) = usize::try_from(h).ok().and_then(|h| mask.get_mut(h)) {
+            *m = true;
+        }
+    }
+    let squares = map_builder::context::reach_squares(&mask, readability.lower_level_reach);
+    // About one tile for four squares of context, at most the dial's.
+    let tiles = (readability.lower_level_tiles as usize).min(squares.len().div_ceil(4));
+    Some(ContextPlan {
+        source,
+        shift: map_builder::context::shift_of(vec![storeys], 96.0),
+        storeys,
+        from,
+        squares,
+        tiles,
+        painted: 0,
+        pixels: 0,
+    })
 }
 
 /// Kinds that are never a deck.
@@ -900,9 +998,14 @@ fn deck_references(
 fn exterior_entrance(
     slice: &SliceSpec,
     references: &[mir::Reference],
+    yaw: &mir::WorldYaw,
 ) -> Option<([f32; 2], Option<f32>, String)> {
     if let Some(p) = slice.entrance {
-        return Some((p, None, "the slice's entrance".to_owned()));
+        return Some((
+            yaw.apply_xy(p[0], p[1]),
+            None,
+            "the slice's entrance".to_owned(),
+        ));
     }
     let worldspace = slice.worldspace.to_ascii_lowercase();
     references
@@ -961,7 +1064,27 @@ fn plan_exterior(
     });
     if let Some(split) = split.as_ref().filter(|s| s.level_count() > 1) {
         split_lines = split.summary();
-        let entrance = exterior_entrance(&inputs.slice, &scene.references);
+        // The gate a turned or spread-out window leaves off is still the
+        // entrance the slice means: refused below (`check_clips`).
+        let mut candidates = scene.references.clone();
+        candidates.extend(scene.clip.doors().cloned());
+        let entrance = exterior_entrance(&inputs.slice, &candidates, &scene.yaw);
+        if let Some((_, _, from)) = &entrance
+            && let Some(door) = scene
+                .clip
+                .doors()
+                .find(|d| from.contains(&d.form.to_string()))
+        {
+            return Err(stage(format!(
+                "{}: the entrance, door {} (the first leading out of the worldspace), falls \
+                 outside the map: the readability dials leave a window {} units square (today's \
+                 {}); raise units_per_hex, move map_center or set entrance",
+                inputs.slice.map_stem(),
+                door.form,
+                scene.clip.map_side,
+                scene.clip.today_side
+            )));
+        }
         if let Some((point, z, from)) = &entrance {
             scene.build_options.entrance_near = Some(*point);
             let level = match z {
@@ -991,6 +1114,7 @@ fn plan_exterior(
             let standable =
                 map_builder::walk::standable_hexes(&frame, &scene.sampler, &scene.cells, &options);
             let walkers = walkers_of(&frame, &scene.sampler, &scene.cells, &options);
+            let walkers_k = walkers.clone();
             let decks = if k == 0 {
                 BTreeSet::new()
             } else {
@@ -1060,6 +1184,36 @@ fn plan_exterior(
             } else {
                 Terrain::Blank(mean_z)
             };
+            if k > 0 {
+                // The deck height above the town's ground under it: the
+                // median over the level's walkable hexes.
+                let storey = f64::from(scene.projection.storey_units());
+                let mut heights: Vec<f64> = Vec::new();
+                for &h in &walkers_k {
+                    let Some(tile) = frame.hex_centre_tile(h) else {
+                        continue;
+                    };
+                    let [x, y] = frame.source_of_tile(tile);
+                    let (x, y) = (x as f32, y as f32);
+                    if let (Some(top), Some(ground)) =
+                        (split.surface_height(k, x, y), scene.sampler.height(x, y))
+                    {
+                        heights.push(f64::from(top - ground) / storey);
+                    }
+                }
+                heights.sort_by(f64::total_cmp);
+                let storeys = heights.get(heights.len() / 2).copied().unwrap_or(0.0);
+                run.context = context_plan(
+                    &scene.readability,
+                    &walkers_k,
+                    0,
+                    storeys,
+                    format!(
+                        "the median height of the level's {} walkable hexes above the ground under them",
+                        heights.len()
+                    ),
+                );
+            }
             run.level = Some(level);
             run.open = counts;
             run.doors = Some(doors);
@@ -1118,6 +1272,11 @@ fn plan_exterior(
         people_skipped: Vec::new(),
         groups: scene.groups,
         critter_band: None,
+        readability: scene.readability,
+        yaw: scene.yaw,
+        calibration: scene.calibration,
+        clip: scene.clip,
+        view_fit: scene.view_fit,
     })
 }
 
@@ -1175,6 +1334,11 @@ fn plan_interior(
         people_skipped: Vec::new(),
         groups: scene.groups.clone(),
         critter_band: band,
+        readability: scene.readability.clone(),
+        yaw: scene.yaw,
+        calibration: scene.calibration.clone(),
+        clip: scene.clip.clone(),
+        view_fit: None,
     };
 
     let auto = slice.storeys.as_deref() == Some("auto");
@@ -1414,6 +1578,16 @@ fn plan_interior(
             walkers: walkers.len(),
         };
         run.doors = Some(doors);
+        if e > 0 {
+            let below = storeys[chosen[e - 1]].floor_z;
+            run.context = context_plan(
+                &scene.readability,
+                &walkers,
+                e - 1,
+                f64::from(z - below) / f64::from(scene.projection.storey_units()),
+                format!("the storey's floor z {z:.1} over the one below at z {below:.1}"),
+            );
+        }
         runs.push(run);
     }
     // Stairs: each connector's landings on two kept storeys.
@@ -1667,7 +1841,10 @@ fn estimate_runs(
         .iter()
         .flat_map(|m| m.runs.iter().map(|r| r.tile_weight))
         .collect();
-    let tiles = shares(budgets.tile_cap, &weights);
+    // Tiles kept back first: each elevation's lower-level context, and the
+    // link cues the builder paints after the terrain (`TileReserve`).
+    let reserve = TileReserve::of(plan, budgets.tile_cap);
+    let tiles = shares(reserve.terrain, &weights);
     let mut i = 0;
     for map in &mut plan.maps {
         for run in &mut map.runs {
@@ -1676,11 +1853,159 @@ fn estimate_runs(
                 scenery: scenery[i],
                 items: items[i],
             };
-            run.tile_cap = tiles[i];
+            run.tile_cap = tiles[i] + run.context.as_ref().map_or(0, |c| c.tiles);
             i += 1;
         }
     }
     Ok(())
+}
+
+/// Floor tiles one link-cue hex costs, measured on Megaton (each cue hex
+/// paints parts of about two squares; neighbouring hexes share some).
+pub(crate) const CUE_TILES_PER_HEX: f64 = 0.85;
+/// Cue hexes per door (its exit grids and the arrival hex beside it) and
+/// per stair end (its grids and arrival), as the builder lays them.
+pub(crate) const CUE_HEXES_PER_DOOR: usize = 6;
+const CUE_HEXES_PER_STAIR_END: usize = 5;
+
+/// What the layer's tile list keeps back from the terrain shares.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct TileReserve {
+    /// The terrain's total after the reserves.
+    pub(crate) terrain: usize,
+    /// Every elevation's lower-level context, together.
+    pub(crate) context: usize,
+    /// The link cues' estimate (`mark_links`): doors and stair ends of the
+    /// maps that mark their links, at [`CUE_TILES_PER_HEX`] per cue hex,
+    /// at most `map_builder::marks::DEFAULT_MAX_TILES` a map.
+    pub(crate) cues: usize,
+    pub(crate) cue_hexes: usize,
+}
+
+impl TileReserve {
+    fn of(plan: &Plan, cap: usize) -> Self {
+        let context: usize = plan
+            .maps
+            .iter()
+            .flat_map(|m| &m.runs)
+            .filter_map(|r| r.context.as_ref())
+            .map(|c| c.tiles)
+            .sum();
+        let (mut cues, mut cue_hexes) = (0usize, 0usize);
+        for (m, map) in plan.maps.iter().enumerate() {
+            if map.build_options.mark_links.is_none() {
+                continue;
+            }
+            let doors = map
+                .references
+                .iter()
+                .filter(|r| r.teleport.is_some() && !r.flags.deleted)
+                .count();
+            let stair_ends = plan
+                .stairs
+                .iter()
+                .flat_map(|s| &s.ends)
+                .filter(|end| end.map == m)
+                .count();
+            let hexes = doors * CUE_HEXES_PER_DOOR + stair_ends * CUE_HEXES_PER_STAIR_END;
+            cue_hexes += hexes;
+            cues += ((hexes as f64 * CUE_TILES_PER_HEX).ceil() as usize)
+                .min(map_builder::marks::DEFAULT_MAX_TILES);
+        }
+        // Never more than half the list: the ground needs the rest.
+        let cues = cues.min((cap / 2).saturating_sub(context));
+        TileReserve {
+            terrain: cap.saturating_sub(context + cues),
+            context,
+            cues,
+            cue_hexes,
+        }
+    }
+}
+
+/// The lines of `## FID budget` on the tiles the readability dials keep
+/// back (`lower_level_dim`, `mark_links`); nothing when neither is on.
+fn write_tile_reserve(text: &mut String, plan: &Plan, budgets: &Budgets) {
+    let reserve = TileReserve::of(plan, budgets.tile_cap);
+    let with_context: Vec<&Run> = plan
+        .maps
+        .iter()
+        .flat_map(|m| &m.runs)
+        .filter(|r| r.context.is_some())
+        .collect();
+    if with_context.is_empty() && reserve.cues == 0 {
+        return;
+    }
+    if let Some(map) = plan
+        .maps
+        .iter()
+        .find(|m| m.readability.lower_level_dim > 0.0)
+    {
+        let r = &map.readability;
+        let _ = writeln!(
+            text,
+            "Lower-level context (`lower_level_dim` {}, `lower_level_desaturate` {}, `lower_level_reach` {} hexes, `lower_level_tiles` {}): the picture of the elevation below, a 3 by 3 blur, dimmed and desaturated, baked into this elevation's blank floor squares near its walkable hexes and merged with its own floor by the terrain's greedy merge into the elevation's tile cap (its share plus the context's tiles). Floor tiles only: no wall, scenery or item entry is spent on it.\n",
+            r.lower_level_dim, r.lower_level_desaturate, r.lower_level_reach, r.lower_level_tiles
+        );
+    }
+    if !with_context.is_empty() {
+        let _ = writeln!(
+            text,
+            "| map, elevation | context squares (painted) | shift px (storeys, from) | tile cap (context) | tiles | distinct before the merge | squares substituted | mean substitution error |\n|---|---:|---|---:|---:|---:|---:|---:|"
+        );
+        for run in &with_context {
+            let c = run.context.as_ref().expect("filtered");
+            let stats = run.ground.as_ref().map(|g| &g.stats);
+            let _ = writeln!(
+                text,
+                "| {} | {} ({}) | {} ({:.2}, {}) | {} ({}) | {} | {} | {} | {:.4} |",
+                run.label,
+                c.squares.len(),
+                c.painted,
+                c.shift,
+                c.storeys,
+                c.from,
+                run.tile_cap,
+                c.tiles,
+                stats.map_or(0, |g| g.tiles_after),
+                stats.map_or(0, |g| g.distinct_tiles),
+                stats.map_or(0, |g| g.substituted_squares),
+                stats.map_or(0.0, |g| g.mean_substitution_error)
+            );
+        }
+        let _ = writeln!(text);
+    }
+    let _ = writeln!(
+        text,
+        "Tiles kept back from the terrain shares: {} for lower-level context, {} for link cues (an estimate: {} cue hexes at {} tiles each, at most {} a map); the terrain shares the other {} of {}.",
+        reserve.context,
+        reserve.cues,
+        reserve.cue_hexes,
+        CUE_TILES_PER_HEX,
+        map_builder::marks::DEFAULT_MAX_TILES,
+        reserve.terrain,
+        budgets.tile_cap
+    );
+    for map in &plan.maps {
+        for run in map
+            .runs
+            .iter()
+            .filter(|r| r.context.is_none() && r.elevation == 0)
+        {
+            if let (Some(g), true) = (&run.ground, map.interior.is_none()) {
+                let _ = writeln!(
+                    text,
+                    "- {}: {} tiles of {} distinct ({} squares substituted, mean error {:.4}): what the ground level keeps after the reserve",
+                    run.label,
+                    g.stats.tiles_after,
+                    g.stats.distinct_tiles,
+                    g.stats.substituted_squares,
+                    g.stats.mean_substitution_error
+                );
+            }
+        }
+    }
+    let _ = writeln!(text);
 }
 
 fn budget_text(plan: &Plan, budgets: &Budgets) -> String {
@@ -1798,6 +2123,79 @@ fn normalise_teleports(plan: &mut Plan) -> usize {
     changed
 }
 
+/// The map each cell is built into (its first), by cell form key.
+fn cell_owners(plan: &Plan) -> BTreeMap<String, usize> {
+    let mut owners = BTreeMap::new();
+    for (m, map) in plan.maps.iter().enumerate() {
+        for cell in &map.cells {
+            owners.entry(cell.form.to_string()).or_insert(m);
+        }
+    }
+    owners
+}
+
+/// Turns every teleport of the layer into the space of the map it leads to
+/// (`world_yaw_deg`): a teleport's arrival point and rotation lie in the
+/// destination's world, so they take the destination map's turn, whichever
+/// map the door stands on. A teleport into a cell no map is built from (a
+/// stub) is left as it is. Nothing changes when no map is turned.
+fn turn_teleports(plan: &mut Plan) {
+    if plan.maps.iter().all(|m| m.yaw.is_identity()) {
+        return;
+    }
+    let owners = cell_owners(plan);
+    let yaws: Vec<mir::WorldYaw> = plan.maps.iter().map(|m| m.yaw).collect();
+    let turn_of = |form: &mir::FormKey| owners.get(&form.to_string()).map(|m| yaws[*m]);
+    for map in &mut plan.maps {
+        crate::readability::turn_teleports(&mut map.cells, &mut map.references, &turn_of);
+        crate::readability::turn_teleports(&mut map.builder_cells, &mut [], &turn_of);
+        for run in &mut map.runs {
+            crate::readability::turn_teleports(&mut [], &mut run.references, &turn_of);
+        }
+    }
+}
+
+/// Refuses a layer whose readability dials leave a link off a map: a
+/// teleport door that today's window holds, that the turned or spread-out
+/// window does not, and that leads to a cell another map of the layer is
+/// built from.
+fn check_clips(plan: &Plan) -> Result<(), ConvertError> {
+    let owners = cell_owners(plan);
+    // A partner door filed in a persistent cell: the map holding it.
+    let mut holder: BTreeMap<String, usize> = BTreeMap::new();
+    for (m, map) in plan.maps.iter().enumerate() {
+        for cell in &map.cells {
+            for r in &cell.references {
+                holder.entry(r.form.to_string()).or_insert(m);
+            }
+        }
+    }
+    for (m, map) in plan.maps.iter().enumerate() {
+        for door in map.clip.doors() {
+            let Some(teleport) = door.teleport.as_ref() else {
+                continue;
+            };
+            let to = teleport
+                .cell
+                .as_ref()
+                .and_then(|c| owners.get(&c.form.to_string()))
+                .or_else(|| holder.get(&teleport.door.to_string()))
+                .copied();
+            if let Some(to) = to
+                && to != m
+            {
+                return Err(stage(format!(
+                    "{}: door {} links to map {} but falls outside the map: the readability \
+                     dials leave a window {} units square (today's {}); raise units_per_hex or \
+                     move map_center",
+                    map.stem, door.form, plan.maps[to].stem, map.clip.map_side, map.clip.today_side
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Drops the placements of teleport doors that belong to another
 /// elevation (a door is converted on its own elevation only).
 fn demote_doors(run: &mut Run) {
@@ -1875,18 +2273,20 @@ pub fn map_layer(inputs: &Inputs, layer: &LayerSpec) -> Result<MapSummary, Conve
     let plan_time = crate::timings::span("plan the layer");
     let mut plan = plan(inputs, &mir, &maps)?;
     let redirected = normalise_teleports(&mut plan);
+    check_clips(&plan)?;
+    turn_teleports(&mut plan);
     drop(plan_time);
     let estimate_time = crate::timings::span("estimate");
     estimate_runs(&assets, &mut plan, &budgets)?;
     drop(estimate_time);
 
-    // Slice every run in order, passing on what each leaves unused.
-    let mut renderer =
-        foundry_render::renderer(inputs.backend, &inputs.calibration).map_err(stage)?;
+    // Slice every run in order, passing on what each leaves unused. One
+    // renderer per calibration the maps project with (`units_per_hex`):
+    // the run's own unless a map's dials change it.
+    let mut renderers: BTreeMap<String, Box<dyn foundry_render::Renderer>> = BTreeMap::new();
     // Renders and grounds come from the content-hash store when their
     // inputs are unchanged (`crate::cache`).
     let store = crate::cache::Store::open(&inputs.store_dir());
-    let calibration_toml = inputs.calibration.to_toml().map_err(stage)?;
     let texture_id = |path: &str| mir.texture_hash(path).map(str::to_owned);
     let manifest_digest = map::manifest_digest(inputs)?;
     // Interiors first, then the levels above an exterior's ground, its
@@ -1914,6 +2314,15 @@ pub fn map_layer(inputs: &Inputs, layer: &LayerSpec) -> Result<MapSummary, Conve
             run.budget.scenery += carry[1];
             run.budget.items += carry[2];
             let _t = crate::timings::span(format!("slice {}", run.label));
+            let calibration_toml = map.calibration.to_toml().map_err(stage)?;
+            if !renderers.contains_key(&calibration_toml) {
+                let renderer =
+                    foundry_render::renderer(inputs.backend, &map.calibration).map_err(stage)?;
+                renderers.insert(calibration_toml.clone(), renderer);
+            }
+            let renderer = renderers
+                .get_mut(&calibration_toml)
+                .expect("a renderer for every calibration");
             let mut cached = crate::cache::CachedRenderer::new(
                 renderer.as_mut(),
                 &calibration_toml,
@@ -1973,28 +2382,98 @@ pub fn map_layer(inputs: &Inputs, layer: &LayerSpec) -> Result<MapSummary, Conve
     }
 
     // Ground: smallest tile demand first, each passing on what it leaves.
-    let mut order: Vec<(usize, usize, usize)> = Vec::new();
+    // An elevation with lower-level context waits for the elevation its
+    // picture is of, and comes right after it.
+    let mut sorted: Vec<(usize, usize, usize)> = Vec::new();
     for (m, map) in plan.maps.iter().enumerate() {
         for (r, run) in map.runs.iter().enumerate() {
-            order.push((run.tile_weight, m, r));
+            sorted.push((run.tile_weight, m, r));
         }
     }
-    order.sort();
+    sorted.sort();
+    let mut order: Vec<(usize, usize)> = Vec::new();
+    let mut waiting: Vec<(usize, usize)> = Vec::new();
+    for (_, m, r) in sorted {
+        let source = plan.maps[m].runs[r].context.as_ref().map(|c| c.source);
+        if source.is_some_and(|s| !order.contains(&(m, s))) {
+            waiting.push((m, r));
+            continue;
+        }
+        order.push((m, r));
+        while let Some(i) = waiting.iter().position(|&(wm, wr)| {
+            plan.maps[wm].runs[wr]
+                .context
+                .as_ref()
+                .is_some_and(|c| order.contains(&(wm, c.source)))
+        }) {
+            order.push(waiting.remove(i));
+        }
+    }
+    order.extend(waiting);
+    let palette_rgb: [[u8; 3]; 256] = {
+        let rgba = palette.rgba8();
+        std::array::from_fn(|i| [rgba[i][0], rgba[i][1], rgba[i][2]])
+    };
     let mut tile_carry = 0usize;
-    for (_, m, r) in order {
+    for (m, r) in order {
+        // The lower-level context: the picture of the elevation below, as
+        // the engine draws it, dimmed, under this elevation's own floor.
+        let context: Vec<map_builder::context::ContextSquare> =
+            match plan.maps[m].runs[r].context.as_ref() {
+                None => Vec::new(),
+                Some(plan_c) => {
+                    let map = &plan.maps[m];
+                    let source = &map.runs[plan_c.source];
+                    let ground = source.ground.as_ref().ok_or_else(|| {
+                        stage(format!(
+                            "{}: the context's elevation has no ground yet",
+                            map.runs[r].label
+                        ))
+                    })?;
+                    let (pixels, width, height) =
+                        map::compose_preview(ground, source.sliced.as_ref().expect("sliced above"));
+                    let (origin, _, _) = map_terrain::Ground::bounds();
+                    let dials = &map.readability;
+                    map_builder::context::paint(
+                        &map_builder::context::Composite {
+                            pixels: &pixels,
+                            origin,
+                            width,
+                            height,
+                            palette: &palette_rgb,
+                        },
+                        &plan_c.squares,
+                        &map_builder::context::ContextLook {
+                            dim: dials.lower_level_dim,
+                            desaturate: dials.lower_level_desaturate,
+                            shift: plan_c.shift,
+                        },
+                    )
+                }
+            };
         let map = &mut plan.maps[m];
         let run = &mut map.runs[r];
         run.tile_cap += tile_carry;
+        if let Some(c) = run.context.as_mut() {
+            c.painted = context.len();
+            c.pixels = context.iter().map(|s| s.drawn).sum();
+        }
         let sliced = run.sliced.as_ref().expect("sliced above");
-        let overlays: Vec<map_terrain::Overlay<'_>> = sliced
-            .overlays
+        // The context first: the elevation's own floor is drawn over it.
+        let overlays: Vec<map_terrain::Overlay<'_>> = context
             .iter()
-            .map(|o| map_terrain::Overlay {
+            .map(|c| map_terrain::Overlay {
+                origin: c.origin,
+                width: 80,
+                height: 36,
+                rgba: &c.rgba,
+            })
+            .chain(sliced.overlays.iter().map(|o| map_terrain::Overlay {
                 origin: o.origin,
                 width: o.width,
                 height: o.height,
                 rgba: &o.rgba,
-            })
+            }))
             .collect();
         let blank = matches!(run.terrain, Terrain::Blank(_));
         let _t = crate::timings::span(format!("terrain {}", run.label));
@@ -2008,7 +2487,11 @@ pub fn map_layer(inputs: &Inputs, layer: &LayerSpec) -> Result<MapSummary, Conve
             jobs: inputs.jobs,
             texture_lod_bias: map::GROUND_LOD_BIAS,
             blank_without_land: blank,
-            tone: map::terrain_tone(&map.inputs.slice, &run.slicer_config),
+            tone: map::terrain_tone(
+                &map.inputs.slice,
+                &run.slicer_config,
+                map.readability.ground_calm,
+            ),
             vertex_color_floor: map.inputs.slice.vertex_color_floor.unwrap_or(0.0),
             ..map_terrain::TerrainOptions::default()
         };
@@ -2020,6 +2503,7 @@ pub fn map_layer(inputs: &Inputs, layer: &LayerSpec) -> Result<MapSummary, Conve
             }
             Terrain::Land => &map.sampler,
         };
+        let calibration_toml = map.calibration.to_toml().map_err(stage)?;
         let key = crate::cache::GroundKey {
             land: matches!(run.terrain, Terrain::Land)
                 .then_some((manifest_digest.as_str(), map.worldspace.as_str())),
@@ -2037,7 +2521,7 @@ pub fn map_layer(inputs: &Inputs, layer: &LayerSpec) -> Result<MapSummary, Conve
                 &map.window,
                 sampler,
                 &map.projection,
-                &inputs.calibration,
+                &map.calibration,
                 &palette_map,
                 &overlays,
                 &options,
@@ -2048,7 +2532,7 @@ pub fn map_layer(inputs: &Inputs, layer: &LayerSpec) -> Result<MapSummary, Conve
                 &map.window,
                 sampler,
                 &map.projection,
-                &inputs.calibration,
+                &map.calibration,
                 &palette_map,
                 &overlays,
                 &options,
@@ -2172,6 +2656,9 @@ pub fn map_layer(inputs: &Inputs, layer: &LayerSpec) -> Result<MapSummary, Conve
             .as_ref()
             .map(|c| std::sync::Arc::new(c.catalogue.clone())),
         close_unreached: layer.close_unreached,
+        // With any readability dial set, stairs into dead-end pockets go
+        // (a turned or spread-out town breaks decks into such pockets).
+        prune_dead_end_stairs: plan.maps.iter().any(|m| !m.readability.is_default()),
         ..map_builder::LayerOptions::default()
     };
     let build_time = crate::timings::span("build the layer");
@@ -2391,6 +2878,7 @@ pub fn map_layer(inputs: &Inputs, layer: &LayerSpec) -> Result<MapSummary, Conve
                             &worldspace,
                             &frame,
                             &known,
+                            &map.yaw,
                         );
                     }
                 }
@@ -2403,6 +2891,7 @@ pub fn map_layer(inputs: &Inputs, layer: &LayerSpec) -> Result<MapSummary, Conve
                     .collect();
                 stage.exits = exits_of(built_map);
                 stage.items = items.clone();
+                stage.world_yaw_deg = map.yaw.degrees();
                 stage
             })
             .collect();
@@ -3057,6 +3546,37 @@ fn report_text(
     if let Some(map) = built.maps.first() {
         let report = &map.report;
         map::write_list_section(&mut text, budgets, report, verified);
+        let rows: Vec<map::FidRow> = plan
+            .maps
+            .iter()
+            .flat_map(|m| m.runs.iter())
+            .map(|run| {
+                map::FidRow::of(
+                    run.label.clone(),
+                    run.sliced.as_ref().expect("sliced above"),
+                    run.ground.as_ref().map_or(0, |g| g.tiles.len()),
+                )
+            })
+            .collect();
+        map::write_fid_budget(&mut text, &rows, &report.art_lists);
+        write_tile_reserve(&mut text, plan, budgets);
+    }
+    {
+        let dials: Vec<map::ReadabilityRow<'_>> = plan
+            .maps
+            .iter()
+            .zip(&built.maps)
+            .map(|(m, b)| {
+                (
+                    m.stem.as_str(),
+                    &m.readability,
+                    &m.clip,
+                    b.walkable.iter().map(|w| &w[..]).collect(),
+                    m.view_fit.as_ref(),
+                )
+            })
+            .collect();
+        map::write_readability_section(&mut text, &dials, &inputs.calibration);
     }
     {
         let groups: Vec<(&str, &map::GroupsReport, &map_builder::BuildReport)> = plan
@@ -3150,6 +3670,15 @@ fn report_text(
                 }
                 let _ = scene;
             }
+            if map.readability.foreground_kerb_narrow.is_some()
+                && let Some(d) = &sliced.report.declutter
+            {
+                let _ = writeln!(
+                    text,
+                    "- cutaway on this elevation: {} of {} strips cut, {} of them to the narrow-walkway kerb\n",
+                    d.cutaway.strips_cut, d.cutaway.strips_considered, d.cutaway.strips_narrow
+                );
+            }
             let _ = writeln!(text, "### Art budget\n\n```\n{}\n```\n", sliced.report);
             map::write_slicer_sections(&mut text, sliced);
             if let Some(ground) = &run.ground {
@@ -3163,7 +3692,12 @@ fn report_text(
         }
         if m == 0 || map.declutter.profile != "off" {
             let first = map.runs[0].sliced.as_ref().expect("sliced above");
-            map::write_declutter_section(&mut text, &map.declutter, first);
+            map::write_declutter_section(
+                &mut text,
+                &map.declutter,
+                first,
+                map.readability.foreground_kerb_narrow,
+            );
         }
         let _ = writeln!(text, "## Readability\n");
         for line in b.report.readability_summary() {

@@ -243,7 +243,18 @@ pub(crate) fn cache_key(
     hasher.update(inputs.calibration.to_toml().map_err(stage)?.as_bytes());
     hasher.update(Sha256::digest(palette_bytes));
     hasher.update(format!("{:?}", inputs.backend).as_bytes());
-    hasher.update(inputs.slice.to_toml().as_bytes());
+    // The slice without its `[readability]` table: the effective dials are
+    // hashed below, and only when one differs from its default, so a run
+    // without them (or with every one at its default) keeps its key.
+    let slice = crate::SliceSpec {
+        readability: None,
+        ..inputs.slice.clone()
+    };
+    hasher.update(slice.to_toml().as_bytes());
+    let readability = inputs.readability()?;
+    if !readability.is_default() {
+        hasher.update(readability.key_text().as_bytes());
+    }
     // Only a standalone run hashes its mode, so that every key made before
     // the mode existed stays valid.
     if inputs.standalone {
@@ -607,6 +618,110 @@ pub(crate) struct Scene {
     pub(crate) interior: Option<InteriorScene>,
     /// What the enable-group pass did (`enable_groups`); empty when off.
     pub(crate) groups: GroupsReport,
+    /// The readability dials of this map (`Inputs::readability`): what a
+    /// pass reading a dial asks of the scene.
+    pub(crate) readability: crate::readability::Readability,
+    /// The turn of the source world (`world_yaw_deg`, about the window's
+    /// centre): `cells`, `references` and the sampler are already turned;
+    /// teleports leading into the map are turned by
+    /// [`turn_own_teleports`] (one map) or the layer's pass.
+    pub(crate) yaw: mir::WorldYaw,
+    /// The calibration the map is projected with (`units_per_hex`):
+    /// `inputs.calibration` unless a dial changes it. Renders and the
+    /// terrain take this one; critters and item sprites keep the run's.
+    pub(crate) calibration: foundry_render::Calibration,
+    /// What the turned or spread-out window leaves off.
+    pub(crate) clip: crate::readability::Clip,
+    /// The window's placement for the view border (`fit_view_border`);
+    /// `None`: centred on the slice's centre, as before.
+    pub(crate) view_fit: Option<crate::view_fit::ViewFit>,
+}
+
+/// The map window of an exterior slice and, with `fit_view_border`, how it
+/// was placed (`crate::view_fit`): centred on the slice's centre, or moved
+/// so that the walkable extent (the navmesh of the window's cells and their
+/// neighbours, turned by `yaw`) is centred in the engine's view border.
+pub(crate) fn placed_window(
+    inputs: &Inputs,
+    mir: &Mir,
+    readability: &crate::readability::Readability,
+    projection: &Projection,
+    yaw: &mir::WorldYaw,
+) -> Result<(MapWindow, Option<crate::view_fit::ViewFit>), ConvertError> {
+    let window = MapWindow::from_center(inputs.slice.center(), projection.tile_units());
+    if !readability.fit_view_border {
+        return Ok((window, None));
+    }
+    let worldspace = inputs.slice.worldspace.to_ascii_lowercase();
+    let (xs, ys) = crate::readability::source_window(&window, yaw).cells(1);
+    let mut cells = Vec::new();
+    for y in ys {
+        for x in xs.clone() {
+            if let Some(mut doc) = mir.cell(&worldspace, x, y).map_err(stage)? {
+                yaw.turn_cell(&mut doc);
+                cells.push(doc);
+            }
+        }
+    }
+    let points = crate::view_fit::navmesh_points(&cells);
+    let Some(fit) = crate::view_fit::fit(
+        &window,
+        projection,
+        &points,
+        yaw.centre(),
+        readability.world_yaw_deg,
+        readability.units_per_hex,
+    ) else {
+        return Ok((window, None));
+    };
+    Ok((
+        MapWindow::from_center(fit.centre_after, projection.tile_units()),
+        Some(fit),
+    ))
+}
+
+/// Turns, by the scene's yaw, every teleport of `cells` and `references`
+/// that leads into one of the scene's own cells (the one-map path: a
+/// teleport's arrival lies in the space of the map it leads to). Nothing
+/// without a turn.
+pub(crate) fn turn_own_teleports(
+    scene_cells: &[CellDoc],
+    yaw: &mir::WorldYaw,
+    cells: &mut [CellDoc],
+    references: &mut [mir::Reference],
+) {
+    if yaw.is_identity() {
+        return;
+    }
+    let own: BTreeSet<String> = scene_cells.iter().map(|c| c.form.to_string()).collect();
+    crate::readability::turn_teleports(cells, references, &|form| {
+        own.contains(&form.to_string()).then_some(*yaw)
+    });
+}
+
+/// Fails when a turned or spread-out window leaves the slice's `entrance`
+/// off the map; `what` names the space (`source`, `room`).
+fn check_entrance(
+    slice: &crate::SliceSpec,
+    clip: &crate::readability::Clip,
+    yaw: &mir::WorldYaw,
+    window: &MapWindow,
+) -> Result<(), ConvertError> {
+    if !clip.active {
+        return Ok(());
+    }
+    if let Some([x, y]) = slice.entrance {
+        let [mx, my] = yaw.apply_xy(x, y);
+        if !window.contains(mx, my) {
+            return Err(stage(format!(
+                "the slice's entrance ({x:.0}, {y:.0}) falls outside the map: the readability \
+                 dials leave a window {} units square (today's {}); raise units_per_hex, \
+                 move map_center or the entrance",
+                clip.map_side, clip.today_side
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Where an interior slice's numbers came from, for the report.
@@ -629,14 +744,26 @@ pub(crate) fn scene(inputs: &Inputs, mir: &Mir) -> Result<Scene, ConvertError> {
     if let Some(id) = &inputs.slice.interior {
         return interior_scene(inputs, mir, id);
     }
-    let projection = Projection::new(&inputs.calibration).map_err(stage)?;
-    let window = MapWindow::from_center(inputs.slice.center(), projection.tile_units());
+    let readability = inputs.readability()?;
+    let calibration = readability.map_calibration(&inputs.calibration);
+    let projection = Projection::new(&calibration).map_err(stage)?;
+    let centre = inputs.slice.center();
+    // The turn of the world about the slice's centre; the window (centred
+    // there, or with `fit_view_border` moved to centre the walkable extent
+    // in the engine's view border); the source square the turned window
+    // reads (the window itself for no turn, and for quarter turns about
+    // its own centre).
+    let yaw = readability.yaw(centre, &inputs.calibration);
+    let (window, view_fit) = placed_window(inputs, mir, &readability, &projection, &yaw)?;
+    let source_window = crate::readability::source_window(&window, &yaw);
     let worldspace = inputs.slice.worldspace.to_ascii_lowercase();
-    let sampler = GroundSampler::load(mir, &worldspace, &window).map_err(stage)?;
+    let sampler = GroundSampler::load(mir, &worldspace, &source_window)
+        .map_err(stage)?
+        .turned(yaw);
 
     // Cells the window touches, with a margin so that an object standing
-    // just outside still reaches in.
-    let (xs, ys) = window.cells(1);
+    // just outside still reaches in: chosen in source space, then turned.
+    let (xs, ys) = source_window.cells(1);
     let mut cells: Vec<CellDoc> = Vec::new();
     for y in ys {
         for x in xs.clone() {
@@ -650,6 +777,17 @@ pub(crate) fn scene(inputs: &Inputs, mir: &Mir) -> Result<Scene, ConvertError> {
             "no extracted cell of {} lies in the map window; run extract first, or move map_center",
             inputs.slice.worldspace
         )));
+    }
+    let today = MapWindow::from_center(
+        centre,
+        Projection::new(&inputs.calibration)
+            .map_err(stage)?
+            .tile_units(),
+    );
+    let clip = crate::readability::Clip::of(&cells, &today, &window, &yaw);
+    check_entrance(&inputs.slice, &clip, &yaw, &window)?;
+    for cell in &mut cells {
+        yaw.turn_cell(cell);
     }
     // A reference belongs to the map when its origin is in the window. A
     // standalone run also takes a static whose origin is outside but whose
@@ -717,6 +855,8 @@ pub(crate) fn scene(inputs: &Inputs, mir: &Mir) -> Result<Scene, ConvertError> {
     let slicer_config = map_slicer::SlicerConfig {
         open_hexes,
         landmark_walkers: Some(landmark_walkers),
+        wall_z_scale: readability.wall_z_scale as f32,
+        item_scale: readability.item_scale(&inputs.calibration),
         ..slicer_defaults(inputs.game)
     };
     Ok(Scene {
@@ -731,6 +871,11 @@ pub(crate) fn scene(inputs: &Inputs, mir: &Mir) -> Result<Scene, ConvertError> {
         open,
         interior: None,
         groups: GroupsReport::default(),
+        readability,
+        yaw,
+        calibration,
+        clip,
+        view_fit,
     })
 }
 
@@ -738,7 +883,9 @@ pub(crate) fn scene(inputs: &Inputs, mir: &Mir) -> Result<Scene, ConvertError> {
 /// on a flat floor, the window centred on it, every standable hex open.
 pub(crate) fn interior_scene(inputs: &Inputs, mir: &Mir, id: &str) -> Result<Scene, ConvertError> {
     let slice = &inputs.slice;
-    let projection = Projection::new(&inputs.calibration).map_err(stage)?;
+    let readability = inputs.readability()?;
+    let calibration = readability.map_calibration(&inputs.calibration);
+    let projection = Projection::new(&calibration).map_err(stage)?;
     let doc = mir.interior(id).map_err(stage)?.ok_or_else(|| {
         let known: Vec<&str> = mir.interiors().map(|e| e.id.as_str()).collect();
         stage(format!(
@@ -752,8 +899,8 @@ pub(crate) fn interior_scene(inputs: &Inputs, mir: &Mir, id: &str) -> Result<Sce
             }
         ))
     })?;
-    let cells = vec![doc];
-    let storeys = mir::storeys(&cells[0]);
+    let mut cells = vec![doc];
+    let mut storeys = mir::storeys(&cells[0]);
     let (floor_z, floor_from) = match (slice.floor_z, storeys.first()) {
         (Some(z), _) => (z, "the slice's floor_z"),
         (None, Some(storey)) => (storey.floor_z, "the largest navmesh storey"),
@@ -778,8 +925,25 @@ pub(crate) fn interior_scene(inputs: &Inputs, mir: &Mir, id: &str) -> Result<Sce
         },
     };
     let window = MapWindow::from_center(centre, projection.tile_units());
+    // The room turns about its centre (`world_yaw_deg`).
+    let yaw = readability.yaw(centre, &inputs.calibration);
+    let today = MapWindow::from_center(
+        centre,
+        Projection::new(&inputs.calibration)
+            .map_err(stage)?
+            .tile_units(),
+    );
+    let clip = crate::readability::Clip::of(&cells, &today, &window, &yaw);
+    check_entrance(slice, &clip, &yaw, &window)?;
+    if !yaw.is_identity() {
+        yaw.turn_cell(&mut cells[0]);
+        storeys = mir::storeys(&cells[0]);
+    }
     let (entrance_near, entrance_from) = match slice.entrance {
-        Some(p) => (Some(p), "the slice's entrance".to_owned()),
+        Some(p) => (
+            Some(yaw.apply_xy(p[0], p[1])),
+            "the slice's entrance".to_owned(),
+        ),
         None => match first_door(&cells[0].references) {
             Some(door) => (
                 Some([door.transform.position[0], door.transform.position[1]]),
@@ -828,6 +992,8 @@ pub(crate) fn interior_scene(inputs: &Inputs, mir: &Mir, id: &str) -> Result<Sce
         open_hexes,
         landmark_walkers: Some(landmark_walkers),
         interior: Some(slice.interior_slice(floor_z)),
+        wall_z_scale: readability.wall_z_scale as f32,
+        item_scale: readability.item_scale(&inputs.calibration),
         ..slicer_defaults(inputs.game)
     };
     let interior = InteriorScene {
@@ -853,6 +1019,11 @@ pub(crate) fn interior_scene(inputs: &Inputs, mir: &Mir, id: &str) -> Result<Sce
         open,
         interior: Some(interior),
         groups: GroupsReport::default(),
+        readability,
+        yaw,
+        calibration,
+        clip,
+        view_fit: None,
     })
 }
 
@@ -901,8 +1072,22 @@ pub(crate) fn apply_declutter(
         from,
         ..DeclutterChoice::default()
     };
+    let dials = scene.readability.clone();
+    let refuse = |e: String| ConvertError::Slice {
+        name: inputs.slice.name.clone(),
+        reason: e,
+    };
+    // Link cues are the builder's: they work with the pass on or off.
+    if dials.mark_links {
+        let palette = inputs.palette()?;
+        scene.build_options.mark_links = Some(map_builder::marks::LinkCues {
+            strength: dials.link_cue_strength,
+            ..map_builder::marks::LinkCues::from_palette(&palette)
+        });
+    }
     if profile == "off" {
-        // Validated all the same: tables without the pass are an error.
+        // Validated all the same: tables without the pass are an error, and
+        // so are the dials that act on it (`ground_calm`, the narrow kerb).
         crate::declutter::profile(
             inputs.game,
             &profile,
@@ -910,10 +1095,14 @@ pub(crate) fn apply_declutter(
             inputs.slice.tone.as_ref(),
             &BTreeSet::new(),
         )
-        .map_err(|e| ConvertError::Slice {
-            name: inputs.slice.name.clone(),
-            reason: e,
-        })?;
+        .map_err(refuse)?;
+        crate::declutter::apply_readability(
+            None,
+            dials.ground_calm,
+            dials.foreground_kerb_narrow,
+            dials.narrow_width_hexes,
+        )
+        .map_err(refuse)?;
         return Ok(choice);
     }
     let records = mir.records().map_err(stage)?;
@@ -971,6 +1160,13 @@ pub(crate) fn apply_declutter(
         choice.decorative = Some((rule, items.len()));
         declutter.decorative_items = items;
     }
+    crate::declutter::apply_readability(
+        Some(&mut declutter),
+        dials.ground_calm,
+        dials.foreground_kerb_narrow,
+        dials.narrow_width_hexes,
+    )
+    .map_err(refuse)?;
     choice.referenced = referenced.len();
     choice.interactive = interactive.len();
     scene.build_options.interactive = interactive;
@@ -1236,7 +1432,7 @@ pub(crate) fn apply_slice_keys(slice: &crate::SliceSpec, scene: &mut Scene) {
     if !slice.is_interior()
         && let Some(point) = slice.entrance
     {
-        scene.build_options.entrance_near = Some(point);
+        scene.build_options.entrance_near = Some(scene.yaw.apply_xy(point[0], point[1]));
     }
     if !slice.is_interior() && slice.navmesh_only == Some(true) {
         scene.build_options.navmesh_only = true;
@@ -1250,14 +1446,20 @@ pub(crate) fn apply_slice_keys(slice: &crate::SliceSpec, scene: &mut Scene) {
 }
 
 /// The terrain's tone: the profile's floor tone when the slice gives a
-/// `[tone.floor]` (with the declutter pass on); otherwise none, and the
-/// ground keeps its bytes.
+/// `[tone.floor]` (with the declutter pass on; `ground_calm` is already in
+/// it); otherwise, with `ground_calm` above 0, the calm alone
+/// (`Tone::IDENTITY.calmed`), so that the dial calms the terrain from what
+/// it was; otherwise none, and the ground keeps its bytes.
 pub(crate) fn terrain_tone(
     slice: &crate::SliceSpec,
     config: &map_slicer::SlicerConfig,
+    ground_calm: f64,
 ) -> Option<foundry_render::Tone> {
-    slice.tone.as_ref().and_then(|t| t.floor)?;
-    config.declutter.as_ref().map(|d| d.tones.floor)
+    let declutter = config.declutter.as_ref()?;
+    if slice.tone.as_ref().and_then(|t| t.floor).is_some() {
+        return Some(declutter.tones.floor);
+    }
+    (ground_calm > 0.0).then(|| foundry_render::Tone::IDENTITY.calmed(ground_calm as f32))
 }
 
 /// The teleport door of `references` with the lowest form key: the door a
@@ -1782,19 +1984,28 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
     }
     apply_slice_keys(&inputs.slice, &mut scene);
     apply_enable_groups(inputs, &mir, &mut scene)?;
-    let ground_tone = terrain_tone(&inputs.slice, &scene.slicer_config);
+    let ground_tone = terrain_tone(
+        &inputs.slice,
+        &scene.slicer_config,
+        scene.readability.ground_calm,
+    );
     let Scene {
         projection,
         window,
         worldspace,
         sampler,
-        cells,
-        references,
+        mut cells,
+        mut references,
         mut build_options,
         slicer_config,
         open,
         interior,
         groups,
+        readability,
+        yaw,
+        calibration,
+        clip,
+        view_fit,
     } = scene;
 
     // Interiors the window's doors open on, for the exits. An interior
@@ -1815,14 +2026,22 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
             interiors.insert(key, doc);
         }
     }
+    // Teleports into this map's own cells (the interiors' doors back out
+    // among them) arrive in the turned world.
+    let mut interiors: Vec<CellDoc> = interiors.into_values().collect();
+    let scene_cells = cells.clone();
+    turn_own_teleports(&scene_cells, &yaw, &mut cells, &mut references);
+    turn_own_teleports(&scene_cells, &yaw, &mut interiors, &mut []);
+    drop(scene_cells);
 
     drop(plan_time);
-    let mut renderer =
-        foundry_render::renderer(inputs.backend, &inputs.calibration).map_err(stage)?;
+    // The map's own calibration (`units_per_hex`): the renders and the
+    // terrain take it, and so do their cache keys.
+    let mut renderer = foundry_render::renderer(inputs.backend, &calibration).map_err(stage)?;
     // Renders and grounds come from the content-hash store when their
     // inputs are unchanged (`crate::cache`).
     let store = crate::cache::Store::open(&inputs.store_dir());
-    let calibration_toml = inputs.calibration.to_toml().map_err(stage)?;
+    let calibration_toml = calibration.to_toml().map_err(stage)?;
     let texture_id = |path: &str| mir.texture_hash(path).map(str::to_owned);
     let mut cached = crate::cache::CachedRenderer::new(
         renderer.as_mut(),
@@ -1871,8 +2090,25 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
     // A standalone run has about four times the tiles; greedy merging
     // spends them better than k-means at every cap. A run that extends the
     // base list keeps the default method, and so its bytes.
+    // Link cues (`mark_links`) are painted into new floor tiles after the
+    // terrain: keep back their estimate (the layer path's rule).
+    let cue_reserve = if build_options.mark_links.is_some() {
+        let doors = references
+            .iter()
+            .filter(|r| r.teleport.is_some() && !r.flags.deleted)
+            .count();
+        ((doors * crate::layer::CUE_HEXES_PER_DOOR) as f64 * crate::layer::CUE_TILES_PER_HEX)
+            .ceil()
+            .min(map_builder::marks::DEFAULT_MAX_TILES as f64) as usize
+    } else {
+        0
+    };
     let terrain_options = map_terrain::TerrainOptions {
-        library_cap: budgets.tile_cap,
+        library_cap: budgets
+            .tile_cap
+            .saturating_sub(cue_reserve)
+            .max(budgets.tile_cap / 2)
+            .max(1),
         library_method: if inputs.standalone {
             map_terrain::LibraryMethod::GreedyMerge
         } else {
@@ -1908,7 +2144,7 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
                 &window,
                 &sampler,
                 &projection,
-                &inputs.calibration,
+                &calibration,
                 &palette_map,
                 &overlays,
                 &terrain_options,
@@ -1920,7 +2156,7 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
                 &window,
                 &sampler,
                 &projection,
-                &inputs.calibration,
+                &calibration,
                 &palette_map,
                 &overlays,
                 &terrain_options,
@@ -1998,7 +2234,7 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
     drop(people_time);
     let build_time = crate::timings::span("build the map");
     let mut builder_cells = cells.clone();
-    builder_cells.extend(interiors.into_values());
+    builder_cells.extend(interiors);
     let stem = inputs.slice.map_stem();
     let layer_name = format!("Mojave Foundry: {}", inputs.slice.name);
     let built = map_builder::build_map(&map_builder::BuildInput {
@@ -2087,6 +2323,17 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
         "Window: {} units square, north-west corner at ({}, {}).\n",
         window.size, window.x_west, window.y_north
     );
+    write_readability_section(
+        &mut text,
+        &[(
+            stem.as_str(),
+            &readability,
+            &clip,
+            vec![&built.walkable[..]],
+            view_fit.as_ref(),
+        )],
+        &inputs.calibration,
+    );
     if let Some(scene) = &interior {
         write_interior_section(
             &mut text,
@@ -2100,12 +2347,26 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
     }
     let _ = writeln!(text, "## Art budget\n\n```\n{}\n```\n", sliced.report);
     write_list_section(&mut text, &budgets, report, &verified);
+    write_fid_budget(
+        &mut text,
+        &[FidRow::of(
+            format!("{stem} elevation 0"),
+            &sliced,
+            ground.tiles.len(),
+        )],
+        &report.art_lists,
+    );
     write_slicer_sections(&mut text, &sliced);
     write_ground_section(&mut text, &ground.stats);
     write_open_section(&mut text, &open, protected);
     let _ = writeln!(text, "## Walkability\n\n```\n{:#?}\n```\n", report.walk);
     write_reach_sections(&mut text, report);
-    write_declutter_section(&mut text, &declutter_choice, &sliced);
+    write_declutter_section(
+        &mut text,
+        &declutter_choice,
+        &sliced,
+        readability.foreground_kerb_narrow,
+    );
     let _ = writeln!(text, "## Readability\n");
     for line in report.readability_summary() {
         let _ = writeln!(text, "- {line}");
@@ -2257,6 +2518,7 @@ pub fn map(inputs: &Inputs) -> Result<MapSummary, ConvertError> {
             outside: Vec::new(),
             interior: interior.is_some(),
             walkable: vec![(0, built.walkable.clone())],
+            world_yaw_deg: yaw.degrees(),
             exits: report
                 .exits
                 .iter()
@@ -2399,6 +2661,7 @@ pub(crate) fn write_declutter_section(
     text: &mut String,
     choice: &DeclutterChoice,
     sliced: &map_slicer::Sliced,
+    narrow_kerb: Option<f64>,
 ) {
     let _ = writeln!(text, "## Declutter\n");
     let _ = writeln!(
@@ -2457,6 +2720,13 @@ pub(crate) fn write_declutter_section(
         c.walkers_covered_before,
         c.walkers_covered_after
     );
+    if let Some(kerb) = narrow_kerb {
+        let _ = writeln!(
+            text,
+            "- narrow walkways (`foreground_kerb_narrow` {kerb}): {} of the cut strips cut to the narrow kerb",
+            c.strips_narrow
+        );
+    }
     if let Some(before) = &stats.floor_before {
         let _ = writeln!(text, "- floor before the pass: {before}");
     }
@@ -2663,6 +2933,164 @@ pub(crate) fn write_list_section(
             verified.replaced_art_lists.join(", ")
         }
     );
+}
+
+/// One map elevation's use of the capped art lists, for `## FID budget`.
+#[derive(Debug, Clone)]
+pub(crate) struct FidRow {
+    pub(crate) label: String,
+    pub(crate) tiles: usize,
+    pub(crate) walls: usize,
+    pub(crate) scenery: usize,
+    pub(crate) items: usize,
+    /// The budget ladder's last step, or that it was not climbed.
+    pub(crate) settled: String,
+}
+
+impl FidRow {
+    /// The row of one slicer run and its terrain.
+    pub(crate) fn of(label: String, sliced: &map_slicer::Sliced, tiles: usize) -> FidRow {
+        let used = |category: map_slicer::ArtCategory| {
+            sliced
+                .report
+                .categories
+                .iter()
+                .find(|c| c.category == category)
+                .map_or(0, |c| c.used)
+        };
+        let ladder = &sliced.report.ladder;
+        let settled = match ladder.last() {
+            None => "none: fit at once".to_owned(),
+            Some(step) => format!(
+                "step {} of the ladder: {} ({})",
+                ladder.len(),
+                step.kind.name(),
+                step.change
+            ),
+        };
+        FidRow {
+            label,
+            tiles,
+            walls: used(map_slicer::ArtCategory::Walls),
+            scenery: used(map_slicer::ArtCategory::Scenery),
+            items: used(map_slicer::ArtCategory::Items),
+            settled,
+        }
+    }
+}
+
+/// `## FID budget`: per map and elevation, then in total, the entries of
+/// every art list against the 4,096 a FID can address, with the headroom,
+/// and which step of the budget ladder each run settled on.
+pub(crate) fn write_fid_budget(
+    text: &mut String,
+    rows: &[FidRow],
+    lists: &BTreeMap<String, map_builder::ArtListReport>,
+) {
+    let limit = mir::ART_LIST_LIMIT as usize;
+    let _ = writeln!(text, "## FID budget\n");
+    let _ = writeln!(
+        text,
+        "A FID addresses at most {limit} entries of each art list, the base game's included. \
+         Entries this build's own art takes, per map and elevation:\n"
+    );
+    let _ = writeln!(
+        text,
+        "| map, elevation | tiles | walls | scenery | items | budget step settled on |\n|---|---:|---:|---:|---:|---|"
+    );
+    let mut total = [0usize; 4];
+    for row in rows {
+        for (k, v) in [row.tiles, row.walls, row.scenery, row.items]
+            .into_iter()
+            .enumerate()
+        {
+            total[k] += v;
+        }
+        let _ = writeln!(
+            text,
+            "| {} | {} | {} | {} | {} | {} |",
+            row.label, row.tiles, row.walls, row.scenery, row.items, row.settled
+        );
+    }
+    let _ = writeln!(
+        text,
+        "| total | {} | {} | {} | {} | |\n",
+        total[0], total[1], total[2], total[3]
+    );
+    if rows.len() > 1 {
+        let _ = writeln!(
+            text,
+            "The total adds each run's entries; a list holds fewer when runs share art.\n"
+        );
+    }
+    let _ = writeln!(
+        text,
+        "Every list as written, against the limit:\n\n| list | limit | entries | of which added | headroom | use |\n|---|---:|---:|---:|---:|---:|"
+    );
+    for (name, list) in lists {
+        let entries = list.kept + list.added;
+        let _ = writeln!(
+            text,
+            "| {name} | {limit} | {entries} | {} | {} | {:.1} % |",
+            list.added,
+            limit.saturating_sub(entries),
+            100.0 * entries as f64 / limit as f64
+        );
+    }
+    let _ = writeln!(text);
+}
+
+/// One map for `## Readability dials`: its stem, dials, clip and, per
+/// elevation, the walkable hexes as built.
+pub(crate) type ReadabilityRow<'a> = (
+    &'a str,
+    &'a crate::readability::Readability,
+    &'a crate::readability::Clip,
+    Vec<&'a [bool]>,
+    Option<&'a crate::view_fit::ViewFit>,
+);
+
+/// `## Readability dials`: each map's dials, what its window leaves off,
+/// and how many walkable hexes lie outside the engine's view border (the
+/// camera never centres there; an entry hex must lie inside).
+pub(crate) fn write_readability_section(
+    text: &mut String,
+    maps: &[ReadabilityRow<'_>],
+    calibration: &foundry_render::Calibration,
+) {
+    let _ = writeln!(text, "## Readability dials\n");
+    for (stem, readability, clip, walkable, fit) in maps {
+        if readability.is_default() && !clip.active {
+            let _ = writeln!(text, "- `{stem}`: every dial at its default (today's map)");
+        } else {
+            for line in readability
+                .lines(calibration)
+                .into_iter()
+                .chain(clip.lines())
+            {
+                let _ = writeln!(text, "- `{stem}`: {line}");
+            }
+        }
+        if let Some(fit) = fit {
+            for line in fit.lines() {
+                let _ = writeln!(text, "- `{stem}` view border: {line}");
+            }
+        }
+        for (e, mask) in walkable.iter().enumerate() {
+            let total = mask.iter().filter(|w| **w).count();
+            let outside = mask
+                .iter()
+                .enumerate()
+                .filter(|(h, w)| **w && !map_builder::inside_view_border(*h as i32))
+                .count();
+            let _ = writeln!(
+                text,
+                "- `{stem}` elevation {e}: {outside} of {total} walkable hexes lie outside the \
+                 engine's view border (the camera does not centre there)"
+            );
+        }
+    }
+    let _ = writeln!(text);
 }
 
 /// `## Budget ladder`, `## Landmarks` and `## Trigger volumes skipped`.

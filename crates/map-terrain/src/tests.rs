@@ -190,6 +190,7 @@ impl Probe {
             &geometry,
             options,
             f64::from(options.texture_repeat_units),
+            None,
         )
         .expect("terrain");
         Probe {

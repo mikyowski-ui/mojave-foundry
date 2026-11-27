@@ -21,6 +21,21 @@
 //! clamped to `0..=1` and rounded. Alpha never changes; transparent pixels
 //! are left alone. The power is computed with basic IEEE operations only,
 //! so the bytes are the same on every machine.
+//!
+//! **Ground calm** ([`ClassTones::calmed`], [`Tone::calmed`]). A dial `k`
+//! in `0..=1` that sets walkable ground further back than the class tones
+//! alone do, so walls and props read in front of it. It scales the floor
+//! tone, whatever it is (the preset's, or a slice's `[tone.floor]`):
+//! `gain · (1 - 0.20 k)`, `contrast · (1 - 0.05 k)`, `saturation ·
+//! (1 - 0.35 k)`, gamma unchanged. Props (walls and interactive things
+//! alike, one tone) and figures are left as they are, so against the
+//! calmer ground they gain relative contrast. On the readable preset, 0.5
+//! takes a mid-grey floor pixel (0.4) about 8 % darker than the preset
+//! does and its spread (the slope of the curve) from 0.81 to 0.71; 1.0
+//! about 15 % darker, slope 0.62, saturation 0.55. The darkest pixels (under
+//! about 0.12) are lifted a few levels, as the preset's own contrast does,
+//! so the ground never sinks into black. `k = 0` returns the tone
+//! unchanged, bit for bit.
 
 use serde::{Deserialize, Serialize};
 
@@ -128,7 +143,29 @@ impl Tone {
     pub fn apply_output(&self, output: &mut RenderOutput) {
         self.apply(&mut output.rgba);
     }
+
+    /// This curve with the ground calm `amount` (module documentation)
+    /// laid over it. `amount` is clamped to `0..=1`; 0 (or a value that is
+    /// not finite) returns the curve unchanged.
+    pub fn calmed(self, amount: f32) -> Tone {
+        if !(amount.is_finite() && amount > 0.0) {
+            return self;
+        }
+        let k = amount.min(1.0);
+        Tone {
+            gain: self.gain * (1.0 - CALM_GAIN * k),
+            gamma: self.gamma,
+            saturation: self.saturation * (1.0 - CALM_SATURATION * k),
+            contrast: self.contrast * (1.0 - CALM_CONTRAST * k),
+        }
+    }
 }
+
+/// How much a full ground calm (1.0) takes off the floor's gain,
+/// saturation and contrast ([`Tone::calmed`]).
+const CALM_GAIN: f32 = 0.20;
+const CALM_SATURATION: f32 = 0.35;
+const CALM_CONTRAST: f32 = 0.05;
 
 impl Default for Tone {
     fn default() -> Self {
@@ -174,6 +211,16 @@ impl ClassTones {
                 saturation: 1.1,
                 contrast: 1.05,
             },
+        }
+    }
+
+    /// These tones with the ground calm `ground_calm` (module
+    /// documentation): the floor tone calmed, props and figures as they
+    /// are. 0 returns them unchanged.
+    pub fn calmed(self, ground_calm: f32) -> ClassTones {
+        ClassTones {
+            floor: self.floor.calmed(ground_calm),
+            ..self
         }
     }
 
@@ -350,6 +397,106 @@ mod tests {
         assert!(sum(floor) < sum(mid));
         assert!(sum(figure) > sum(mid));
         assert_eq!(tones.props.apply_rgb(mid), mid);
+    }
+
+    /// A synthetic floor: a ramp of warm and cool greys, opaque.
+    fn floor_ramp() -> Vec<u8> {
+        let mut rgba = Vec::new();
+        for i in 0..64u32 {
+            let v = 30 + i * 3;
+            let (r, g, b) = if i % 2 == 0 {
+                (v + 12, v, v.saturating_sub(10))
+            } else {
+                (v.saturating_sub(6), v, v + 8)
+            };
+            rgba.extend([r as u8, g as u8, b as u8, 255]);
+        }
+        rgba
+    }
+
+    /// Mean and standard deviation of the luma, and the mean chroma (largest
+    /// minus smallest channel).
+    fn measure(rgba: &[u8]) -> (f64, f64, f64) {
+        let px: Vec<[f64; 3]> = rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|p| [f64::from(p[0]), f64::from(p[1]), f64::from(p[2])])
+            .collect();
+        let n = px.len() as f64;
+        let luma: Vec<f64> = px
+            .iter()
+            .map(|c| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2])
+            .collect();
+        let mean = luma.iter().sum::<f64>() / n;
+        let spread = (luma.iter().map(|y| (y - mean).powi(2)).sum::<f64>() / n).sqrt();
+        let chroma = px
+            .iter()
+            .map(|c| {
+                c.iter().copied().fold(f64::MIN, f64::max)
+                    - c.iter().copied().fold(f64::MAX, f64::min)
+            })
+            .sum::<f64>()
+            / n;
+        (mean, spread, chroma)
+    }
+
+    #[test]
+    fn ground_calm_zero_is_the_preset_bit_for_bit() {
+        let tones = ClassTones::readable();
+        assert_eq!(tones.calmed(0.0), tones);
+        assert_eq!(tones.calmed(-1.0), tones);
+        assert_eq!(tones.calmed(f32::NAN), tones);
+        assert_eq!(Tone::IDENTITY.calmed(0.0), Tone::IDENTITY);
+        // Above 1 is a full calm.
+        assert_eq!(tones.calmed(3.0), tones.calmed(1.0));
+        assert!(tones.calmed(1.0).validate().is_ok());
+    }
+
+    #[test]
+    fn ground_calm_lowers_floor_luminance_contrast_and_colour_monotonically() {
+        let base = ClassTones::readable();
+        let mut last: Option<(f64, f64, f64)> = None;
+        for step in 0..=4 {
+            let k = step as f32 / 4.0;
+            let tones = base.calmed(k);
+            let mut floor = floor_ramp();
+            tones.floor.apply(&mut floor);
+            let now = measure(&floor);
+            if let Some(before) = last {
+                assert!(now.0 < before.0, "luminance at {k}: {now:?} vs {before:?}");
+                assert!(now.1 < before.1, "contrast at {k}: {now:?} vs {before:?}");
+                assert!(now.2 <= before.2, "chroma at {k}: {now:?} vs {before:?}");
+            }
+            last = Some(now);
+            // Walls and props, and figures, never change.
+            assert_eq!(tones.props, base.props);
+            assert_eq!(tones.figures, base.figures);
+        }
+        // 1.0 is strong but not a black or grey wash: the ramp keeps most
+        // of its spread and its mean stays well off black.
+        let mut preset = floor_ramp();
+        base.floor.apply(&mut preset);
+        let mut full = floor_ramp();
+        base.calmed(1.0).floor.apply(&mut full);
+        let (p, f) = (measure(&preset), measure(&full));
+        assert!(f.0 > 0.6 * p.0 && f.0 < 0.95 * p.0, "{f:?} vs {p:?}");
+        assert!(f.1 > 0.6 * p.1 && f.1 < 0.9 * p.1, "{f:?} vs {p:?}");
+    }
+
+    #[test]
+    fn props_stand_out_more_against_a_calmer_floor() {
+        // The same colour as floor and as prop: the gap widens with the calm.
+        let colour = [150, 130, 110];
+        let luma = |c: [u8; 3]| {
+            0.2126 * f64::from(c[0]) + 0.7152 * f64::from(c[1]) + 0.0722 * f64::from(c[2])
+        };
+        let gap = |k: f32| {
+            let t = ClassTones::readable().calmed(k);
+            luma(t.props.apply_rgb(colour)) - luma(t.floor.apply_rgb(colour))
+        };
+        assert!(gap(0.5) > gap(0.0));
+        assert!(gap(1.0) > gap(0.5));
     }
 
     #[test]

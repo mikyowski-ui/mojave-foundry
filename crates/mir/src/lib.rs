@@ -107,6 +107,7 @@ mod report;
 mod simlogic;
 mod source;
 pub mod storeys;
+mod yaw;
 
 pub use actors::{
     ARMED_FAMILIES, DEFAULT_FAMILIES, DEFAULT_WEAPONS, HUMAN_ANIMATIONS, HUMAN_SKELETON,
@@ -150,3 +151,4 @@ pub use simlogic::{
 };
 pub use source::DataSource;
 pub use storeys::{DEFAULT_STOREY_GAP, Storey, navmesh_storeys, storeys, storeys_with_gap};
+pub use yaw::WorldYaw;

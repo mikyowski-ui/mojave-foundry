@@ -147,6 +147,12 @@ struct Mode {
     /// 1) into the same layer, the doors linked both ways.
     #[arg(long)]
     with_interiors: bool,
+    /// A readability dial, KEY=VALUE (repeatable; wins over the slice's and
+    /// the layer's `[readability]` tables): world_yaw_deg, units_per_hex,
+    /// wall_z_scale, lower_level_dim, lower_level_desaturate,
+    /// foreground_kerb_narrow, narrow_width_hexes, ground_calm, mark_links.
+    #[arg(long, value_name = "KEY=VALUE")]
+    readability: Vec<String>,
 }
 
 impl Common {
@@ -154,6 +160,14 @@ impl Common {
         let mut inputs = self.inputs()?;
         inputs.standalone = mode.standalone;
         inputs.with_interiors = mode.with_interiors;
+        for text in &mode.readability {
+            let one = mojave_convert::readability::ReadabilitySpec::parse_assignment(text)
+                .map_err(|e| ConvertError::stage("arguments", e))?;
+            inputs.readability_cli = inputs.readability_cli.over(&one);
+        }
+        // Checked now, before any stage runs.
+        mojave_convert::readability::Readability::from_spec(&inputs.readability_cli)
+            .map_err(|e| ConvertError::stage("arguments", e))?;
         if let Some(name) = &mode.declutter {
             if !mojave_convert::declutter::PROFILES.contains(&name.as_str()) {
                 return Err(ConvertError::stage(

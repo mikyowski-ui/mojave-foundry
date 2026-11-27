@@ -1024,9 +1024,52 @@ pub fn shots(options: &ShotsOptions) -> Result<ShotsSummary, ConvertError> {
     })
 }
 
+/// A file name with an optional crop, `FILE.png@X,Y,WxH` (pixels): the
+/// file and the rectangle. A name whose suffix does not parse is a file.
+fn split_crop(path: &Path) -> (PathBuf, Option<[u32; 4]>) {
+    let text = path.to_string_lossy();
+    if let Some((file, crop)) = text.rsplit_once('@') {
+        let parts: Option<[u32; 4]> = (|| {
+            let (x, rest) = crop.split_once(',')?;
+            let (y, size) = rest.split_once(',')?;
+            let (w, h) = size.split_once('x')?;
+            Some([
+                x.parse().ok()?,
+                y.parse().ok()?,
+                w.parse().ok()?,
+                h.parse().ok()?,
+            ])
+        })();
+        if let Some(rect) = parts.filter(|r| r[2] > 0 && r[3] > 0) {
+            return (PathBuf::from(file), Some(rect));
+        }
+    }
+    (path.to_path_buf(), None)
+}
+
+/// `image` cut to `rect` (clamped to the image).
+fn crop(image: foundry_gallery::Image, rect: [u32; 4]) -> foundry_gallery::Image {
+    let [x, y, w, h] = rect;
+    let x = x.min(image.width.saturating_sub(1));
+    let y = y.min(image.height.saturating_sub(1));
+    let w = w.min(image.width - x);
+    let h = h.min(image.height - y);
+    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    for row in y..y + h {
+        let start = ((row * image.width + x) * 4) as usize;
+        rgba.extend_from_slice(&image.rgba[start..start + (w * 4) as usize]);
+    }
+    foundry_gallery::Image {
+        width: w,
+        height: h,
+        rgba,
+    }
+}
+
 /// A contact page of PNG files of any size, each under its label, scaled
 /// down to fit `max_cell`, `columns` to a row: for choosing and showing
-/// frames (`mojave-convert contact`).
+/// frames (`mojave-convert contact`). A file named `FILE.png@X,Y,WxH` is
+/// cut to that rectangle first.
 pub fn contact_page(
     entries: &[(String, PathBuf)],
     title: Option<&str>,
@@ -1036,9 +1079,14 @@ pub fn contact_page(
 ) -> Result<(), ConvertError> {
     let mut images = Vec::new();
     for (label, path) in entries {
-        let bytes = std::fs::read(path).map_err(io(path))?;
+        let (path, rect) = split_crop(path);
+        let bytes = std::fs::read(&path).map_err(io(&path))?;
         let image = foundry_gallery::decode_png(&bytes)
             .map_err(|e| stage(format!("{}: {e}", path.display())))?;
+        let image = match rect {
+            Some(r) => crop(image, r),
+            None => image,
+        };
         images.push((label.as_str(), image));
     }
     if images.is_empty() {

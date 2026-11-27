@@ -87,6 +87,12 @@ pub(crate) struct RenderKey {
     /// Declutter, outdoors: a digest of the roof triangles left out over
     /// walkable ground. `None`: none.
     roof: Option<u64>,
+    /// The readability dials' scale in map axes after the reference's own
+    /// transform, quantised by `scale_quantum`: horizontal (an item kept at
+    /// its size on a spread-out map, [`SlicerConfig::item_scale`]) and
+    /// vertical (a wall compressed, [`SlicerConfig::wall_z_scale`]). `None`
+    /// for neither: the render is today's.
+    stretch: Option<[i64; 2]>,
 }
 
 impl RenderKey {
@@ -131,7 +137,43 @@ impl RenderKey {
             cut: None,
             look: 0,
             roof: None,
+            stretch: None,
         })
+    }
+
+    /// The key of a render scaled by `horizontal` along both ground axes
+    /// and by `vertical` along the height, in map axes after the
+    /// reference's own transform (about its origin). Both 1 keeps the key.
+    pub(crate) fn with_stretch(
+        self,
+        horizontal: f32,
+        vertical: f32,
+        config: &SlicerConfig,
+    ) -> Self {
+        if horizontal == 1.0 && vertical == 1.0 {
+            return self;
+        }
+        let q = |v: f32| (f64::from(v) / f64::from(config.scale_quantum)).round() as i64;
+        RenderKey {
+            stretch: Some([q(horizontal), q(vertical)]),
+            ..self
+        }
+    }
+
+    /// The vertical scale of [`RenderKey::with_stretch`]; 1 without one.
+    pub(crate) fn vertical(&self, config: &SlicerConfig) -> f32 {
+        self.stretch.map_or(1.0, |[_, v]| {
+            (v as f64 * f64::from(config.scale_quantum)) as f32
+        })
+    }
+
+    /// A height above the reference's anchor as drawn: scaled by the
+    /// vertical stretch, unchanged (bit for bit) without one.
+    pub(crate) fn drawn_height(&self, height: f32, config: &SlicerConfig) -> f32 {
+        match self.stretch {
+            Some(_) => height * self.vertical(config),
+            None => height,
+        }
     }
 
     /// The key of a render drawn with the wire rule's `look` bits.
@@ -154,8 +196,25 @@ impl RenderKey {
         }
     }
 
-    /// The canonical transform: no translation.
+    /// The canonical transform: no translation; the stretch, if any,
+    /// applied after the reference's own transform.
     pub(crate) fn matrix(&self, config: &SlicerConfig) -> [[f32; 4]; 3] {
+        let mut m = self.base_matrix(config);
+        if let Some([h, v]) = self.stretch {
+            let d = |v: i64| (v as f64 * f64::from(config.scale_quantum)) as f32;
+            let factors = [d(h), d(h), d(v)];
+            for (row, factor) in m.iter_mut().zip(factors) {
+                for value in row.iter_mut().take(3) {
+                    *value *= factor;
+                }
+            }
+        }
+        m
+    }
+
+    /// The canonical transform without the stretch: what the interior split
+    /// and the ceiling cut work on (they are in source heights).
+    pub(crate) fn base_matrix(&self, config: &SlicerConfig) -> [[f32; 4]; 3] {
         let d = |v: i64, step: f32| (v as f64 * f64::from(step)) as f32;
         Transform {
             position: [0.0; 3],
@@ -163,6 +222,25 @@ impl RenderKey {
             scale: d(self.scale, config.scale_quantum),
         }
         .matrix()
+    }
+}
+
+/// The readability stretch of reference `r` of class `class`: a wall or
+/// building shell (a sliced reference of a wall kind) compressed by
+/// [`SlicerConfig::wall_z_scale`]; an item kept at its size by
+/// [`SlicerConfig::item_scale`]. `(1, 1)` for everything else.
+fn stretch_of(r: &Reference, class: &Class, config: &SlicerConfig) -> (f32, f32) {
+    match class {
+        Class::Sliced
+            if config.wall_z_scale != 1.0
+                && r.base_kind
+                    .as_deref()
+                    .is_some_and(|k| config.wall_kinds.iter().any(|w| w == k)) =>
+        {
+            (1.0, config.wall_z_scale)
+        }
+        Class::Sprite(Role::Item) if config.item_scale != 1.0 => (config.item_scale, 1.0),
+        _ => (1.0, 1.0),
     }
 }
 
@@ -315,8 +393,28 @@ pub(crate) fn standing_on(
     floor: Option<f32>,
     reference: &Reference,
 ) -> Option<([i64; 2], [i32; 2], f32)> {
+    standing_scaled(projection, window, sampler, floor, reference, None)
+}
+
+/// [`standing_on`] for a render compressed by `vertical` about the anchor
+/// (the terrain under the origin, or the floor): the origin stands at
+/// `ground + vertical · (z - ground)`, so the roofs and upper storeys of a
+/// building compressed piece by piece move down with it. `None` is
+/// [`standing_on`], bit for bit.
+pub(crate) fn standing_scaled(
+    projection: &Projection,
+    window: &MapWindow,
+    sampler: &GroundSampler,
+    floor: Option<f32>,
+    reference: &Reference,
+    vertical: Option<f32>,
+) -> Option<([i64; 2], [i32; 2], f32)> {
     let [x, y, z] = reference.transform.position;
     let ground_z = floor.unwrap_or_else(|| sampler.height(x, y).unwrap_or(z));
+    let z = match vertical {
+        Some(v) => ground_z + v * (z - ground_z),
+        None => z,
+    };
     let anchor = [window.x_west, window.y_north, ground_z];
     let g = projection.screen(projection.tile_from_source(anchor, [x, y, ground_z]));
     let p = projection.screen(projection.tile_from_source(anchor, [x, y, z]));
@@ -849,15 +947,19 @@ fn run_once(
     // The declutter pass (the `declutter` module), when it is on.
     let decision = config.declutter.as_ref().zip(prepared.decision.as_ref());
     let walkers = decision.map(|(profile, _)| profile.walkers_of(config));
+    // Outdoors without `exteriors`, the narrow-walkway kerb alone still
+    // cuts the strips beside narrow walkways (`narrow_only`), and only
+    // those.
     let cutaway = decision.and_then(|(profile, _)| {
         profile.cutaway.as_ref().filter(|c| {
             if interior.is_some() {
                 c.interiors
             } else {
-                c.exteriors
+                c.exteriors || c.narrow_kerb_height.is_some()
             }
         })
     });
+    let narrow_only = interior.is_none() && cutaway.is_some_and(|c| !c.exteriors);
     let mut cut_stats = CutawayStats::default();
     let mut covered = (BTreeSet::new(), BTreeSet::new());
     let mut door_covered = (BTreeSet::new(), BTreeSet::new());
@@ -993,6 +1095,8 @@ fn run_once(
                         _ => key,
                     };
                     let key = key.with_look(look).with_roof(roofs.get(&i).copied());
+                    let (horizontal, vertical) = stretch_of(r, class, config);
+                    let key = key.with_stretch(horizontal, vertical, config);
                     groups.entry(key).or_default().push(i)
                 }
                 None => skip(&mut skipped, r, SkipReason::NoMesh),
@@ -1046,7 +1150,7 @@ fn run_once(
             let mut split = match (key.lift(), interior) {
                 (Some(lift), Some(indoors)) => Some(interior::split_at(
                     mesh,
-                    &key.matrix(config),
+                    &key.base_matrix(config),
                     lift,
                     indoors,
                     config.floor_min_up,
@@ -1212,8 +1316,9 @@ fn run_once(
                 let r = prepared.refs[i];
                 let class = &classes[i];
                 let model = model_of(r);
+                let vertical = key.stretch.map(|_| key.vertical(config));
                 let Some((ground, offset, ground_z)) =
-                    standing_on(projection, window, sampler, floor_z, r)
+                    standing_scaled(projection, window, sampler, floor_z, r, vertical)
                 else {
                     skip(&mut skipped, r, SkipReason::OutsideMap);
                     demote(&mut report, class.kind());
@@ -1259,6 +1364,7 @@ fn run_once(
                                     offset,
                                     lift: r.transform.position[2]
                                         - foot.map_or(floor, |z| z.max(floor)),
+                                    narrow_only,
                                 };
                                 let cut = cutaway::trim_door(
                                     &canvas,
@@ -1594,7 +1700,7 @@ fn run_once(
                                 projection,
                                 mesh,
                                 key.matrix(config),
-                                r.transform.position[2] - ground_z,
+                                key.drawn_height(r.transform.position[2] - ground_z, config),
                                 textures,
                                 map,
                                 ground,
@@ -1635,13 +1741,22 @@ fn run_once(
                                     // The kerb stands on the wall's own foot
                                     // (a raised ring, a sunken pit), never
                                     // below the floor band or the terrain.
-                                    lift: r.transform.position[2]
-                                        - footprint.as_ref().map_or(ground_z, |f| {
-                                            f.z[0].max(match interior {
-                                                Some(indoors) => ground_z + indoors.floor_band[0],
-                                                None => ground_z,
-                                            })
-                                        }),
+                                    // A compressed wall's kerb stands on its
+                                    // compressed foot: the kerb keeps its
+                                    // drawn height.
+                                    lift: key.drawn_height(
+                                        r.transform.position[2]
+                                            - footprint.as_ref().map_or(ground_z, |f| {
+                                                f.z[0].max(match interior {
+                                                    Some(indoors) => {
+                                                        ground_z + indoors.floor_band[0]
+                                                    }
+                                                    None => ground_z,
+                                                })
+                                            }),
+                                        config,
+                                    ),
+                                    narrow_only,
                                 })
                             }
                             _ => None,
@@ -1676,6 +1791,7 @@ fn run_once(
                         if let Some(t) = trimmed {
                             cut_stats.strips_considered += t.considered;
                             cut_stats.strips_cut += t.cut;
+                            cut_stats.strips_narrow += t.narrow;
                             cut_stats.pixels_removed += t.pixels_removed;
                             cut_stats.strips_emptied += t.emptied.len();
                             covered.0.extend(t.covered_before);

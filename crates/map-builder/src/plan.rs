@@ -1242,6 +1242,27 @@ pub(crate) fn would_place(plan: &MapPlan, e: usize) -> Vec<Spot> {
     place_on(plan, e, &plan.elevations[e].walkable, &reserved).0
 }
 
+/// The engine's view border (`vault-engine`, the map border of its view
+/// centre): mirrored columns (`199 - column`) and rows, both exclusive. A
+/// view centre, and so a map's entry hex, must lie inside it; the camera
+/// never centres on a hex outside it. Every map is 200 by 200 hexes and
+/// the border does not depend on its contents.
+pub const VIEW_BORDER_COLUMNS: (i32, i32) = (43, 155);
+pub const VIEW_BORDER_ROWS: (i32, i32) = (44, 155);
+
+/// Whether the camera can centre on `hex` ([`VIEW_BORDER_COLUMNS`],
+/// [`VIEW_BORDER_ROWS`]).
+pub fn inside_view_border(hex: i32) -> bool {
+    if !(0..40_000).contains(&hex) {
+        return false;
+    }
+    let (mirrored, row) = (199 - hex % 200, hex / 200);
+    VIEW_BORDER_COLUMNS.0 < mirrored
+        && mirrored < VIEW_BORDER_COLUMNS.1
+        && VIEW_BORDER_ROWS.0 < row
+        && row < VIEW_BORDER_ROWS.1
+}
+
 /// The entrance by the crate notes' rule: in the largest component (with
 /// `nearest_component`, the component of the walkable hex nearest
 /// `centre`), off the border and `avoid`, clearest [`Sight`] by `rule`
@@ -1278,33 +1299,42 @@ pub(crate) fn entrance(
         .collect();
     candidates.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
     let steps = |hex: i32| HexGrid::lattice_distance(nearest, hex).unwrap_or(0);
-    let mut fallback: [Option<i32>; 2] = [None, None];
-    for (_, hex) in candidates {
-        match cover.sight_by(hex, figure, rule) {
-            Sight::Clear => {
+    // Inside the engine's view border first: an entry hex outside it fails
+    // the map's load. Every entrance that loaded before is inside it, and
+    // is then also the first of its tier among the hexes inside, so such a
+    // map keeps its entrance; only one the border refused moves.
+    for inside in [true, false] {
+        let mut fallback: [Option<i32>; 2] = [None, None];
+        for &(_, hex) in candidates
+            .iter()
+            .filter(|(_, hex)| !inside || inside_view_border(*hex))
+        {
+            match cover.sight_by(hex, figure, rule) {
+                Sight::Clear => {
+                    return Some(EntranceReport {
+                        hex,
+                        sight: Sight::Clear,
+                        in_main: true,
+                        steps_from_centre: steps(hex),
+                    });
+                }
+                Sight::Behind => {
+                    fallback[0].get_or_insert(hex);
+                }
+                Sight::Covered => {
+                    fallback[1].get_or_insert(hex);
+                }
+            }
+        }
+        for (slot, sight) in [(fallback[0], Sight::Behind), (fallback[1], Sight::Covered)] {
+            if let Some(hex) = slot {
                 return Some(EntranceReport {
                     hex,
-                    sight: Sight::Clear,
+                    sight,
                     in_main: true,
                     steps_from_centre: steps(hex),
                 });
             }
-            Sight::Behind => {
-                fallback[0].get_or_insert(hex);
-            }
-            Sight::Covered => {
-                fallback[1].get_or_insert(hex);
-            }
-        }
-    }
-    for (slot, sight) in [(fallback[0], Sight::Behind), (fallback[1], Sight::Covered)] {
-        if let Some(hex) = slot {
-            return Some(EntranceReport {
-                hex,
-                sight,
-                in_main: true,
-                steps_from_centre: steps(hex),
-            });
         }
     }
     Some(EntranceReport {

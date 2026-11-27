@@ -230,6 +230,9 @@ pub struct CutawayStats {
     pub strips_considered: usize,
     /// Strips cropped to the kerb.
     pub strips_cut: usize,
+    /// Of those, cropped to the narrow-walkway kerb
+    /// ([`crate::Cutaway::narrow_kerb_height`]); 0 with the rule off.
+    pub strips_narrow: usize,
     /// Opaque pixels they lost.
     pub pixels_removed: u64,
     /// Cut strips left with no pixel (their hexes block without art).
