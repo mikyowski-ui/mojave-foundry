@@ -6,10 +6,12 @@
 //! ```text
 //! cargo run -p transpile --example build_report -- <mir dir> <map-placements.json>
 //!     [--speaker EDID]... [--topic EDID]... [--quest EDID]... [--json out.json]
+//!     [--team-faction EDID]...
 //! ```
 //!
 //! `--speaker`, `--topic` and `--quest` print what the build made of those
-//! records. Reads only; prints counts and editor ids, never source text.
+//! records. `--team-faction` adds to `SimConfig::team_factions` (spec 7.5).
+//! Reads only; prints counts and editor ids, never source text.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -24,7 +26,7 @@ use transpile::ir::{
 fn usage() -> ! {
     eprintln!(
         "usage: build_report <mir dir> <map-placements.json> [--speaker EDID]... \
-         [--topic EDID]... [--quest EDID]... [--json out.json]"
+         [--topic EDID]... [--quest EDID]... [--json out.json] [--team-faction EDID]..."
     );
     std::process::exit(2)
 }
@@ -98,6 +100,7 @@ fn main() {
     let mut topics = Vec::new();
     let mut quests = Vec::new();
     let mut json_out: Option<PathBuf> = None;
+    let mut config = SimConfig::default();
     while let Some(flag) = args.next() {
         let value = args.next().unwrap_or_else(|| usage());
         match flag.as_str() {
@@ -105,6 +108,7 @@ fn main() {
             "--topic" => topics.push(value),
             "--quest" => quests.push(value),
             "--json" => json_out = Some(PathBuf::from(value)),
+            "--team-faction" => config.team_factions.push(value),
             _ => usage(),
         }
     }
@@ -127,7 +131,7 @@ fn main() {
         std::process::exit(1)
     });
     let started = std::time::Instant::now();
-    let module = match transpile::build(&mir, &slice, &SimConfig::default()) {
+    let module = match transpile::build(&mir, &slice, &config) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("build failed: {e}");

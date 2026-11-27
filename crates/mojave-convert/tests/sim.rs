@@ -166,6 +166,58 @@ fn all_with_sim_writes_a_layer_the_engine_loads_and_reruns_change_nothing() {
     assert!(!outcome.cached);
     let report = outcome.report.expect("a report");
     assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+    // The layer file's `[sim_options]` reached the build: the map stage
+    // left it for the stage, the stage built with it (the unknown faction
+    // is reported), and a `--config` `[sim]` table is laid over it.
+    let options = std::fs::read_to_string(out.join(mojave_convert::layer::SIM_OPTIONS_FILE))
+        .expect("sim-options.toml");
+    assert!(options.contains("MMShopFaction"), "{options}");
+    let listed = ["MMShopFaction".to_owned(), "MMNoSuchFaction".to_owned()];
+    let packages = report
+        .build_sections
+        .iter()
+        .find(|s| s.section == Some(transpile::diag::Section::Packages))
+        .expect("the packages section");
+    assert!(
+        packages
+            .reasons
+            .contains_key("unknown_team_faction MMNoSuchFaction"),
+        "{:?}",
+        packages.reasons
+    );
+    assert!(
+        report
+            .key_parts
+            .iter()
+            .any(|(name, value)| name == "sim options" && value.contains("MMShopFaction"))
+    );
+    let config = |given: transpile::ir::SimConfig| {
+        SimInputs::load(
+            &out,
+            &SimOptions {
+                config: given,
+                ..SimOptions::default()
+            },
+        )
+        .expect("loads")
+        .config
+    };
+    let base = config(transpile::ir::SimConfig::default());
+    assert_eq!(base.team_factions, listed);
+    let deeper = config(transpile::ir::SimConfig {
+        quest_depth: 3,
+        ..Default::default()
+    });
+    assert_eq!(
+        (deeper.quest_depth, deeper.team_factions),
+        (3, listed.to_vec())
+    );
+    let replaced = config(transpile::ir::SimConfig {
+        team_factions: vec!["Other".into()],
+        ..Default::default()
+    });
+    assert_eq!(replaced.team_factions, ["Other"]);
     assert!(report.program_count > 0, "{report:?}");
     let layer = tree_of(&layer_dir);
     let (programs, failures) = check_programs(&layer);
@@ -435,4 +487,51 @@ fn report_only_runs_on_a_reconstructed_index_and_bad_indexes_are_refused() {
     std::fs::remove_dir_all(out.join("mir")).expect("remove the MIR");
     let error = SimInputs::load(&out, &options).expect_err("no MIR");
     assert!(error.to_string().starts_with("mir:"), "{error}");
+}
+
+/// A build error is a failed run: the report is still written, the error
+/// lines go to stderr, the exit status is non-zero. `--report-only`
+/// follows the same rule; a run with no error succeeds.
+#[test]
+fn a_lowering_error_fails_the_command_and_still_writes_the_report() {
+    use std::process::Command;
+    let fixture = common::fixture();
+    let mart = mini_mart::write_sim(&fixture.root.path().join("sim"));
+    let on = run_pipeline(&fixture, &mart.layer_file, "out-fail");
+    pipeline::all(&on).expect("the pipeline runs");
+    let out = on.out.clone();
+    let exe = env!("CARGO_BIN_EXE_mojave-convert");
+    let run = |extra: &[&str]| {
+        Command::new(exe)
+            .arg("sim")
+            .arg("--out")
+            .arg(&out)
+            .args(extra)
+            .output()
+            .expect("runs")
+    };
+    let f2 = fixture.f2.to_str().expect("utf-8");
+
+    // The good run, forced: success.
+    let good = run(&["--f2", f2, "--force"]);
+    assert!(good.status.success(), "{good:?}");
+
+    // A base file the lowering cannot take: the install's vault13.gam has
+    // a line that is not a variable.
+    let data = fixture.f2.join("data").join("data");
+    std::fs::create_dir_all(&data).expect("dir");
+    std::fs::write(data.join("vault13.gam"), "GVAR_BROKEN := not a number;\n").expect("write");
+    std::fs::remove_file(out.join(sim::REPORT_FILE)).expect("remove the report");
+    for extra in [
+        &["--f2", f2, "--force"][..],
+        &["--report-only", "--f2", f2][..],
+    ] {
+        let bad = run(extra);
+        let stderr = String::from_utf8_lossy(&bad.stderr);
+        assert!(!bad.status.success(), "{extra:?}: {bad:?}");
+        assert!(stderr.contains("build error: "), "{extra:?}: {stderr}");
+        let report = std::fs::read_to_string(out.join(sim::REPORT_FILE)).expect("the report");
+        assert!(report.contains("## Build errors"), "{report}");
+        std::fs::remove_file(out.join(sim::REPORT_FILE)).expect("remove the report");
+    }
 }

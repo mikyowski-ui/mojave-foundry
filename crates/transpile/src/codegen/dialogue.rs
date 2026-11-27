@@ -957,7 +957,9 @@ impl Gen<'_, '_> {
             p.jump(&done);
             p.place(&none);
         }
-        let label = self.label(1);
+        // No greeting passes (or the speaker has none): the converter's
+        // greeting label, then the hub (spec 4.9).
+        let label = self.label(crate::texts::GREETING_LABEL);
         p.push_i(self.list);
         p.push_i(label);
         p.host(hw::GSAY_REPLY);

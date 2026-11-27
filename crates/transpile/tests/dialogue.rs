@@ -233,3 +233,101 @@ fn once_flags() {
             .contains_key(&info(EITHER_INFO).with_sub(once_sub::SAY_ONCE))
     );
 }
+
+/// The town's source with a second, low-priority quest that is gated on
+/// `IsInList` of a form list holding the mayor: three random greeting
+/// INFOs of it, one first in file order and two last.
+fn town_with_a_generic_quest() -> Module {
+    use transpile::source::{SourceCondition, SourceInfo, SourceQuest, SourceResponse};
+    let dir = tempfile::tempdir().unwrap();
+    let mir = testkit::extract(dir.path(), false);
+    let mut source = transpile::source::load(&mir, &testkit::slice(false)).unwrap();
+    let (generic, list) = (key(0x8E0), key(0x8E1));
+    source.quests.get_mut(&key(QUEST)).unwrap().priority = 50;
+    source.quests.insert(
+        generic.clone(),
+        SourceQuest {
+            editor_id: Some("TSGenericQuest".into()),
+            name: None,
+            script: None,
+            flags: 1,
+            priority: 5,
+            delay: None,
+            stages: Vec::new(),
+            objectives: Vec::new(),
+            conditions: vec![SourceCondition::literal(372, "==", 1.0).with_form(list.clone())],
+        },
+    );
+    source.form_lists.insert(list, vec![key(MAYOR)]);
+    for info in source.infos.values_mut() {
+        if info.topic == key(GREETING) {
+            info.order.1 += 10;
+        }
+    }
+    for (form, order, flags) in [(0x8E2, 0, 0x02), (0x8E3, 100, 0x02), (0x8E4, 101, 0x02)] {
+        source.infos.insert(
+            key(form),
+            SourceInfo {
+                topic: key(GREETING),
+                quest: Some(generic.clone()),
+                order: (0, order),
+                info_type: 0,
+                flags,
+                speaker: None,
+                prompt: None,
+                responses: vec![SourceResponse {
+                    number: 1,
+                    emotion_type: 0,
+                    emotion_value: 0,
+                    text: "Hello there.".into(),
+                }],
+                conditions: Vec::new(),
+                choices: Vec::new(),
+                link_from: Vec::new(),
+                add_topics: Vec::new(),
+                begin: None,
+                end: None,
+                challenge: None,
+                label: None,
+                knam: None,
+                knam_sig: None,
+            },
+        );
+    }
+    transpile::build_module(&source, &testkit::slice(false), &Default::default()).unwrap()
+}
+
+#[test]
+fn picks_follow_quest_priority_and_random_groups_stay_in_one_quest() {
+    let m = town_with_a_generic_quest();
+    let mayor = &m.dialogues[&key(MAYOR)];
+    let ordinal = |i: u32| {
+        mayor
+            .nodes
+            .iter()
+            .find(|n| n.info == info(i))
+            .unwrap_or_else(|| panic!("no node for {i:#x}"))
+            .ordinal
+    };
+    // The quest of priority 50 first, in file order, though the generic
+    // quest's first INFO comes before them in the file; then the generic
+    // quest's, in file order, one random group of their own (not joined
+    // to the random INFO of the other quest before them).
+    assert_eq!(
+        mayor.topics[&topic(GREETING)].picks,
+        vec![
+            Pick::Info(ordinal(HELLO_INFO)),
+            Pick::Info(ordinal(EITHER_INFO)),
+            Pick::Random(vec![ordinal(0x8E2), ordinal(0x8E3), ordinal(0x8E4)]),
+        ]
+    );
+    // IsInList on the quest: the guard is not in the list, so the generic
+    // quest's INFOs fold away for it.
+    let guard = &m.dialogues[&key(GUARD)];
+    assert!(
+        guard
+            .nodes
+            .iter()
+            .all(|n| ![0x8E2, 0x8E3, 0x8E4].map(info).contains(&n.info))
+    );
+}

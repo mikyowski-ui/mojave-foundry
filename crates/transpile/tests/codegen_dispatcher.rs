@@ -338,3 +338,191 @@ fn a_dispatcher_of_hundreds_of_quests_has_no_stack_finding() {
         .count();
     assert_eq!(polls, 64);
 }
+
+// ---- every passing log entry runs (spec 6.2, owner decision of 2026-11-26)
+
+/// `global_var(g) == value` as a condition.
+fn global_is(g: &SimId, value: i32) -> Cond {
+    Cond::Cmp {
+        lhs: Expr::Var(VarRef::Global(g.clone())),
+        op: CmpOp::Eq,
+        rhs: Expr::Int(value),
+    }
+}
+
+/// `set g to value`.
+fn set_global(g: &SimId, value: i32) -> Stmt {
+    Stmt::Set(VarRef::Global(g.clone()), Expr::Int(value))
+}
+
+/// A quest with one stage (10) whose log entries are `entries`
+/// (condition, script body), in order; returns the quest form.
+fn one_stage_quest(m: &mut Module, entries: Vec<(Cond, Vec<Stmt>)>) -> FormKey {
+    let form = key(0x100);
+    add_quest(m, form.clone(), 1, 0, None, |_| Vec::new());
+    let quest = SimId::of(SimKind::Quest, &form);
+    let mut log = Vec::new();
+    for (number, (condition, body)) in entries.into_iter().enumerate() {
+        let script = SimId::stage_script(&form, 10, number as u32);
+        m.scripts.insert(
+            script.clone(),
+            Script {
+                id: script.clone(),
+                editor_id: "Stage".into(),
+                kind: ScriptKind::Result(ResultOwner::Stage(SimId::stage(&form, 10))),
+                vars: Vec::new(),
+                blocks: vec![Block {
+                    event: Event::Result,
+                    body,
+                }],
+                diagnostics: Vec::new(),
+            },
+        );
+        log.push(LogEntry {
+            complete: false,
+            fail: false,
+            condition,
+            text: None,
+            script: Some(script),
+            next_quest: None,
+        });
+    }
+    m.quests.get_mut(&quest).unwrap().stages[0].entries = log;
+    form
+}
+
+/// Lowers `m`, sets stage 10 of `quest` (stage, done and pending bits),
+/// applies `before`, runs the dispatcher once and returns a reader of the
+/// globals afterwards.
+fn run_pending(
+    m: &Module,
+    quest: &FormKey,
+    before: &[(SimId, i32)],
+) -> impl Fn(&SimId) -> i32 + use<> {
+    let bytes = dispatcher_bytes(m, &LowerFacts::default());
+    assert_program_ok("mfquest.int", &bytes);
+    let order: Vec<SimId> = m
+        .globals_in_allocation_order()
+        .iter()
+        .map(|g| g.id.clone())
+        .collect();
+    let index = |id: &SimId| order.iter().position(|g| g == id).unwrap();
+    let mut world = World::new(order.len(), 0);
+    for (i, g) in m.globals_in_allocation_order().iter().enumerate() {
+        world.globals[i] = g.initial;
+    }
+    world.globals[index(&SimId::quest_state(quest, quest_sub::STAGE))] = 10;
+    world.globals[index(&SimId::quest_state(quest, quest_sub::DONE))] = 1;
+    world.globals[index(&SimId::quest_state(quest, quest_sub::PEND))] = 1;
+    for (id, value) in before {
+        world.globals[index(id)] = *value;
+    }
+    let mut dispatcher = Instance::load("mfquest.int", &bytes, &mut world);
+    dispatcher.call(&mut world, "start");
+    assert_eq!(
+        world.globals[index(&SimId::quest_state(quest, quest_sub::PEND))],
+        0,
+        "the pending bit is cleared"
+    );
+    let globals = world.globals;
+    move |id: &SimId| globals[order.iter().position(|g| g == id).unwrap()]
+}
+
+fn flag_globals(m: &mut Module, n: u32) -> Vec<SimId> {
+    (0..n)
+        .map(|i| {
+            let id = SimId::of(SimKind::Global, &key(0x700 + i));
+            global(m, id.clone(), GlobalPurpose::Glob, 0);
+            id
+        })
+        .collect()
+}
+
+#[test]
+fn every_passing_log_entry_of_a_stage_runs_in_order() {
+    // Three entries: the first and third pass, the second does not.
+    let mut m = Module::default();
+    let g = flag_globals(&mut m, 4);
+    let (gate, ran) = (&g[0], &g[1..]);
+    let quest = one_stage_quest(
+        &mut m,
+        vec![
+            (global_is(gate, 0), vec![set_global(&ran[0], 1)]),
+            (global_is(gate, 1), vec![set_global(&ran[1], 1)]),
+            (Cond::True, vec![set_global(&ran[2], 1)]),
+        ],
+    );
+    let value = run_pending(&m, &quest, &[]);
+    assert_eq!(value(&ran[0]), 1, "the first entry ran");
+    assert_eq!(value(&ran[1]), 0, "the second entry's condition fails");
+    assert_eq!(value(&ran[2]), 1, "the third entry ran after the first");
+}
+
+#[test]
+fn an_earlier_log_entry_can_change_a_later_entrys_condition() {
+    // The source evaluates the entries one after another: the first
+    // entry's script sets the gate the second entry tests, so both run;
+    // the third tests the gate's old value and no longer passes.
+    let mut m = Module::default();
+    let g = flag_globals(&mut m, 4);
+    let (gate, ran) = (&g[0], &g[1..]);
+    let quest = one_stage_quest(
+        &mut m,
+        vec![
+            (
+                global_is(gate, 0),
+                vec![set_global(gate, 1), set_global(&ran[0], 1)],
+            ),
+            (global_is(gate, 1), vec![set_global(&ran[1], 1)]),
+            (global_is(gate, 0), vec![set_global(&ran[2], 1)]),
+        ],
+    );
+    let value = run_pending(&m, &quest, &[]);
+    assert_eq!(value(gate), 1);
+    assert_eq!(value(&ran[0]), 1, "the first entry ran");
+    assert_eq!(value(&ran[1]), 1, "the second sees the first entry's write");
+    assert_eq!(value(&ran[2]), 0, "the third sees it too and fails");
+
+    // With the gate already set, only the second entry runs.
+    let value = run_pending(&m, &quest, &[(gate.clone(), 1)]);
+    assert_eq!((value(&ran[0]), value(&ran[1]), value(&ran[2])), (0, 1, 0));
+}
+
+#[test]
+fn a_stage_of_fifteen_conditional_entries_passes_the_stack_model() {
+    // Like a real objectives quest: 15 entries, the first two
+    // complementary, the others on a stage-done term or a compound
+    // condition. Every entry whose condition passes runs.
+    let mut m = Module::default();
+    let g = flag_globals(&mut m, 16);
+    let (gate, ran) = (&g[0], &g[1..]);
+    let entries: Vec<(Cond, Vec<Stmt>)> = (0..15)
+        .map(|i| {
+            let condition = match i {
+                0 => global_is(gate, 0),
+                1 => global_is(gate, 1),
+                _ if i % 3 == 0 => Cond::All(vec![
+                    global_is(gate, 0),
+                    Cond::Any(vec![global_is(&ran[0], 1), global_is(&ran[1], 1)]),
+                ]),
+                _ => Cond::Cmp {
+                    lhs: Expr::Call(Box::new(Call {
+                        func: Func::Known(FuncId::named("GetStageDone").unwrap()),
+                        on: None,
+                        args: vec![Expr::Form(key(0x100)), Expr::Int(10)],
+                    })),
+                    op: CmpOp::Eq,
+                    rhs: Expr::Int(1),
+                },
+            };
+            (condition, vec![set_global(&ran[i], 1)])
+        })
+        .collect();
+    let quest = one_stage_quest(&mut m, entries);
+    let value = run_pending(&m, &quest, &[]);
+    let ran_values: Vec<i32> = ran.iter().map(value).collect();
+    assert_eq!(
+        ran_values,
+        vec![1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+    );
+}

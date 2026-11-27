@@ -798,7 +798,10 @@ layer is what it was. The rules are in the module notes of
   has no AI data. Hostile people get `hostile_team` (66) and the packet
   named `hostile_packet` in the base `data/ai.txt` ("Merc Raider", 136 in
   a stock install); friendly people the builder's defaults (team 99, the
-  packet of `critters::choose_ai_packet`).
+  packet of `critters::choose_ai_packet`). A critter whose actor gets a
+  program from the `sim` stage has its team replaced at run time by its
+  faction team (section 11.4; changed 2026-11-26): the map record's 66 or
+  99 holds only until that program's `start`.
 - **Footprints**: the slice key `footprints = true` sets
   `SlicerConfig::furniture = Some(FurnitureRule::default())` and passes
   `Sliced::footprints` to `BuildOptions::footprints`; off by default.
@@ -1638,7 +1641,10 @@ pub struct Placement { pub objects: Vec<PlacedObject> }   // sorted (map, elevat
 pub struct SimSlice { pub name: String, pub placement: Placement }
 pub struct SimConfig { pub sfall: bool,          // owner decision 6: false
                        pub hello_barks: bool,    // owner decision 14: false
-                       pub quest_depth: u32 }    // quests followed beyond those the slice's code names; default 1
+                       pub quest_depth: u32,     // quests followed beyond those the slice's code names; default 1
+                       pub team_factions: Vec<String> }  // faction editor ids, each one team of all its
+                                                 //   members, checked in order before the default
+                                                 //   team rule; default empty (2026-11-26, spec 7.5)
 pub struct BaseFiles {                           // the base copies of spec 10.1, each file's text or None
     pub scripts_lst: Option<String>,   // scripts/scripts.lst
     pub vault13_gam: Option<String>,   // data/vault13.gam
@@ -1658,8 +1664,9 @@ pub enum TranspileError {
                                                  //   placement of another game
 ```
 
-`SimConfig` derives `Default` and is read with `#[serde(default)]` (the
-`[sim]` table of `foundry.toml`). `SimId` serialises as the text
+`SimConfig` derives `Default` and is read with `#[serde(default)]`: from a
+layer file's `[sim_options]` table, with the `[sim]` table of a `--config`
+file (`foundry.toml`) laid over it (section 11.3; changed 2026-11-26). `SimId` serialises as the text
 `<kind>/<form>/<sub>`, for example `stage/fallout3.esm:01a2b3/10`, with the
 kind as `SimKind::name()` (`topic`, `info`, `quest`, `stage`, `objective`,
 `quest_var`, `global`, `script`, `script_var`, `package`, `group`,
@@ -1864,6 +1871,17 @@ writes and prints. Today `run` only counts. Pass 2 replaces its body with the
 build (`transpile::build` then `lower`); the spec does not fix `run`'s final
 signature (today it cannot fail).
 
+**Options** (2026-11-26). A layer file's `[sim_options]` table
+(`LayerSpec::sim_options`, its keys checked against `SimConfig` when the
+file is read) is written by the map stage to `<out>/sim-options.toml` on
+every run, cached or not, and removed when the layer has none; it is not
+part of the map stage's key (`layer.rs` hashes the file's text without the
+table). The `sim` stage, from `all` or as its own command, builds with that
+table as the base and every key of the `--config` file's `[sim]` table
+that is not at its default laid over it (`sim::effective_config`): `[sim]`
+wins key by key, and a `[sim]` key set to its default does not override the
+layer's. Slices that are not layers have no `[sim_options]`.
+
 **Cache key** (spec 10.3; `SimInputs::cache_key`): `sim-1:` followed by the
 content hash of the lines `<name>=<value>`, one per key part, in this order.
 The version is `sim::SIM_VERSION`.
@@ -1872,7 +1890,9 @@ The version is `sim::SIM_VERSION`.
 |---|---|
 | `sim` | `sim-1` |
 | `transpiler` | **placeholder**: `none (Pass 2 scaffold)`; becomes the transpiler's version |
-| `foundry.toml [sim]` | **placeholder**: `none (not read by the scaffold)`; the `[sim]` table is not read and not yet defined in `config.rs` |
+| `foundry.toml [sim]` | the `--config` file's `[sim]` table as JSON (`SimOptions::config`; all defaults without one) |
+| `layer [sim_options]` | hash of `<out>/sim-options.toml`, or `absent` (2026-11-26) |
+| `sim options` | the options the build runs with, as JSON (`sim::effective_config`, 2026-11-26) |
 | `game` | `GameVariant::id` |
 | `slice` | hash of the manifest's slice |
 | `plugins` | hash of the manifest's plugin list |
@@ -1930,7 +1950,7 @@ generation, collected in order.
 | Globals | base count G, then ours in `SimId` order by kind: quest state, quest variables, `GLOB`s, groups, notes, once-flags, actor globals; `data/vault13.gam` is a whole copy with ours appended, which keeps every base index |
 | Dialogue message ids (per speaker program) | 1 to 99 converter labels; `10000 + 10 n + r` response r (0 to 8) of the speaker's INFO ordinal n; `10000 + 10 n + 9` its prompt; `900000 + t` topic t's name; 970 to 1099 left free (the engine's Ask About lookup) |
 | Pip-Boy message ids | `map.msg`, `quests.msg`, `pipboy.msg` from 100000; holodisk title `100000 + k`, text window `200000 + 500 k` for note k |
-| Teams | from 100, in faction `SimId` order |
+| Teams | from 100 (`transpile::packages::TEAM_BASE`), in faction `SimId` order of `Module::teams`; each critter program sets its own with `critter_add_trait(self_obj, 1, 6, team)` in `start`, once per critter (2026-11-26) |
 | Reference slots | from 1, in `SimId` order; exported variable `r<k>` on its map |
 | Text | written through `emit`'s MSG adapter: braces become parentheses, characters outside Windows-1252 become `?`, every change counted in the report |
 
@@ -1954,7 +1974,7 @@ The owner accepted all 15 defaults as written. They are decisions for Pass 2.
 | 8 | Quest journal: objectives only |
 | 9 | No `sim-ids.toml` allocation file in Pass 2 (on before long playtests) |
 | 10 | `vault-vm` is a dev-dependency at the pinned revision, for tests only |
-| 11 | Megaton townsfolk are one team, raiders one team |
+| 11 | Megaton townsfolk are one team, raiders one team. Refined 2026-11-26: teams stay faction-derived; only the members of a listed town faction (`SimConfig::team_factions`, Megaton: `MegatonResidentFaction`) are unified |
 | 12 | Essential NPCs: the flag is ignored and reported |
 | 13 | Karma is a shadow global with no display until gap K |
 | 14 | Hello barks are off in Pass 2 |

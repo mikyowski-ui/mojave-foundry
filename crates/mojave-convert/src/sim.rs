@@ -39,7 +39,8 @@
 //! # Cache
 //!
 //! Stage key `sim-1` ([`SimInputs::cache_key`], spec 10.3): the stage
-//! version, the transpiler revision, the `[sim]` options, the game, the
+//! version, the transpiler revision, the `[sim]` options and the layer's
+//! `sim-options.toml` (see [`effective_config`]), the game, the
 //! slice, the MIR's identity (its `manifest.json`, which carries the slice
 //! and the plugins' SHA-256), the base files, the map stage's key, the
 //! pristine manifest and maps, the placement index and the facts file. With
@@ -68,7 +69,7 @@ pub const SIM_VERSION: &str = "sim-1";
 
 /// The transpiler revision the key names. `transpile` exposes no version
 /// of its own; this constant moves with every change of its output.
-pub const TRANSPILER_REVISION: &str = "transpile pass-2 wave S2 (2026-11-24)";
+pub const TRANSPILER_REVISION: &str = "transpile pass-2 fix1 (2026-11-26)";
 
 /// The report's name, beside `map-report.md`.
 pub const REPORT_FILE: &str = "sim-report.md";
@@ -131,8 +132,42 @@ pub struct SimOptions {
     pub report_only: bool,
     /// Run even when the stored key matches.
     pub force: bool,
-    /// The `[sim]` table of `foundry.toml`.
+    /// The `[sim]` table of `foundry.toml`, laid over the layer's
+    /// `[sim_options]` ([`effective_config`]).
     pub config: SimConfig,
+}
+
+/// The build options of a run: the layer file's `[sim_options]` (left by
+/// the map stage in `<out>/sim-options.toml`) with every key of `given`
+/// (the `--config` file's `[sim]` table) that is not at its default laid
+/// over it; `given` alone when the layer has no table. A `[sim]` key set to
+/// its default value does not override the layer's. Also returns the
+/// file's text, for the cache key.
+///
+/// # Errors
+///
+/// The file does not parse as `SimConfig` options.
+pub fn effective_config(
+    out: &Path,
+    given: &SimConfig,
+) -> Result<(SimConfig, Option<String>), SimError> {
+    let path = out.join(crate::layer::SIM_OPTIONS_FILE);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok((given.clone(), None));
+    };
+    let file = crate::layer::SIM_OPTIONS_FILE;
+    let mut table: toml::Table = toml::from_str(&text).map_err(|e| fail(file, e))?;
+    let defaults = toml::Table::try_from(SimConfig::default()).map_err(|e| fail(file, e))?;
+    let over = toml::Table::try_from(given.clone()).map_err(|e| fail(file, e))?;
+    for (key, value) in over {
+        if defaults.get(&key) != Some(&value) {
+            table.insert(key, value);
+        }
+    }
+    let config = toml::Value::Table(table)
+        .try_into::<SimConfig>()
+        .map_err(|e| fail(file, e))?;
+    Ok((config, Some(text)))
 }
 
 fn hash(bytes: &[u8]) -> String {
@@ -589,6 +624,7 @@ impl SimInputs {
         let (base, base_sources, base_key) =
             base_files(&pristine, options.f2.as_deref(), &mut warnings)?;
 
+        let (config, layer_options) = effective_config(out, &options.config)?;
         let read_or =
             |path: PathBuf| std::fs::read(path).map_or_else(|_| "absent".to_owned(), |b| hash(&b));
         let mut key_parts: Vec<(String, String)> = vec![
@@ -597,6 +633,14 @@ impl SimInputs {
             (
                 "foundry.toml [sim]".into(),
                 serde_json::to_string(&options.config).unwrap_or_default(),
+            ),
+            (
+                "layer [sim_options]".into(),
+                layer_options.map_or_else(|| "absent".to_owned(), |t| hash(t.as_bytes())),
+            ),
+            (
+                "sim options".into(),
+                serde_json::to_string(&config).unwrap_or_default(),
             ),
             ("game".into(), game.id().into()),
             (
@@ -642,7 +686,7 @@ impl SimInputs {
             has_output,
             base,
             base_sources,
-            config: options.config.clone(),
+            config,
             slice,
             warnings,
             key_parts,
@@ -1192,6 +1236,20 @@ impl SimReport {
             .map(|(_, c)| c)
     }
 
+    /// The failure the command exits with: `Some` when the build or the
+    /// lowering failed (the report still lists the errors), `None` for a
+    /// run with no build error. Counted fallbacks are not errors.
+    pub fn failure(&self) -> Option<String> {
+        if self.errors.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "the simulation stage had {} build error{} (details in {REPORT_FILE})",
+            self.errors.len(),
+            if self.errors.len() == 1 { "" } else { "s" }
+        ))
+    }
+
     /// The lines the command prints.
     pub fn console_lines(&self) -> Vec<String> {
         let mut lines = vec![
@@ -1540,6 +1598,14 @@ pub fn cli(out: &Path, options: &SimOptions) -> Result<(), String> {
                 println!("{line}");
             }
             println!("report: {}", out.join(REPORT_FILE).display());
+            // The report is written; a build error is still a failed run.
+            if let Some(failure) = report.failure() {
+                for error in &report.errors {
+                    eprintln!("build error: {error}");
+                }
+                println!("time: {:.2} s", started.elapsed().as_secs_f64());
+                return Err(failure);
+            }
         }
     }
     println!("time: {:.2} s", started.elapsed().as_secs_f64());

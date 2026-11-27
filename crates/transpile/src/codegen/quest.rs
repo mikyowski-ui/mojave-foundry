@@ -153,7 +153,11 @@ impl Gen<'_, '_> {
     }
 
     /// Runs the pending stage scripts of one quest, in stage order
-    /// (spec 6.2).
+    /// (spec 6.2): for each pending stage, every log entry in file order
+    /// whose condition passes runs (its script, complete and fail flags,
+    /// next quest). Each condition is tested when its entry is reached, so
+    /// an earlier entry's script can change whether a later entry passes,
+    /// as the source runs them one after another.
     fn pending_stages(&mut self, p: &mut Proc, quest: &Quest) {
         self.scope.owner = quest.editor_id.clone();
         let q = quest.id.form.clone();
@@ -181,7 +185,6 @@ impl Gen<'_, '_> {
                 p.binary("band");
             });
             self.clear_bits(p, pend, bit);
-            let done = p.label();
             for entry in &stage.entries {
                 let mark = p.mark();
                 let next = p.label();
@@ -235,12 +238,10 @@ impl Gen<'_, '_> {
                 {
                     self.set_bits(p, g, 1);
                 }
-                p.jump(&done);
                 p.place(&next);
                 p.release(mark);
                 self.count_in(Section::Quests, Outcome::Compiled, "");
             }
-            p.place(&done);
             p.place(&skip);
         }
     }

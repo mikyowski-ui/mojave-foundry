@@ -22,6 +22,11 @@ pub enum Lowering {
     /// an engine read, 100 for the body-part conditions, else a reported
     /// fallback of 0.
     ActorValue,
+    /// `IsInList`: whether the run-on's base is a member of a form list,
+    /// written as one `GetIsID` term per member (nested lists flattened),
+    /// so that the subject's terms fold like any speaker term (spec 4.2)
+    /// and the others are base compares at run time.
+    FormList,
     /// Not evaluable: the term takes `value`.
     Fallback {
         /// The value the function is taken to return.
@@ -54,7 +59,7 @@ const fn fallback(index: u16, name: &'static str, value: f32, report: bool) -> C
     row(index, name, Lowering::Fallback { value, report })
 }
 
-use Lowering::{ActorValue, Runtime, Static, Variable};
+use Lowering::{ActorValue, FormList, Runtime, Static, Variable};
 
 /// The table, in the order of spec 4.8 (by count in the slice), then the
 /// package additions, the speaker terms and the threshold reads.
@@ -107,6 +112,7 @@ pub static TABLE: &[CondFunction] = &[
     row(69, "GetIsRace", Static),
     row(68, "GetIsClass", Static),
     row(64, "GetIsCreature", Static),
+    row(372, "IsInList", FormList),
     // Threshold reads (spec 4.7).
     row(277, "GetBaseActorValue", ActorValue),
     row(495, "GetPermanentActorValue", ActorValue),
@@ -144,7 +150,9 @@ mod tests {
     #[test]
     fn evaluable_rows_are_in_the_signature_table() {
         for f in TABLE {
-            if matches!(f.lowering, Lowering::Fallback { .. }) && f.name.starts_with('(') {
+            if matches!(f.lowering, Lowering::Fallback { .. }) && f.name.starts_with('(')
+                || f.lowering == Lowering::FormList
+            {
                 continue;
             }
             let sig = functions::lookup(f.name).unwrap_or_else(|| panic!("{} missing", f.name));

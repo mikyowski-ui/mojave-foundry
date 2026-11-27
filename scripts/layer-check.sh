@@ -49,9 +49,11 @@ idle="$check/idle.jsonl"
 
 for map in $mapfiles; do
     stem=${map%.map}
-    # A short headless bot run, not a replay: a replay log must carry the
-    # layer's mod-stack record once the layer has scripts, and an idle log
-    # written here has none.
+    # A short headless bot run, not a replay. The converter now writes the
+    # layer's mod-stack record, so a replay would load it; the bot run is kept
+    # because its session setup also installs the Fallout 2 new-game state
+    # (campaign tables, the player's local-variable slice), which a replay of
+    # a map does not.
     rm -rf "$check/load-$stem"
     ( cd "$out" && "$engine" --autoplay-headless --game-profile fallout2 \
         --master-dat "$f2/master.dat" --critter-dat "$f2/critter.dat" \

@@ -306,7 +306,7 @@ impl Loader<'_> {
 /// topics' INFOs lead to, and the shared failure topic; within each topic
 /// the INFOs whose speaker terms allow a slice actor or that have none),
 /// the slice's terminals and their sub-terminals, and every script, quest,
-/// global, game setting, message, faction and note.
+/// global, game setting, message, faction, form list and note.
 ///
 /// # Errors
 ///
@@ -322,6 +322,7 @@ pub fn load(mir: &mir::Mir, slice: &SimSlice) -> Result<SimSource> {
     load_globals(&mut l, &mut source)?;
     load_settings(&mut l, &mut source)?;
     load_factions(&mut l, &mut source)?;
+    load_form_lists(&mut l, &mut source)?;
     load_messages(&mut l, &mut source)?;
     load_notes(&mut l, &mut source)?;
     load_terminals(&mut l, &mut source)?;
@@ -880,6 +881,30 @@ fn load_factions(l: &mut Loader<'_>, source: &mut SimSource) -> Result<()> {
                     .collect(),
             },
         );
+    }
+    Ok(())
+}
+
+/// Every form list's members (`LNAM`, a form id each), resolved, in order.
+fn load_form_lists(l: &mut Loader<'_>, source: &mut SimSource) -> Result<()> {
+    let lists = l.forms_of(
+        "form lists",
+        "SELECT form FROM records WHERE sig = 'FLST' ORDER BY form",
+    )?;
+    for list in lists {
+        let Some(k) = mir_key(&list) else { continue };
+        let owner = l.plugin_of(&list)?.unwrap_or(0);
+        let members: Vec<FormKey> = l
+            .records
+            .raw_subrecords(&k)?
+            .into_iter()
+            .filter(|(sig, _)| sig == "LNAM")
+            .filter_map(|(_, data)| {
+                let raw = u32::from_le_bytes(data.get(..4)?.try_into().ok()?);
+                l.resolve(owner, FormId(raw))
+            })
+            .collect();
+        source.form_lists.insert(list, members);
     }
     Ok(())
 }

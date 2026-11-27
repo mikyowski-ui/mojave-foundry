@@ -203,6 +203,10 @@ impl Gen<'_, '_> {
             });
             g.set_local_with(p, locals::LAST_GM, |_, p| p.host(hw::GAME_TIME));
             g.set_local(p, locals::EVP, 1);
+            // The faction team (spec 7.5), once per critter, before its
+            // first turn: a later change (the party, a faction switch) is
+            // kept.
+            g.set_team(p);
         });
         self.store_self(&mut p);
         self.apply_self_groups(&mut p);

@@ -9,6 +9,10 @@
 //!   (0 subject, 1 target, 2 the condition's reference, 3 combat target,
 //!   4 linked reference); a variable read; an actor-value read; or a
 //!   fallback.
+//! - **Form lists.** `IsInList` (index 372) becomes the disjunction of
+//!   `GetIsID` terms over the list's members (nested lists flattened), or
+//!   its negation, from the comparison; a list the plugin list does not
+//!   hold is a fallback of 0.
 //! - **Fallbacks** are never silently true (4.9): the function takes its
 //!   fallback value (0 for a function with no row) and the comparison is
 //!   evaluated with it. See [`Cond`] for how the result is written.
@@ -295,9 +299,88 @@ fn term(
             }
             runtime_call(row, on, args)
         }
+        Lowering::FormList => return in_list(condition, op, &rhs, on, names, owner, uses),
         Lowering::Fallback { .. } => unreachable!("handled above"),
     };
     let cond = Cond::Cmp { lhs, op, rhs };
+    simplify(&cond)
+}
+
+/// The most members an `IsInList` term expands to; a longer list (after
+/// flattening) is a reported fallback of 0.
+pub const MAX_LIST_MEMBERS: usize = 512;
+
+/// The members of a form list, nested lists flattened (each list once),
+/// in order, without repeats; `None` when `list` is not a known list.
+fn list_members(list: &FormKey, names: &NameTable) -> Option<Vec<FormKey>> {
+    let mut out: Vec<FormKey> = Vec::new();
+    let mut seen: BTreeSet<FormKey> = BTreeSet::new();
+    let mut pending: Vec<FormKey> = vec![list.clone()];
+    names.form_list(list)?;
+    while let Some(current) = pending.pop() {
+        if !seen.insert(current.clone()) {
+            continue;
+        }
+        let Some(members) = names.form_list(&current) else {
+            if !out.contains(&current) {
+                out.push(current);
+            }
+            continue;
+        };
+        pending.extend(members.iter().rev().cloned());
+    }
+    Some(out)
+}
+
+/// `IsInList list op value`: the function is 1 when the run-on's base is
+/// a member and 0 otherwise, so the comparison decides which of the two
+/// passes; the member test is one `GetIsID == 1` per member.
+fn in_list(
+    condition: &SourceCondition,
+    op: CmpOp,
+    rhs: &Expr,
+    on: RefExpr,
+    names: &NameTable,
+    owner: &SimId,
+    uses: &mut CondUses,
+) -> Cond {
+    let members = condition
+        .param1_form
+        .as_ref()
+        .and_then(|list| list_members(list, names));
+    let (Some(members), Some(value)) = (members, literal(rhs)) else {
+        uses.diags.push(
+            Diag::warning(
+                Category::ConditionBadParameter,
+                "IsInList names no form list of the plugin list, or compares with a global",
+            )
+            .owned_by(owner)
+            .about("IsInList"),
+        );
+        return fallback_term(condition, op, rhs, 0.0, true, owner, uses);
+    };
+    if members.len() > MAX_LIST_MEMBERS {
+        return fallback_term(condition, op, rhs, 0.0, true, owner, uses);
+    }
+    let Some(is_id) = functions::by_index(72) else {
+        unreachable!("GetIsID is in the table")
+    };
+    let member = Cond::Any(
+        members
+            .into_iter()
+            .map(|m| Cond::Cmp {
+                lhs: runtime_call(is_id, on.clone(), vec![Expr::Form(m)]),
+                op: CmpOp::Eq,
+                rhs: Expr::Int(1),
+            })
+            .collect(),
+    );
+    let cond = match (op.holds(1.0, value), op.holds(0.0, value)) {
+        (true, true) => Cond::True,
+        (false, false) => Cond::False,
+        (true, false) => member,
+        (false, true) => Cond::Not(Box::new(member)),
+    };
     simplify(&cond)
 }
 

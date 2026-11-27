@@ -49,3 +49,9 @@ map = "clinic"
 cut_height = 150.0
 footprints = true
 navmesh_coverage = "share:0.5"
+
+[sim_options]
+# Pass 2 (spec 7.5, owner decision 11 as refined on 2026-11-26): every
+# member of the town's own faction is on one team; the other actors keep
+# their faction-derived teams. Read by the sim stage, not by the map stage.
+team_factions = ["MegatonResidentFaction"]

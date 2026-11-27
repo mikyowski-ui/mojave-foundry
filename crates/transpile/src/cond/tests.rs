@@ -106,6 +106,16 @@ fn every_table_function_lowers_by_its_class() {
                 assert_eq!(call_name(lhs), Some(row.name));
                 assert_eq!(*rhs, Expr::Int(50));
             }
+            Lowering::FormList => {
+                // With no list in the name table: a reported fallback.
+                let (cond, uses) = lower_one(sample(row, 1.0));
+                assert!(
+                    matches!(&cond, Cond::Not(inner) if matches!(**inner, Cond::Fallback { .. })),
+                    "{}: {cond:?}",
+                    row.name
+                );
+                assert!(!uses.diags.is_empty());
+            }
             Lowering::Fallback { value, report } => {
                 let (held, uses) = lower_one(sample(row, f64::from(value)));
                 assert_eq!(
@@ -382,4 +392,65 @@ fn simplification_keeps_passed_fallbacks_visible() {
         }),
         Cond::True
     );
+}
+
+fn is_id(base: u32, on: RefExpr) -> Cond {
+    Cond::Cmp {
+        lhs: Expr::Call(Box::new(Call {
+            func: Func::Known(FuncId::named("GetIsID").unwrap()),
+            on: Some(on),
+            args: vec![Expr::Form(key(base))],
+        })),
+        op: CmpOp::Eq,
+        rhs: Expr::Int(1),
+    }
+}
+
+/// `IsInList` (index 372) is a `GetIsID` disjunction over the list's
+/// members, nested lists flattened, so the speaker fold decides it.
+#[test]
+fn is_in_list_is_a_get_is_id_disjunction_that_folds_on_the_speaker() {
+    let mut names = names();
+    names.set_form_list(key(0x50), vec![key(0x60), key(0x51), key(0x61)]);
+    names.set_form_list(key(0x51), vec![key(0x62), key(0x60)]);
+    let lower_with = |c: SourceCondition| {
+        let mut uses = CondUses::default();
+        let cond = lower(&[c], &owner(), &names, &mut uses);
+        (cond, uses)
+    };
+    let member = Cond::Any(vec![
+        is_id(0x60, RefExpr::SelfRef),
+        is_id(0x62, RefExpr::SelfRef),
+        is_id(0x61, RefExpr::SelfRef),
+    ]);
+    let (cond, uses) = lower_with(SourceCondition::literal(372, "==", 1.0).with_form(key(0x50)));
+    assert_eq!(cond, member);
+    assert!(uses.diags.is_empty(), "{:?}", uses.diags);
+    let (cond, _) = lower_with(SourceCondition::literal(372, "==", 0.0).with_form(key(0x50)));
+    assert_eq!(cond, Cond::Not(Box::new(member.clone())));
+    let (cond, _) = lower_with(SourceCondition::literal(372, "<", 2.0).with_form(key(0x50)));
+    assert_eq!(cond, Cond::True, "0 and 1 both pass");
+    // On the player: runtime base compares.
+    let (cond, _) = lower_with(
+        SourceCondition::literal(372, "!=", 0.0)
+            .with_form(key(0x51))
+            .on(1, None),
+    );
+    assert_eq!(
+        cond,
+        Cond::Any(vec![
+            is_id(0x62, RefExpr::Player),
+            is_id(0x60, RefExpr::Player)
+        ])
+    );
+    // Folded on a speaker: a member passes, another base fails.
+    let facts = |base: u32| Facts {
+        subject: Some(SubjectFacts {
+            base: key(base),
+            ..SubjectFacts::default()
+        }),
+        interior: None,
+    };
+    assert_eq!(fold(&member, &facts(0x62)), Cond::True);
+    assert_eq!(fold(&member, &facts(0x70)), Cond::False);
 }

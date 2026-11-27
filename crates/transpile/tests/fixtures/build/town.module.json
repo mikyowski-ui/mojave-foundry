@@ -156,6 +156,11 @@
       "role": "label"
     },
     {
+      "owner": "text/mojave-foundry:000000/32",
+      "source": "(Waits for you to speak.)",
+      "role": "label"
+    },
+    {
       "owner": "info/testtown.esm:000891/0",
       "source": "Welcome to town.",
       "role": "response"
@@ -294,7 +299,7 @@
       "id": "topic/testtown.esm:000892/0",
       "editor_id": "TSJobTopic",
       "kind": "topic",
-      "name": 52,
+      "name": 53,
       "priority": 0.0,
       "top_level": true,
       "infos": [
@@ -345,7 +350,7 @@
       "responses": [
         {
           "number": 1,
-          "text": 31,
+          "text": 32,
           "emotion": [
             0,
             0
@@ -353,7 +358,7 @@
         },
         {
           "number": 2,
-          "text": 32,
+          "text": 33,
           "emotion": [
             0,
             0
@@ -527,7 +532,7 @@
       "responses": [
         {
           "number": 1,
-          "text": 33,
+          "text": 34,
           "emotion": [
             0,
             0
@@ -613,7 +618,7 @@
       "responses": [
         {
           "number": 1,
-          "text": 34,
+          "text": 35,
           "emotion": [
             0,
             0
@@ -670,14 +675,14 @@
       "responses": [
         {
           "number": 1,
-          "text": 35,
+          "text": 36,
           "emotion": [
             0,
             0
           ]
         }
       ],
-      "prompt": 36,
+      "prompt": 37,
       "choices": [],
       "link_from": [],
       "add_topics": [],
@@ -1226,7 +1231,7 @@
     "quest/testtown.esm:000870/0": {
       "id": "quest/testtown.esm:000870/0",
       "editor_id": "TSQuest",
-      "name": 45,
+      "name": 46,
       "start_enabled": true,
       "priority": 0,
       "delay_seconds": 0.0,
@@ -1252,7 +1257,7 @@
               "complete": false,
               "fail": false,
               "condition": "true",
-              "text": 47,
+              "text": 48,
               "script": "script/testtown.esm:000870/16779776",
               "next_quest": null
             }
@@ -1307,7 +1312,7 @@
                   }
                 ]
               },
-              "text": 48,
+              "text": 49,
               "script": null,
               "next_quest": null
             }
@@ -1321,7 +1326,7 @@
               "complete": true,
               "fail": false,
               "condition": "true",
-              "text": 46,
+              "text": 47,
               "script": "script/testtown.esm:000870/16784896",
               "next_quest": null
             }
@@ -1332,7 +1337,7 @@
         {
           "id": "objective/testtown.esm:000870/10",
           "index": 10,
-          "text": 49,
+          "text": 50,
           "targets": [
             [
               "testtown.esm:000c01",
@@ -1343,7 +1348,7 @@
         {
           "id": "objective/testtown.esm:000870/20",
           "index": 20,
-          "text": 50,
+          "text": 51,
           "targets": []
         }
       ],
@@ -1352,7 +1357,7 @@
     "quest/testtown.esm:000871/0": {
       "id": "quest/testtown.esm:000871/0",
       "editor_id": "TSOtherQuest",
-      "name": 51,
+      "name": 52,
       "start_enabled": false,
       "priority": 0,
       "delay_seconds": 0.0,
@@ -1579,7 +1584,7 @@
   "terminals": {
     "terminal/testtown.esm:000803/0": {
       "id": "terminal/testtown.esm:000803/0",
-      "header": 37,
+      "header": 38,
       "difficulty": 0,
       "flags": 0,
       "server": 0,
@@ -1587,7 +1592,7 @@
       "items": [
         {
           "id": "menu_item/testtown.esm:000803/0",
-          "text": 38,
+          "text": 39,
           "result": null,
           "add_note": true,
           "show_note": "note/testtown.esm:000802/0",
@@ -1597,8 +1602,8 @@
         },
         {
           "id": "menu_item/testtown.esm:000803/1",
-          "text": 39,
-          "result": 40,
+          "text": 40,
+          "result": 41,
           "add_note": false,
           "show_note": null,
           "submenu": null,
@@ -1627,7 +1632,7 @@
         },
         {
           "id": "menu_item/testtown.esm:000803/2",
-          "text": 41,
+          "text": 42,
           "result": null,
           "add_note": false,
           "show_note": null,
@@ -1639,7 +1644,7 @@
     },
     "terminal/testtown.esm:000804/0": {
       "id": "terminal/testtown.esm:000804/0",
-      "header": 42,
+      "header": 43,
       "difficulty": 0,
       "flags": 0,
       "server": 0,
@@ -1647,8 +1652,8 @@
       "items": [
         {
           "id": "menu_item/testtown.esm:000804/0",
-          "text": 43,
-          "result": 44,
+          "text": 44,
+          "result": 45,
           "add_note": false,
           "show_note": null,
           "submenu": null,
@@ -1661,9 +1666,9 @@
   "notes": {
     "note/testtown.esm:000802/0": {
       "id": "note/testtown.esm:000802/0",
-      "title": 53,
+      "title": 54,
       "body": {
-        "text": 54
+        "text": 55
       }
     }
   },
@@ -1897,7 +1902,7 @@
           "info": "info/testtown.esm:000895/0",
           "topic": "topic/testtown.esm:000892/0",
           "condition": "true",
-          "prompt": 36,
+          "prompt": 37,
           "choices": [],
           "failure": null
         }
@@ -2075,18 +2080,18 @@
   "journal": {
     "quest/testtown.esm:000870/0": {
       "quest": "quest/testtown.esm:000870/0",
-      "heading": 45,
+      "heading": 46,
       "rows": [
         {
           "objective": "objective/testtown.esm:000870/10",
-          "text": 49,
+          "text": 50,
           "global": "objective/testtown.esm:000870/10",
           "display_at": 1,
           "completed_at": 2
         },
         {
           "objective": "objective/testtown.esm:000870/20",
-          "text": 50,
+          "text": 51,
           "global": "objective/testtown.esm:000870/20",
           "display_at": 1,
           "completed_at": 2
@@ -2155,9 +2160,9 @@
     "note/testtown.esm:000802/0": {
       "note": "note/testtown.esm:000802/0",
       "global": "note/testtown.esm:000802/0",
-      "title": 53,
+      "title": 54,
       "paragraphs": [
-        54
+        55
       ],
       "source": "text"
     }

@@ -370,7 +370,22 @@ storeys = "auto"
 
 [[maps]]
 interior = "MegatonClinic"    # no slice file: the first exterior's keys, as an interior
+
+[sim_options]                 # the sim stage's build options (transpile::ir::SimConfig)
+team_factions = ["MegatonResidentFaction"]   # each listed faction: one team of all its members
 ```
+
+`[sim_options]` (2026-11-26) sets the simulation stage's options in the
+layer file: `team_factions` (faction editor ids; each forms one team of all
+its members, checked in order before the default rule of the most-related
+faction; default none), `quest_depth` (default 1), `sfall` and
+`hello_barks` (default false). An unknown key or a wrong type is refused
+when the layer file is read. The map stage writes the table to
+`<out>/sim-options.toml` on every run (and removes that file when the
+layer has none), where the `sim` stage reads it; the table is not part of
+the map stage's key, so changing it rebuilds no map. Put it last in the
+file, or before another table header: it runs to the next `[...]` line.
+Slice files that are not layers have no `[sim_options]`.
 
 `close_unreached` (on by default, in a layer file and on a one-map build;
 `close_unreached = false` in the layer file, or in a slice for a one-map
@@ -582,17 +597,65 @@ mojave-convert replay-frames --engine $E --f2 $F2 --out <dir> --log <dir>/engine
 mojave-convert before-after --before <dir without the pass> --after <dir with it> --out pairs.png
 ```
 
-To play a converted map in a `vault-engine` build:
+To play a converted map in a `vault-engine` build, as a real new game:
 
 ```
-scripts/play.sh <vault-platform binary> <Fallout 2 install> <the --out directory>
+scripts/play.sh <vault-platform binary> <Fallout 2 install> <the --out directory> [map]
 ```
+
+`play.sh` starts the engine's normal game flow (`--game`, the `fallout2`
+profile, the enhanced preset, the converter's layer mounted over the install)
+so the Fallout 2 new-game state is installed: the Pip-Boy shows the layer's
+`quests.txt` and `holodisk.txt`, and the player's own script has its
+local-variable slice. Plain `--preview-map` never installs that state, which
+is why the old launch showed the Fallout 1 quest tables and three "LVAR ...
+outside the script's slice" diagnostics at the start.
+
+Controls, in order: any key skips each of the two start movies (the second is
+the intro); on the main menu press `N` (New Game); on the character screen
+Left and Right choose a premade character and `T` takes it; any key skips the
+hand-off movie; the game then starts on `[map]` (a map of the layer, with or
+without `.map`; default: the first map the layer registers). In play `Alt+F`
+cycles the game speed and `Alt+V` the viewport. Saves go to
+`<out>/saves`.
+
+How the start map is chosen: the engine's own `StartingMap` key (the engine's
+startup spec, a `[Misc]` key of a `ddraw.ini`), which it reads only under sfall
+mode. The script therefore passes `--sfall` and writes a one-file layer,
+`<out>/mods/play-start` (a manifest and that `ddraw.ini`), after the
+converter's in `<out>/load_order.toml`. The converter's own layer is not
+touched. Sfall mode is on for the session; the converter's programs use plain
+Fallout 2 words only, so nothing in them depends on it.
+
+`--preview` (anywhere after the out directory) gives the old launch: the map as
+a plain preview, the player on it at once, no menus, no sfall mode and no
+new-game state. `scripts/layer-check.sh` keeps using a short headless bot run
+for each map load: the bot's session setup installs the new-game state as
+well, which a replay does not.
 
 ### Sim
 
 ```
 mojave-convert sim --out <dir>
 ```
+
+Exit status: a build error (the lowering returns an error, or a step panics)
+is written into `sim-report.md` under "Build errors" as before, and now also
+printed to stderr as `build error: ...` lines, and the command exits non-zero
+(`all` does the same when it runs the sim stage, after its other output).
+`--report-only` follows the same rule. A run whose only problems are counted
+fallbacks is a success. A failed run leaves no cache key, so the next run tries
+again.
+
+Options (2026-11-26): the stage builds with the layer file's
+`[sim_options]` (from `<out>/sim-options.toml`, "Layers" above), and a
+`--config <foundry.toml>` file's `[sim]` table is laid over it key by key:
+a key that `[sim]` sets to a value other than its default wins, so
+`[sim]\nquest_depth = 2` keeps the layer's `team_factions`. A `[sim]` key
+set to its default value does not override the layer's. Both tables are
+read straight into `transpile::ir::SimConfig`, so every field that type has
+can be set in either; the options the build used are in the report's
+`## Cache key` table (`sim options`).
 
 `sim` reads an already-built `--out` directory: the MIR (`mir/`), the layer
 (`mods/mojave`) and the placement index `map-placements.json`, which the map
@@ -611,10 +674,11 @@ byte-identical). `--timings` prints what the stage took (the table is always wri
 index in about a quarter of a second warm. A directory without
 `map-placements.json` is read from its built maps instead, with a warning
 (no references, bases or enable parents). No scripts are compiled yet; this
-is the scaffold of Pass 2 (`docs/simulation-layer-spec.md`). Two parts of the
-cache key are placeholders today: the transpiler version and the `[sim]` table
-of `foundry.toml`, which the scaffold does not read. The interfaces are in
-`docs/contracts.md` section 11.
+is the scaffold of Pass 2 (`docs/simulation-layer-spec.md`). The cache key
+names the transpiler revision (`sim::TRANSPILER_REVISION`, bumped with every
+change of the transpiler's output), the `--config` `[sim]` table, the
+layer's `sim-options.toml` and the options the build used. The interfaces
+are in `docs/contracts.md` section 11.
 
 ## Building
 

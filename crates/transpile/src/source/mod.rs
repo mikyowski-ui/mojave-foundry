@@ -554,11 +554,16 @@ pub struct SimSource {
     /// 9.2: holotapes as text), by topic.
     #[serde(default)]
     pub voice_lines: BTreeMap<FormKey, Vec<String>>,
+    /// Every form list (`FLST`): its members (`LNAM`), in order, for
+    /// `IsInList` (spec 4.8).
+    #[serde(default)]
+    pub form_lists: BTreeMap<FormKey, Vec<FormKey>>,
 }
 
 impl SimSource {
     /// The name table: every editor id, every script's variables, every
-    /// quest's script, every reference's base and every base's script.
+    /// quest's script, every reference's base, every base's script and
+    /// every form list.
     pub fn name_table(&self) -> NameTable {
         let mut names = NameTable::new();
         names.set_plugins(self.plugins.clone());
@@ -584,6 +589,9 @@ impl SimSource {
         }
         for (base, reference) in &self.unique_refs {
             names.set_unique_ref(base.clone(), reference.clone());
+        }
+        for (list, members) in &self.form_lists {
+            names.set_form_list(list.clone(), members.clone());
         }
         names
     }

@@ -258,13 +258,15 @@ pub fn write_groups(dir: &Path) -> LinkedMart {
 
 /// The groups mart (as [`write_groups`]) with the records of [`QUEST`]
 /// and the rest, and `sim.layer.toml`: the same two maps as
-/// `groups.layer.toml` with `sim = true`.
+/// `groups.layer.toml` with `sim = true`, and a `[sim_options]` table
+/// listing the shop's faction and an unknown one as team factions.
 pub fn write_sim(dir: &Path) -> LinkedMart {
     let mart = write_linked_flags(dir, true, true);
     let layer = "name = \"minimart-sim\"\nstart = \"mmlot\"\npresence_copies = true\nsim = true\n\n\
                  [all_maps]\nwire = true\nenable_groups = true\n\n\
                  [[maps]]\nslice = \"lot.toml\"\nmap = \"mmlot\"\n\n\
-                 [[maps]]\nslice = \"store.toml\"\nmap = \"mmstore\"\nstoreys = \"auto\"\n";
+                 [[maps]]\nslice = \"store.toml\"\nmap = \"mmstore\"\nstoreys = \"auto\"\n\n\
+                 [sim_options]\nteam_factions = [\"MMShopFaction\", \"MMNoSuchFaction\"]\n";
     let layer_file = dir.join("sim.layer.toml");
     std::fs::write(&layer_file, layer).expect("the layer file");
     LinkedMart {

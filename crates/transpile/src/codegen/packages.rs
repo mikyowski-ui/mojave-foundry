@@ -30,6 +30,26 @@ impl Gen<'_, '_> {
             .is_some_and(|r| r.combat.hostile)
     }
 
+    /// `critter_add_trait(self_obj, 1, 6, team)` (object trait, team
+    /// number; the engine skips it when the team is unchanged): the actor's
+    /// faction team (spec 7.5), when it has one. The word's result is
+    /// popped.
+    pub fn set_team(&mut self, p: &mut Proc) {
+        let Some(team) = self
+            .actor
+            .as_ref()
+            .and_then(|b| crate::packages::team_number(self.ctx.module, b))
+        else {
+            return;
+        };
+        p.host(hw::SELF_OBJ);
+        p.push_i(1);
+        p.push_i(6);
+        p.push_i(team);
+        p.host_stmt(hw::CRITTER_ADD_TRAIT);
+        self.count_in(Section::Packages, Outcome::Compiled, "");
+    }
+
     /// `obj_can_see_obj(self, player)` (its own perception test) starts
     /// combat with `attack_setup` (E23).
     pub fn hostile_tick(&mut self, p: &mut Proc) {

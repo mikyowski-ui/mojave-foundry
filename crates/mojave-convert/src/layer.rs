@@ -62,6 +62,56 @@ use crate::map::{
 /// A layer file's name ends so.
 pub const LAYER_SUFFIX: &str = ".layer.toml";
 
+/// The layer's `[sim_options]` table as the map stage leaves it for the
+/// `sim` stage, in the output directory (spec 10.3).
+pub const SIM_OPTIONS_FILE: &str = "sim-options.toml";
+
+/// Checks a `[sim_options]` table: every key is a `SimConfig` field and
+/// the table reads as one.
+fn check_sim_options(table: &toml::Table) -> Result<(), String> {
+    let known = toml::Table::try_from(transpile::ir::SimConfig::default())
+        .map_err(|e| format!("sim_options: {e}"))?;
+    if let Some(unknown) = table.keys().find(|k| !known.contains_key(*k)) {
+        let mut keys: Vec<&String> = known.keys().collect();
+        keys.sort();
+        return Err(format!(
+            "sim_options: unknown key {unknown:?} (known: {})",
+            keys.iter()
+                .map(|k| k.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    toml::Value::Table(table.clone())
+        .try_into::<transpile::ir::SimConfig>()
+        .map(|_| ())
+        .map_err(|e| format!("sim_options: {e}"))
+}
+
+/// The layer file's text without its `[sim_options]` table (from its
+/// header to the next table header, and the blank lines just before it),
+/// so that a simulation option does not rebuild the maps: a file with the
+/// table at its end has the key of the same file without it.
+fn without_sim_options(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut skipping = false;
+    for line in text.split_inclusive('\n') {
+        let head = line.trim_start();
+        if head.starts_with('[') {
+            skipping = head.starts_with("[sim_options]");
+            if skipping {
+                while out.ends_with("\n\n") {
+                    out.pop();
+                }
+            }
+        }
+        if !skipping {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
 /// Bumped whenever a layer's output for the same inputs would change.
 const LAYER_VERSION: &str = "layer-2";
 
@@ -99,6 +149,12 @@ pub struct LayerSpec {
     /// `sim = true` (task T9): `all` runs the simulation stage after the
     /// map stage. Default off.
     pub sim: bool,
+    /// `[sim_options]`: the simulation stage's build options
+    /// (`transpile::ir::SimConfig`, its keys checked here). The map stage
+    /// writes the table to `<out>/sim-options.toml` ([`SIM_OPTIONS_FILE`]),
+    /// where the `sim` stage reads it; it is not part of the map stage's
+    /// key. `None`: no table.
+    pub sim_options: Option<toml::Table>,
     pub maps: Vec<LayerMap>,
     /// The first exterior's slice as a table, and the `[all_maps]` keys:
     /// what an automatic interior is made from.
@@ -127,6 +183,8 @@ struct LayerFile {
     presence_copies: bool,
     #[serde(default)]
     sim: bool,
+    #[serde(default)]
+    sim_options: Option<toml::Table>,
     #[serde(default)]
     all_maps: toml::Table,
     #[serde(default)]
@@ -278,6 +336,9 @@ impl LayerSpec {
         if file.with_interiors && base.is_none() {
             return Err("with_interiors needs an exterior map".to_owned());
         }
+        if let Some(table) = &file.sim_options {
+            check_sim_options(table)?;
+        }
         let spec = Self {
             name: file.name,
             start: file.start,
@@ -285,10 +346,11 @@ impl LayerSpec {
             close_unreached: file.close_unreached,
             presence_copies: file.presence_copies,
             sim: file.sim,
+            sim_options: file.sim_options,
             maps,
             base,
             all_maps: file.all_maps,
-            source: text.to_owned(),
+            source: without_sim_options(text),
         };
         spec.validate()?;
         Ok(spec)
@@ -303,6 +365,7 @@ impl LayerSpec {
             close_unreached: slice.close_unreached.unwrap_or(true),
             presence_copies: false,
             sim: slice.sim.unwrap_or(false),
+            sim_options: None,
             maps: vec![LayerMap {
                 slice: slice.clone(),
                 automatic: false,
@@ -322,6 +385,7 @@ impl LayerSpec {
             close_unreached: slice.close_unreached.unwrap_or(true),
             presence_copies: false,
             sim: slice.sim.unwrap_or(false),
+            sim_options: None,
             maps: vec![LayerMap {
                 slice: slice.clone(),
                 automatic: false,
@@ -1752,6 +1816,25 @@ fn demote_doors(run: &mut Run) {
     run.doors_demoted = before - run.placements.len();
 }
 
+/// Leaves the layer's `[sim_options]` for the `sim` stage in
+/// `<out>/sim-options.toml`, or removes a stale one; on every run, cached
+/// or not, so the file always follows the layer file.
+fn write_sim_options(out: &Path, layer: &LayerSpec) -> Result<(), ConvertError> {
+    let path = out.join(SIM_OPTIONS_FILE);
+    match &layer.sim_options {
+        Some(table) => {
+            std::fs::create_dir_all(out).map_err(io(out))?;
+            let text = toml::to_string(table).map_err(|e| ConvertError::Slice {
+                name: layer.name.clone(),
+                reason: format!("sim_options: {e}"),
+            })?;
+            std::fs::write(&path, text).map_err(io(&path))
+        }
+        None if path.is_file() => std::fs::remove_file(&path).map_err(io(&path)),
+        None => Ok(()),
+    }
+}
+
 /// Builds the layer's maps and writes the layer (module notes).
 pub fn map_layer(inputs: &Inputs, layer: &LayerSpec) -> Result<MapSummary, ConvertError> {
     let started = std::time::Instant::now();
@@ -1763,6 +1846,7 @@ pub fn map_layer(inputs: &Inputs, layer: &LayerSpec) -> Result<MapSummary, Conve
     let maps = layer.resolve(inputs, &mir)?;
 
     let mod_dir = inputs.mod_dir();
+    write_sim_options(&inputs.out, layer)?;
     let (key, per_map_keys) = layer_key(inputs, layer, &maps, &palette_bytes, &base)?;
     let cache_dir = inputs.out.join("cache");
     let key_path = cache_dir.join("map.key");
@@ -3199,6 +3283,39 @@ mod tests {
             std::fs::write(dir.path().join(name), text).unwrap();
         }
         dir
+    }
+
+    #[test]
+    fn sim_options_are_read_checked_and_left_out_of_the_map_key() {
+        let dir = dir_with(&[("town.toml", EXTERIOR)]);
+        let plain = "name = \"town-layer\"\nsim = true\n\n\
+                     [[maps]]\nslice = \"town.toml\"\nmap = \"town\"\n";
+        let with = format!(
+            "{plain}\n[sim_options]\n# the town's own faction\n\
+             team_factions = [\"TownFaction\"]\nquest_depth = 2\n"
+        );
+        let layer = LayerSpec::from_toml(&with, dir.path()).unwrap();
+        let table = layer.sim_options.clone().expect("the table");
+        let config: transpile::ir::SimConfig = toml::Value::Table(table).try_into().unwrap();
+        assert_eq!(config.team_factions, ["TownFaction"]);
+        assert_eq!(config.quest_depth, 2);
+        let without = LayerSpec::from_toml(plain, dir.path()).unwrap();
+        assert!(without.sim_options.is_none());
+        assert_eq!(
+            layer.source, without.source,
+            "a simulation option does not change the map stage's key"
+        );
+        // A table before the maps is cut up to the next header.
+        let early = "name = \"town-layer\"\nsim = true\n\n[sim_options]\nquest_depth = 3\n\n\
+                     [[maps]]\nslice = \"town.toml\"\nmap = \"town\"\n";
+        let layer = LayerSpec::from_toml(early, dir.path()).unwrap();
+        assert!(layer.source.contains("[[maps]]") && !layer.source.contains("quest_depth"));
+        // Unknown keys and wrong types are refused.
+        let bad = format!("{plain}\n[sim_options]\nteam_faction = [\"TownFaction\"]\n");
+        let error = LayerSpec::from_toml(&bad, dir.path()).unwrap_err();
+        assert!(error.contains("unknown key \"team_faction\""), "{error}");
+        let bad = format!("{plain}\n[sim_options]\nteam_factions = \"TownFaction\"\n");
+        assert!(LayerSpec::from_toml(&bad, dir.path()).is_err());
     }
 
     #[test]

@@ -293,6 +293,18 @@ fn every_checked_in_layer_resolves() {
                     "{stem}: loot on in every layer"
                 );
             }
+            // `[sim_options]` reads as the stage's options; Megaton lists
+            // its town faction (spec 7.5).
+            if let Some(table) = &layer.sim_options {
+                let config: transpile::ir::SimConfig = toml::Value::Table(table.clone())
+                    .try_into()
+                    .unwrap_or_else(|e| panic!("{stem}: {e}"));
+                if stem == "megaton" {
+                    assert_eq!(config.team_factions, ["MegatonResidentFaction"]);
+                }
+            } else {
+                assert_ne!(stem, "megaton", "Megaton sets its team factions");
+            }
             let stems: Vec<String> = layer.maps.iter().map(|m| m.slice.map_stem()).collect();
             found.insert(stem.to_owned(), stems);
         }

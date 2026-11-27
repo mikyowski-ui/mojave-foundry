@@ -17,8 +17,9 @@
 //!   topics not so reached are barks and are not lowered (owner decision
 //!   14, spec 4.6); topic-type INFOs not reached are counted as unreached.
 //! - **Nodes and picks** (spec 4.3, 4.4): nodes in INFO id order give the
-//!   ordinals; each topic's picks follow its file order with random groups
-//!   (a run of random INFOs up to and including a random-end one).
+//!   ordinals; each topic's picks follow quest priority (higher first),
+//!   then file order, with random groups (a run of one quest's random
+//!   INFOs up to and including a random-end one).
 //! - **Choices** (spec 4.1): `TCLT`, then the reverse `TCLF` links, only
 //!   topics the speaker can say, ordered by priority then first
 //!   appearance; the hub likewise from the top-level and given topics.
@@ -487,6 +488,18 @@ fn speaker_dialogue(
                 .push((info_id.clone(), folded));
         }
     }
+    // The source checks a topic's INFOs quest by quest, higher quest
+    // priority first, each quest's in file order (spec 4.1): a stable sort.
+    let quest_priority = |info: &SimId| {
+        module
+            .infos
+            .get(info)
+            .and_then(|i| module.quests.get(&i.quest))
+            .map_or(0, |q| q.priority)
+    };
+    for infos in passing.values_mut() {
+        infos.sort_by_key(|(info, _)| std::cmp::Reverse(quest_priority(info)));
+    }
     // Reverse links: topic X leads to the topics whose passing INFOs name
     // X in TCLF.
     let mut leads_to: BTreeMap<SimId, BTreeSet<SimId>> = BTreeMap::new();
@@ -628,9 +641,15 @@ fn speaker_dialogue(
     for topic in &lowered {
         let mut picks = Vec::new();
         let mut group: Vec<u32> = Vec::new();
+        let mut group_quest: Option<&SimId> = None;
         for (info_id, _) in &passing[topic] {
             let info = &module.infos[info_id];
             let n = ordinal[info_id];
+            // A random group stays within one quest's INFOs.
+            if group_quest != Some(&info.quest) && !group.is_empty() {
+                picks.push(close(std::mem::take(&mut group)));
+            }
+            group_quest = Some(&info.quest);
             if info.flags.random || (info.flags.random_end && !group.is_empty()) {
                 group.push(n);
                 if info.flags.random_end {

@@ -551,6 +551,16 @@ fn run(cli: Cli) -> Result<(), String> {
             }
             println!("report: {}", inputs.mir_dir().join("report.md").display());
             println!("layer: {}", inputs.mod_dir().display());
+            // The report is written; a build error of the sim stage still
+            // fails the run.
+            if let Some(report) = summary.sim.as_ref().and_then(|o| o.report.as_ref())
+                && let Some(failure) = report.failure()
+            {
+                for error in &report.errors {
+                    eprintln!("build error: {error}");
+                }
+                return Err(failure);
+            }
             Ok(())
         }
         Command::Estimate { common, mode } => {

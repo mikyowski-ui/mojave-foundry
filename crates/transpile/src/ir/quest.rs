@@ -46,7 +46,9 @@ pub struct Stage {
     pub id: SimId,
     /// The stage index.
     pub index: i16,
-    /// Log entries, in file order.
+    /// Log entries, in file order. Every entry whose condition passes
+    /// runs, in this order, each condition tested when its entry is
+    /// reached (spec 6.2).
     pub entries: Vec<LogEntry>,
 }
 

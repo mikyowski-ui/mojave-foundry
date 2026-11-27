@@ -38,6 +38,7 @@ pub struct NameTable {
     ref_bases: BTreeMap<FormKey, FormKey>,
     base_scripts: BTreeMap<FormKey, FormKey>,
     unique_refs: BTreeMap<FormKey, FormKey>,
+    form_lists: BTreeMap<FormKey, Vec<FormKey>>,
     plugins: Vec<String>,
 }
 
@@ -154,5 +155,16 @@ impl NameTable {
     /// A base's script.
     pub fn base_script(&self, base: &FormKey) -> Option<&FormKey> {
         self.base_scripts.get(base)
+    }
+
+    /// Records a form list's members (`FLST` `LNAM`), in order.
+    pub fn set_form_list(&mut self, list: FormKey, members: Vec<FormKey>) {
+        self.form_lists.insert(list, members);
+    }
+
+    /// A form list's direct members, in order; `None` when the form is not
+    /// a known list.
+    pub fn form_list(&self, list: &FormKey) -> Option<&[FormKey]> {
+        self.form_lists.get(list).map(Vec::as_slice)
     }
 }

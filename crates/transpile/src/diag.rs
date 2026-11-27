@@ -199,6 +199,9 @@ pub enum Category {
     LocationOutsideSlice,
     /// A presence copy (spec 7.6), for the report.
     PresenceCopy,
+    /// A `SimConfig::team_factions` editor id that names no faction of the
+    /// plugin list (spec 7.5).
+    UnknownTeamFaction,
 }
 
 /// The report section of spec 10.5 a finding belongs to.
@@ -305,7 +308,7 @@ impl Category {
             MissingSubTerminal | KeyNotConverted | LockLevelRounded | NoteTitleOnly | EmptyNote
             | MissingMessage | MessageFormat => "terminal",
             PackageFallback | FurnitureAction | NoWalkable | LocationOutsideSlice
-            | PresenceCopy => "package",
+            | PresenceCopy | UnknownTeamFaction => "package",
         }
     }
 
@@ -346,6 +349,7 @@ impl Category {
             | FurnitureAction
             | NoWalkable
             | LocationOutsideSlice
+            | UnknownTeamFaction
             | MissingSetting => Outcome::Fallback,
             _ => match severity {
                 Severity::Error => Outcome::Dropped,

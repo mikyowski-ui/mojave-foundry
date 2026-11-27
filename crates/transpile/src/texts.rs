@@ -40,7 +40,12 @@ pub const LABELS: &[(u32, &str)] = &[
     (29, "Intelligence"),
     (30, "Agility"),
     (31, "Luck"),
+    (32, "(Waits for you to speak.)"),
 ];
+
+/// The label said when no greeting INFO passes (spec 4.9): the reply
+/// above the hub.
+pub const GREETING_LABEL: u32 = 32;
 
 /// Builds `Module::texts`: interns each (owner, role, text) once, in the
 /// order of the calls. The build calls it in [`SimId`] order, so the

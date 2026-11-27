@@ -287,6 +287,12 @@ pub struct SimConfig {
     /// Follow quests named by quest scripts and stage scripts, to this
     /// many levels beyond the quests the slice's own code names.
     pub quest_depth: u32,
+    /// Factions, by editor id (case does not matter), each of which forms
+    /// one team of all its members (spec 7.5, owner decision 11 as refined
+    /// on 2026-11-26: the town's own faction): checked in this order
+    /// before the default rule, the first the actor is a member of naming
+    /// its team. Empty by default: every team follows the default rule.
+    pub team_factions: Vec<String>,
 }
 
 impl Default for SimConfig {
@@ -295,6 +301,7 @@ impl Default for SimConfig {
             sfall: false,
             hello_barks: false,
             quest_depth: 1,
+            team_factions: Vec::new(),
         }
     }
 }

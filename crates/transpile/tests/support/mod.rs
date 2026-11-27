@@ -82,6 +82,9 @@ pub struct World {
     pub stats: BTreeMap<i32, i32>,
     pub can_see: bool,
     pub timers: Vec<(u32, i32, i32)>,
+    /// Team numbers set with `critter_add_trait(obj, 1, 6, team)`, by
+    /// object.
+    pub teams: BTreeMap<u32, i32>,
     in_dialogue: bool,
 }
 
@@ -274,10 +277,15 @@ impl VmHost for World {
             "tile_distance_objs" => int(vm, 5)?,
             "animate_move_obj_to_tile" => self.transcript.push(Event::Move(call.int(1))),
             "attack_setup" => self.transcript.push(Event::Attack),
+            "critter_add_trait" => {
+                if (call.int(2), call.int(1)) == (1, 6) {
+                    self.teams.insert(obj(3), call.int(0));
+                }
+                int(vm, -1)?;
+            }
             "add_timer_event" => self.timers.push((obj(2), call.int(1), call.int(0))),
             "critter_heal"
             | "rm_mult_objs_from_inven"
-            | "critter_add_trait"
             | "move_to"
             | "create_object_sid"
             | "obj_carrying_pid_obj" => int(vm, 0)?,

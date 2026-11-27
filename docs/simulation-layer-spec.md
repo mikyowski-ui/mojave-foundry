@@ -518,9 +518,13 @@ for each placed reference, its map, hex, elevation, PID and object id.
 As the editor presents them, and as this compiler reproduces them:
 
 - A **topic** holds INFOs in order. Choosing a topic says the **first
-  INFO whose conditions pass** for this speaker. A run of INFOs flagged
-  random, up to and including one flagged random-end, is one random group:
-  one is drawn among those that pass.
+  INFO whose conditions pass** for this speaker, trying the topic's INFOs
+  quest by quest, higher quest priority first, each quest's INFOs in file
+  order. A run of one quest's INFOs flagged random, up to and including one
+  flagged random-end, is one random group: one is drawn among those that
+  pass. *(Changed 2026-11-26: the order was file order alone, which let a
+  low-priority generic greeting mask a speaker's own; a random group no
+  longer spans two quests.)*
 - An INFO's responses are said in order; then its `end` script runs; then
   the player chooses again.
 - **Choices** after an INFO are its `TCLT` topics, plus every topic with
@@ -721,6 +725,7 @@ serves package and stage conditions.
 | 18 | `GetCurrentTime` | 2 | `game_time_hour` as hours (`hhmm / 100 + (hhmm % 100) / 60`) |
 | 77 | `GetRandomPercent` | 2 | `random(0, 99)` |
 | 382 | `GetHasNote` | 2 | the note's holodisk global `> 0` |
+| 372 | `IsInList` | | the OR of `GetIsID` over the form list's members (`FLST` `LNAM`, nested lists flattened, at most 512): static on the subject, else base compares at run time; an unknown list is a reported fallback of 0. *(Added 2026-11-26: it was a fallback of 0, which folded away every INFO of the Megaton dialogue quest, whose quest condition is `IsInList` of the town's residents.)* |
 | 515, 49, 323 | `IsCombatTarget`, `GetSleeping`, `WhichServiceMenu` | 1 each | fallback 0 |
 
 Package conditions add `IsRaining` (fallback 0), `GetInWorldspace` (map
@@ -734,9 +739,13 @@ An unsupported function is never silently true. It becomes
 and the comparison is then evaluated normally, so `HasPerk X == 0` passes
 and `HasPerk X == 1` fails. Functions with no table entry take value 0.
 Every fallback writes one report line: function, index, count, and the
-first owners by editor id. A dialogue whose every greeting INFO folds to
-`False` gets a converter greeting label so that talk still opens the hub,
-and is reported.
+first owners by editor id. When no greeting INFO can be said, either
+because every one folds to `False` (reported) or because at run time none
+passes (for example, every say-once greeting has been said), talk says the
+converter's greeting label (label 32, a neutral line, never the
+"[Continue]" label) and offers the hub: the top-level and given topics
+whose picks pass, then Goodbye. *(Changed 2026-11-26: the run-time case
+said "[Continue]".)*
 
 ### 4.10 Message files
 
@@ -1052,8 +1061,13 @@ and the pending bit, at once, so `GetStage` and `GetStageDone` read the
 new value immediately. The stage's log-entry scripts run in the
 dispatcher (cross-program calls are unreliable, E3): at its next run, or
 at once when dialogue closes (section 5.11). For each pending stage, in
-ascending stage order, the first log entry whose condition passes runs its
-script, applies complete or fail, and starts `next_quest`. Latency: one
+ascending stage order, every log entry of the stage whose condition passes
+runs, in file order: its script, then complete or fail, then `next_quest`.
+Each entry's condition is tested when that entry is reached, after the
+earlier entries' scripts have run, so an earlier entry can enable or
+disable a later one, as the source evaluates them one after another.
+*(Changed 2026-11-26, owner decision: only the first passing entry ran,
+so a stage with complementary first entries never reached the others.)* Latency: one
 dispatcher run, a fraction of a second, or zero after dialogue. A script
 that sets a stage and in the same block depends on that stage script's
 effects is reported (the slice's INFO scripts set stages in their `end`
@@ -1153,12 +1167,31 @@ Eight locals after the system locals: `L_PKG` (current package ordinal),
 - **Hostile behaviour**: in `critter_p_proc`, when
   `obj_can_see_obj(self_obj, dude_obj)` and the distance is within the
   actor's perception range, `attack_setup(self_obj, dude_obj)` (E23).
-- **Teams**: player 0; each group of actors sharing their first
-  non-crime faction gets one team, numbered from 100 in faction `SimId`
-  order (Megaton townsfolk one team, raiders one team); so attacking one
-  townsperson brings in the others, as the engine's team rule does.
-  `AddToFaction` into a hostile faction switches team with
-  `critter_add_trait(obj, 1, 6, team)`.
+- **Teams** *(changed 2026-11-26)*: player 0. An actor that is a member
+  of one of `SimConfig::team_factions` (editor ids, in order, first match
+  wins) is on that faction's team, whatever its other factions are.
+  Otherwise its team is its non-crime faction with the most relations (its
+  own and inbound; the first in its list on a tie). Teams are numbered from
+  100 in faction `SimId` order. Megaton lists its town faction,
+  `MegatonResidentFaction` (`[sim_options]` of its layer file): the
+  residents form one team, so attacking one brings in the others, and
+  scripted fights between residents and outsiders (the sheriff against
+  Mister Burke, on the Tenpenny Tower residents' team) stay possible. The
+  engine's AI joins a fight by attack relations (its own attacker, a
+  teammate's attacker), not against every other team, so separate friendly
+  teams do not fight each other.
+- **Team lowering** *(added 2026-11-26)*: each critter program's `start`
+  calls `critter_add_trait(self_obj, 1, 6, team)` (object trait, team
+  number; the word's result is popped) once per critter, inside its
+  first-run guard, before the critter's first turn. The engine skips it
+  when the team is unchanged and while a save is restored. A later change
+  (joining the party, a faction switch) is kept. The program's team
+  replaces the map stage's team (66 hostile, 99 friendly) for every critter
+  that has a program, because the faction team is the finer rule; hostility
+  does not depend on it (`hostile_tick` attacks on sight). Every actor with
+  a team has a program, so no team-only critter is left. `AddToFaction`
+  into a hostile faction would switch team with the same word; it is not
+  lowered in Pass 2.
 - **AI packet**: hostile actors take `map_builder::BuildOptions`'s
   hostile packet, chosen from the base `ai.txt` (lowest `min_hp`, then
   highest `chance`, then lowest number); others keep the existing passive
@@ -1530,7 +1563,11 @@ selectable (15). The questions are kept as they were asked.
 10. **`vault-vm` in tests.** Allow it as a dev-dependency at the pinned
     revision (one-way, tests only)? Default: yes.
 11. **Teams.** Megaton townsfolk as one team (attack one, all respond),
-    raiders as one team? Default: yes.
+    raiders as one team? Default: yes. *Refined by the owner on
+    2026-11-26: teams stay faction-derived; only the members of a listed
+    town faction (`SimConfig::team_factions`; Megaton:
+    `MegatonResidentFaction`) are unified, so scripted fights inside the
+    town stay possible (section 7.5).*
 12. **Essential NPCs.** The source protects some NPCs from death; the
     engine has no such flag. Default: ignore and report.
 13. **Karma.** Shadow global with no display until gap K? Default: yes.

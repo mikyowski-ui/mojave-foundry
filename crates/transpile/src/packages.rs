@@ -28,8 +28,10 @@
 //!   aggression is at least 1 and a faction is an enemy of `PlayerFaction`
 //!   (either side's relation), or aggression is at least 2 and no faction
 //!   is a friend or ally of it, or the placement index marks it hostile;
-//!   the team is the first faction that is not a crime faction (no "crime"
-//!   in its editor id and no crime tracking), so townsfolk share a team and
+//!   the team is the first of `SimConfig::team_factions` the actor is a
+//!   member of (the town's own faction: all its members one team), else
+//!   the non-crime faction (no "crime" in its editor id and no crime
+//!   tracking) with the most relations, so townsfolk share a team and
 //!   raiders share another.
 //! - **Presence** (spec 7.6, owner decision 5): the maps holding the actor,
 //!   its presence copies included, when there is more than one; a place on
@@ -259,6 +261,35 @@ pub fn compile(pass: &mut Pass<'_>) {
         );
     }
     pass.module.teams = teams.into_iter().collect();
+    for wanted in &pass.config.team_factions {
+        let known = pass.source.factions.values().any(|f| {
+            f.editor_id
+                .as_deref()
+                .is_some_and(|e| e.eq_ignore_ascii_case(wanted))
+        });
+        if !known {
+            pass.diag(
+                Diag::warning(
+                    Category::UnknownTeamFaction,
+                    "a configured team faction is not a faction of the plugin list; ignored",
+                )
+                .about(wanted.clone()),
+            );
+        }
+    }
+}
+
+/// The first team number (spec 7.5): the faction `module.teams[i]` is team
+/// `TEAM_BASE + i`, above the player's 0 and the map stage's hostile (66)
+/// and friendly (99) defaults.
+pub const TEAM_BASE: i32 = 100;
+
+/// The team number of an actor base: its faction's place in
+/// `Module::teams`, from [`TEAM_BASE`]; `None` when it has no team.
+pub fn team_number(module: &crate::ir::Module, base: &FormKey) -> Option<i32> {
+    let team = module.runs.get(base)?.combat.team.as_ref()?;
+    let index = module.teams.iter().position(|t| t == team)?;
+    Some(TEAM_BASE + i32::try_from(index).ok()?)
 }
 
 fn needs_place(runner: Runner) -> bool {
@@ -608,20 +639,33 @@ fn combat(
             ),
         )
     };
-    // The team: the non-crime faction with the most relations, the first
-    // such in the actor's order on a tie (spec 7.5's "first non-crime
-    // faction", made robust to the order of templated actors' lists).
-    let mut team: Option<(&FormKey, usize)> = None;
-    for f in factions
-        .iter()
-        .filter(|f| !is_crime(pass, f) && Some(**f) != player)
-    {
-        let weight = relation_weight(pass, f);
-        if team.is_none_or(|(_, best)| weight > best) {
-            team = Some((f, weight));
+    // The team: the first configured team faction the actor is a member
+    // of (`SimConfig::team_factions`, the town's own faction); else the
+    // non-crime faction with the most relations, the first such in the
+    // actor's order on a tie (spec 7.5's "first non-crime faction", made
+    // robust to the order of templated actors' lists).
+    let listed = pass.config.team_factions.iter().find_map(|wanted| {
+        factions.iter().copied().find(|f| {
+            pass.source
+                .factions
+                .get(*f)
+                .and_then(|x| x.editor_id.as_deref())
+                .is_some_and(|e| e.eq_ignore_ascii_case(wanted))
+        })
+    });
+    let team = listed.cloned().or_else(|| {
+        let mut team: Option<(&FormKey, usize)> = None;
+        for f in factions
+            .iter()
+            .filter(|f| !is_crime(pass, f) && Some(**f) != player)
+        {
+            let weight = relation_weight(pass, f);
+            if team.is_none_or(|(_, best)| weight > best) {
+                team = Some((f, weight));
+            }
         }
-    }
-    let team = team.map(|(f, _)| f.clone());
+        team.map(|(f, _)| f.clone())
+    });
     Combat {
         hostile,
         reason,
