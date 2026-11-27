@@ -52,8 +52,8 @@ use vault_formats::HexGrid;
 use crate::config::ConvertError;
 use crate::map::{Feature, MapFeatures};
 use crate::replay::{
-    CLASSIC_ZOOM, CameraPlan, Engine, EngineJob, Hop, LogOptions, MAX_MARGIN, Recentre, build_log,
-    fit_steps, frame_size, plan_camera, run_jobs,
+    CLASSIC_ZOOM, CameraPlan, Engine, EngineJob, Hop, LogOptions, MAX_MARGIN, ModStack, Recentre,
+    build_log, fit_steps, frame_size, plan_camera, run_jobs,
 };
 pub use crate::replay::{DEFAULT_MARGIN, TICK_MS, View};
 use crate::route::{self, Route, WalkMap};
@@ -659,6 +659,9 @@ pub(crate) struct Setup {
     pub engine: Engine,
     pub map: String,
     pub walk_map: WalkMap,
+    /// The layer's `mod_stack` record when it has scripts: every log the
+    /// capture builds carries it.
+    pub mod_stack: Option<ModStack>,
 }
 
 /// Checks the engine, the Fallout 2 archives and the layer, finds the map,
@@ -685,9 +688,11 @@ pub(crate) fn setup(
     }
     let map = resolve_map(map, out, &layer)?;
     let walk_map = WalkMap::load(&layer, &map).map_err(stage)?;
+    let mod_stack = ModStack::of_layers(std::slice::from_ref(&layer)).map_err(stage)?;
     let load_order = out.join("load_order.toml");
     std::fs::write(&load_order, "layers = [\"mods/mojave\"]\n").map_err(io(&load_order))?;
     Ok(Setup {
+        mod_stack,
         engine: Engine {
             exe: engine.to_owned(),
             master_dat,
@@ -760,6 +765,7 @@ pub fn shots(options: &ShotsOptions) -> Result<ShotsSummary, ConvertError> {
         engine,
         map,
         walk_map,
+        mod_stack,
     } = setup(
         &options.engine,
         &options.f2,
@@ -847,7 +853,7 @@ pub fn shots(options: &ShotsOptions) -> Result<ShotsSummary, ConvertError> {
         for &view in &framing.views {
             let zoom = view_zoom(view, wide_zoom);
             let camera = framing.camera(view);
-            let log_options = LogOptions::shots(view, zoom);
+            let log_options = LogOptions::shots(view, zoom).with_stack(mod_stack.clone());
             let plan = (camera == CameraKind::Stationary).then(|| {
                 plan_camera(
                     walk_map.entry,
@@ -876,7 +882,7 @@ pub fn shots(options: &ShotsOptions) -> Result<ShotsSummary, ConvertError> {
             });
         }
         // The arrival check: the wide view, following.
-        let probe = LogOptions::shots(View::Wide, wide_zoom);
+        let probe = LogOptions::shots(View::Wide, wide_zoom).with_stack(mod_stack.clone());
         let full = jobs.want(
             format!("{map_stem}-{n:02}-probe"),
             build_log(&probe, &hops, None).text(),

@@ -363,7 +363,7 @@ pub fn plan_camera(start: i32, hops: &[Hop], canvas: [u32; 2], margin: f64) -> C
 }
 
 /// What a replay log is built for.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LogOptions {
     pub view: View,
     /// The enhanced view's zoom (ignored by the game view).
@@ -372,6 +372,10 @@ pub struct LogOptions {
     pub run: bool,
     pub settle: u64,
     pub tail: u64,
+    /// The layers' `mod_stack` record, for a load order with a scripted
+    /// layer ([`ModStack::of_layers`]): the engine refuses to replay a log
+    /// over scripted layers without it.
+    pub mod_stack: Option<ModStack>,
 }
 
 impl LogOptions {
@@ -383,8 +387,115 @@ impl LogOptions {
             run: true,
             settle: SETTLE_TICKS,
             tail: FINAL_TICKS,
+            mod_stack: None,
         }
     }
+
+    /// The same options with the layers' `mod_stack` record.
+    pub fn with_stack(mut self, mod_stack: Option<ModStack>) -> Self {
+        self.mod_stack = mod_stack;
+        self
+    }
+}
+
+/// The engine's mod API version a `mod_stack` record names.
+pub const MOD_API: i32 = 1;
+
+/// The `mod_stack` record of a replay log (the engine's SPEC-024a §2.3):
+/// one entry per scripted layer (a manifest with `[[global_scripts]]` or
+/// `[[hooks]]`), lowest first, with its `id`, its `version`, the FNV-1a
+/// 64-bit hash of the manifest's bytes as 16 uppercase hexadecimal digits,
+/// and each `[settings]` key's manifest value (`i:<int>`, `f:<binary32 bits
+/// as 8 hex digits>`, `s:<text>`). A replay over scripted layers stops with
+/// "mod stack mismatch" unless the record comes before the first tick and
+/// names the same layers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModStack {
+    body: String,
+}
+
+/// One layer of a [`ModStack`].
+#[derive(Debug, Clone, Serialize)]
+struct ModRecord {
+    id: String,
+    version: String,
+    manifest: String,
+    settings: std::collections::BTreeMap<String, String>,
+}
+
+/// FNV-1a, 64 bits.
+pub fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+impl ModStack {
+    /// The record of the manifests' bytes, lowest layer first; `None` when
+    /// no layer is scripted (a log over such layers carries no record).
+    pub fn from_manifests(manifests: &[Vec<u8>]) -> Result<Option<Self>, String> {
+        use vault_formats::mod_manifest::{ModManifest, ModSetting};
+        let mut mods = Vec::new();
+        for bytes in manifests {
+            let text = std::str::from_utf8(bytes).map_err(|e| format!("manifest: {e}"))?;
+            let manifest = ModManifest::parse(text).map_err(|e| format!("manifest: {e}"))?;
+            if !manifest.scripted() {
+                continue;
+            }
+            let settings = manifest
+                .settings
+                .iter()
+                .map(|(key, value)| {
+                    let text = match value {
+                        ModSetting::Int(v) => format!("i:{v}"),
+                        ModSetting::Float(v) => format!("f:{:08X}", v.to_bits()),
+                        ModSetting::Text(t) => format!("s:{t}"),
+                    };
+                    (key.clone(), text)
+                })
+                .collect();
+            mods.push(ModRecord {
+                id: manifest.id.clone().unwrap_or_default(),
+                version: manifest.version.clone().unwrap_or_default(),
+                manifest: format!("{:016X}", fnv1a64(bytes)),
+                settings,
+            });
+        }
+        if mods.is_empty() {
+            return Ok(None);
+        }
+        let mods = serde_json::to_string(&mods).map_err(|e| e.to_string())?;
+        Ok(Some(Self {
+            body: format!("\"kind\":\"mod_stack\",\"api\":{MOD_API},\"mods\":{mods}"),
+        }))
+    }
+
+    /// The record of the layers in `dirs` (each holding a `vault-mod.toml`;
+    /// a directory without one is no layer), lowest first.
+    pub fn of_layers(dirs: &[PathBuf]) -> Result<Option<Self>, String> {
+        let mut manifests = Vec::new();
+        for dir in dirs {
+            let path = dir.join("vault-mod.toml");
+            match std::fs::read(&path) {
+                Ok(bytes) => manifests.push(bytes),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("{}: {e}", path.display())),
+            }
+        }
+        Self::from_manifests(&manifests).map_err(|e| format!("{}: {e}", display_dirs(dirs)))
+    }
+
+    /// The record's JSON fields, without `command_id`.
+    pub fn body(&self) -> &str {
+        &self.body
+    }
+}
+
+fn display_dirs(dirs: &[PathBuf]) -> String {
+    dirs.iter()
+        .map(|d| d.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// A replay input log, one JSON record per line, with where each tick
@@ -516,7 +627,8 @@ impl ReplayLog {
 }
 
 /// Builds a replay log: the surface, for an enhanced view the enhanced
-/// settings (`smooth_camera` off, roofs hidden), the settle ticks, then
+/// settings (`smooth_camera` off, roofs hidden), the `mod_stack` record when
+/// the options carry one, the settle ticks, then
 /// per hop a walk to its waypoint and its ticks, then the tail ticks.
 ///
 /// With a `plan` (enhanced views only) the camera is frozen right after
@@ -537,6 +649,10 @@ pub fn build_log(options: &LogOptions, hops: &[Hop], plan: Option<&CameraPlan>) 
              \"ui_scale\":null}}",
             options.zoom
         ));
+    }
+    // After the other session records, before the first tick.
+    if let Some(stack) = &options.mod_stack {
+        log.push(stack.body());
     }
     let layout = layout(options.view.surface(), options.zoom);
     let offset = |centre: [f64; 2], hex: i32| {
@@ -762,5 +878,58 @@ mod tests {
         }
         assert!((total - 1000.0).abs() < 0.01, "{total}");
         assert!(log.lines().last().unwrap().contains("pointer_left"));
+    }
+
+    #[test]
+    fn fnv1a64_gives_the_published_answers() {
+        assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a64(b"foobar"), 0x85944171f73967e8);
+    }
+
+    #[test]
+    fn a_scripted_layer_gets_a_mod_stack_record_before_the_first_tick() {
+        let plain = b"name = \"Plain\"\n".to_vec();
+        assert_eq!(
+            ModStack::from_manifests(std::slice::from_ref(&plain)).unwrap(),
+            None
+        );
+        let scripted = b"name = \"Synthetic\"\nid = \"synth\"\napi = 1\nversion = \"0.2.0\"\n\n\
+            [settings]\nlevel = 3\nscale = 0.5\nlabel = \"x\"\n\n\
+            [[global_scripts]]\nfile = \"gl_synth.int\"\nrepeat = 6\ntype = 0\n"
+            .to_vec();
+        let stack = ModStack::from_manifests(&[plain, scripted.clone()])
+            .unwrap()
+            .expect("a scripted layer");
+        let options = LogOptions::shots(View::Wide, 0.75).with_stack(Some(stack));
+        let log = build_log(&options, &[], None);
+        let records: Vec<serde_json::Value> = log
+            .lines()
+            .iter()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let kinds: Vec<&str> = records
+            .iter()
+            .map(|r| r["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(&kinds[..4], ["surface", "enhanced", "mod_stack", "tick"]);
+        let record = &records[2];
+        assert_eq!(record["command_id"], 3);
+        assert_eq!(record["api"], 1);
+        let mods = record["mods"].as_array().unwrap();
+        assert_eq!(mods.len(), 1, "only the scripted layer is named");
+        assert_eq!(mods[0]["id"], "synth");
+        assert_eq!(mods[0]["version"], "0.2.0");
+        assert_eq!(
+            mods[0]["manifest"].as_str().unwrap(),
+            format!("{:016X}", fnv1a64(&scripted))
+        );
+        assert_eq!(mods[0]["settings"]["level"], "i:3");
+        assert_eq!(mods[0]["settings"]["scale"], "f:3F000000");
+        assert_eq!(mods[0]["settings"]["label"], "s:x");
+        // Without a record the log is as before.
+        let bare = build_log(&LogOptions::shots(View::Wide, 0.75), &[], None);
+        assert!(!bare.text().contains("mod_stack"));
+        assert_eq!(bare.lines().len() + 1, log.lines().len());
     }
 }

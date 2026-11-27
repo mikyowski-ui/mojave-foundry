@@ -94,6 +94,7 @@ fn a_stationary_log_freezes_the_camera_after_the_settle_ticks() {
         run: true,
         settle: 2,
         tail: 1,
+        mod_stack: None,
     };
     let log = build_log(&options, &hops, Some(&plan)).text();
     let expected = [
@@ -167,6 +168,7 @@ fn a_recentre_is_home_a_tick_and_a_panned_freeze() {
         run: false,
         settle: 1,
         tail: 0,
+        mod_stack: None,
     };
     let built = build_log(&options, &hops, Some(&plan));
     let lines = records(&built.text());

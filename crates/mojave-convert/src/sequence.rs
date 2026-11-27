@@ -587,6 +587,7 @@ pub fn walkthrough(options: &WalkthroughOptions) -> Result<WalkthroughSummary, C
             run: options.run,
             settle: options.settle,
             tail: options.tail,
+            mod_stack: setup.mod_stack.clone(),
         };
         let log = build_log(&log_options, &hops, plan.as_ref());
         let total = log.ticks_total() as u64;

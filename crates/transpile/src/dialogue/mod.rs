@@ -548,16 +548,32 @@ fn speaker_dialogue(
     let by_priority = |list: &mut Vec<SimId>| {
         list.sort_by(|a, b| priority(b).total_cmp(&priority(a)));
     };
+    // A challenge's shared failure topic links from the challenge's topic
+    // (its INFOs' TCLF) so that the failure route can follow it; that link
+    // is the route, not a choice for the player (spec 4.7).
+    let mut failure_routes: BTreeMap<&SimId, BTreeSet<&SimId>> = BTreeMap::new();
+    for info_id in nodes_by_info.keys() {
+        let info = &module.infos[info_id];
+        if let Some(SkillCheck::Percent {
+            failure: FailureRoute::SharedTopic(t),
+            ..
+        }) = &info.check
+        {
+            failure_routes.entry(&info.topic).or_default().insert(t);
+        }
+    }
     let mut nodes = Vec::new();
     let mut late: Vec<Diag> = Vec::new();
     for (info_id, condition) in &nodes_by_info {
         let info = &module.infos[info_id];
+        let routes = failure_routes.get(&info.topic);
         let mut choices: Vec<SimId> = Vec::new();
-        for topic in info
-            .choices
-            .iter()
-            .chain(leads_to.get(&info.topic).into_iter().flatten())
-        {
+        let linked = leads_to
+            .get(&info.topic)
+            .into_iter()
+            .flatten()
+            .filter(|t| !routes.is_some_and(|r| r.contains(t)));
+        for topic in info.choices.iter().chain(linked) {
             if lowered.contains(topic) && !choices.contains(topic) {
                 choices.push(topic.clone());
             }

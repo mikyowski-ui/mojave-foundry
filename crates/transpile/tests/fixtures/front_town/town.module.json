@@ -976,7 +976,9 @@
       ],
       "prompt": null,
       "choices": [],
-      "link_from": [],
+      "link_from": [
+        "topic/testtown.esm:000896/0"
+      ],
       "add_topics": [],
       "begin": null,
       "end": null,

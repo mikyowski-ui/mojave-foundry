@@ -54,6 +54,48 @@ pub(crate) struct Proc {
     result: Option<u32>,
     /// The deepest the expression stack went above the temporaries.
     max_depth: u32,
+    /// Per value above the temporaries, its constant when the code that
+    /// pushed it was a `push.i` (else `None`): what the local words read
+    /// their index from.
+    known: Vec<Option<i32>>,
+    /// Per label, the constants every jump to it arrived with (a value
+    /// two paths disagree on is `None`).
+    known_at_label: BTreeMap<String, Vec<Option<i32>>>,
+    /// Labels already placed: a jump arriving later is a backward one.
+    placed: std::collections::BTreeSet<String>,
+    /// The instance locals the procedure reads or writes.
+    locals: LocalUse,
+}
+
+/// The instance locals (`local_var`, `set_local_var`) code uses.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct LocalUse {
+    /// The constant indices.
+    pub indices: std::collections::BTreeSet<i32>,
+    /// Whether some index is not a `push.i` constant (it cannot be checked
+    /// against the program's slice).
+    pub dynamic: bool,
+}
+
+impl LocalUse {
+    /// The slice the code needs: one past the highest index.
+    #[cfg(test)]
+    pub fn needed(&self) -> u32 {
+        self.indices
+            .last()
+            .map_or(0, |&i| u32::try_from(i).map_or(u32::MAX, |i| i + 1))
+    }
+
+    /// Whether every index is a constant inside a slice of `count`.
+    pub fn fits(&self, count: u32) -> bool {
+        !self.dynamic && self.indices.iter().all(|&i| i >= 0 && (i as u32) < count)
+    }
+
+    #[cfg(test)]
+    fn add(&mut self, other: &LocalUse) {
+        self.indices.extend(other.indices.iter().copied());
+        self.dynamic |= other.dynamic;
+    }
 }
 
 /// The most values one procedure may hold above its frame base (its
@@ -77,6 +119,10 @@ impl Proc {
             floor: 0,
             result: None,
             max_depth: 0,
+            known: Vec::new(),
+            known_at_label: BTreeMap::new(),
+            placed: std::collections::BTreeSet::new(),
+            locals: LocalUse::default(),
         }
     }
 
@@ -127,6 +173,11 @@ impl Proc {
         self.floor = self.floor.max(slot + 1);
     }
 
+    /// The instance locals the procedure uses.
+    pub fn locals(&self) -> &LocalUse {
+        &self.locals
+    }
+
     /// The most values the procedure holds above its frame base.
     pub fn frame_values(&self) -> usize {
         self.temps.len() + self.max_depth as usize
@@ -163,12 +214,28 @@ impl Proc {
             );
             self.depth = self.depth.saturating_sub(pops) + pushes;
             self.max_depth = self.max_depth.max(self.depth);
+            let keep = self.known.len().saturating_sub(pops as usize);
+            self.known.truncate(keep);
+            self.known.extend((0..pushes).map(|_| None));
         }
+    }
+
+    /// The constant `below` values under the top, when it is one.
+    fn known_at(&self, below: usize) -> Option<i32> {
+        self.known
+            .len()
+            .checked_sub(below + 1)
+            .and_then(|at| self.known[at])
     }
 
     pub fn push_i(&mut self, value: i32) {
         self.line(format!("push.i {value}"));
         self.change(0, 1);
+        if self.reachable
+            && let Some(top) = self.known.last_mut()
+        {
+            *top = Some(value);
+        }
     }
 
     pub fn push_f(&mut self, value: f32) {
@@ -204,6 +271,22 @@ impl Proc {
 
     /// A host word; its operands must be on the stack.
     pub fn host(&mut self, word: HostWord) {
+        // The index is the first operand: under the value for a write.
+        let index = match word.name {
+            "local_var" => Some(0),
+            "set_local_var" => Some(1),
+            _ => None,
+        };
+        if let Some(below) = index
+            && self.reachable
+        {
+            match self.known_at(below) {
+                Some(i) => {
+                    self.locals.indices.insert(i);
+                }
+                None => self.locals.dynamic = true,
+            }
+        }
         self.line(word.name);
         self.change(u32::from(word.args), u32::from(word.push));
     }
@@ -233,6 +316,20 @@ impl Proc {
     fn arrive(&mut self, label: &str) {
         if !self.reachable {
             return;
+        }
+        let known = self.known.clone();
+        if self.placed.contains(label) {
+            // A backward jump: the code after the label was read with the
+            // constants recorded there; if this path disagrees, no index
+            // read under them can be trusted.
+            if self.known_at_label.get(label) != Some(&known) {
+                self.locals.dynamic = true;
+            }
+        } else {
+            self.known_at_label
+                .entry(label.to_owned())
+                .and_modify(|seen| *seen = merge_known(seen, &known))
+                .or_insert(known);
         }
         let depth = self.depth;
         let recorded = *self.targets.entry(label.to_owned()).or_insert(depth);
@@ -283,15 +380,29 @@ impl Proc {
                         self.name, self.depth
                     );
                 }
+                // Paths join here: a constant all of them carry stays known.
+                let arrived = self
+                    .known_at_label
+                    .get(label)
+                    .cloned()
+                    .unwrap_or_else(|| vec![None; recorded as usize]);
+                self.known = if self.reachable {
+                    merge_known(&arrived, &self.known)
+                } else {
+                    arrived
+                };
                 self.depth = recorded;
                 self.reachable = true;
             }
             None => {
                 if self.reachable {
                     self.targets.insert(label.to_owned(), self.depth);
+                    self.known_at_label
+                        .insert(label.to_owned(), self.known.clone());
                 }
             }
         }
+        self.placed.insert(label.to_owned());
         self.code.push(format!("{label}:"));
     }
 
@@ -382,6 +493,15 @@ impl Proc {
     }
 }
 
+/// The constants two paths agree on, value by value.
+fn merge_known(a: &[Option<i32>], b: &[Option<i32>]) -> Vec<Option<i32>> {
+    debug_assert_eq!(a.len(), b.len(), "paths meet at different depths");
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| if x == y { *x } else { None })
+        .collect()
+}
+
 /// One program's assembler source.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ProgramAsm {
@@ -396,6 +516,8 @@ pub(crate) struct ProgramAsm {
     exports: Vec<String>,
     /// The largest [`Proc::frame_values`] of the procedures, and whose.
     deepest: (usize, String),
+    /// Each procedure's instance locals, by name.
+    proc_locals: Vec<(String, LocalUse)>,
 }
 
 impl ProgramAsm {
@@ -435,12 +557,29 @@ impl ProgramAsm {
         if proc.frame_values() > self.deepest.0 {
             self.deepest = (proc.frame_values(), name.clone());
         }
+        self.proc_locals.push((name.clone(), proc.locals().clone()));
         self.procs.push((name, proc.finish()));
     }
 
     /// The largest frame of the procedures, and whose.
     pub fn deepest(&self) -> &(usize, String) {
         &self.deepest
+    }
+
+    /// The instance locals of all procedures.
+    #[cfg(test)]
+    pub fn locals(&self) -> LocalUse {
+        let mut all = LocalUse::default();
+        for (_, used) in &self.proc_locals {
+            all.add(used);
+        }
+        all
+    }
+
+    /// The first procedure whose locals do not fit a slice of `count`,
+    /// with what it uses.
+    pub fn local_offender(&self, count: u32) -> Option<&(String, LocalUse)> {
+        self.proc_locals.iter().find(|(_, u)| !u.fits(count))
     }
 
     /// How many program variables (values of the global area) it has.

@@ -171,6 +171,18 @@ fn the_fo3_challenge_and_its_failure_route() {
         .unwrap();
     assert_eq!(node.failure, Some(topic(FAILURE)));
     assert_eq!(mayor.topics[&topic(FAILURE)].picks.len(), 1);
+    // The failure INFO links from the challenge's topic; that link is the
+    // failure route, never an option after a passed challenge.
+    assert_eq!(
+        m.infos[&info(FAILURE_INFO)].link_from,
+        vec![topic(BRIBE)],
+        "the testkit links the failure INFO from the challenge topic"
+    );
+    assert!(
+        !node.choices.contains(&topic(FAILURE)),
+        "the failure topic is offered after the challenge: {:?}",
+        node.choices
+    );
     // Remembered forever: two flags.
     for sub in [once_sub::ATTEMPTED, once_sub::PASSED] {
         assert!(m.globals.contains_key(&info(BRIBE_INFO).with_sub(sub)));

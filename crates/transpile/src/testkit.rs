@@ -491,6 +491,9 @@ fn dialogue(p: &mut PluginBuilder) {
     p.topic(top_level(BRIBE, "TSBribeTopic", "The key"), vec![bribe]);
     let mut failed = info(FAILURE_INFO, 0, &["Nice try."]);
     failed.conditions = vec![is_id(MAYOR)];
+    // As in the source games: the failure INFO links from the challenge's
+    // topic (TCLF), which is its route, not a choice.
+    failed.link_from = vec![FormId(BRIBE)];
     p.topic(
         Topic::new(FAILURE, "SpeechChallengeFailure", "", QUEST),
         vec![failed],

@@ -211,3 +211,110 @@ fn the_engines_mod_layer_accepts_the_files_and_rows() {
     let dir = tempfile::tempdir().unwrap();
     layer.write(&dir.path().join("layer")).unwrap();
 }
+
+/// The instance locals a program's assembler text uses, read with a model
+/// of its own: per value on the stack, the constant a `push.i` gave it (a
+/// label forgets everything below). `Err` names a word the model does not
+/// know or an index that is not a constant.
+fn locals_in_source(source: &str) -> Result<Vec<(String, i32)>, String> {
+    use transpile::codegen::words::ALL;
+    let mut used = Vec::new();
+    let mut stack: Vec<Option<i32>> = Vec::new();
+    let mut procedure = String::new();
+    let pop = |stack: &mut Vec<Option<i32>>, n: usize| {
+        let keep = stack.len().saturating_sub(n);
+        stack.truncate(keep);
+    };
+    for line in source.lines() {
+        let line = line.split(';').next().unwrap_or("").trim();
+        if line.is_empty() || line.starts_with('.') {
+            continue;
+        }
+        if let Some(label) = line.strip_suffix(':') {
+            if !label.contains('.') {
+                procedure = label.to_owned();
+            }
+            stack.clear();
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let word = parts.next().unwrap();
+        let operand = parts.next();
+        let (pops, pushes) = match word {
+            "push.i" => {
+                stack.push(operand.and_then(|v| v.parse().ok()));
+                continue;
+            }
+            "push.f" | "push.a" | "push.p" | "push.n" | "r_to_v" => (0, 1),
+            "pop" | "jmp" | "v_to_r" | "export_var" | "critical_off" => (1, 0),
+            "bz" | "call" | "store_local" | "store_global" | "store_external" => {
+                (2, usize::from(word == "call"))
+            }
+            "fetch_local" | "fetch_global" | "fetch_external" | "not" | "ftoi" => (1, 1),
+            "add" | "sub" | "mul" | "div" | "mod" | "eq" | "ne" | "lt" | "le" | "gt" | "ge"
+            | "band" | "bor" | "bxor" | "and" | "or" => (2, 1),
+            "frame" | "drop_frame" | "restore_base" | "ret" | "global_area" => {
+                stack.clear();
+                continue;
+            }
+            "local_var" | "set_local_var" => {
+                let below = usize::from(word == "set_local_var");
+                let index = stack
+                    .len()
+                    .checked_sub(below + 1)
+                    .and_then(|at| stack[at])
+                    .ok_or_else(|| format!("{procedure}: {word} with no constant index"))?;
+                used.push((procedure.clone(), index));
+                (below + 1, usize::from(word == "local_var"))
+            }
+            other => {
+                let host = ALL
+                    .iter()
+                    .find(|w| w.name == other)
+                    .ok_or_else(|| format!("{procedure}: word {other} not in the model"))?;
+                (usize::from(host.args), usize::from(host.push))
+            }
+        };
+        pop(&mut stack, pops);
+        stack.extend((0..pushes).map(|_| None));
+    }
+    Ok(used)
+}
+
+#[test]
+fn no_program_touches_an_instance_local_it_does_not_own() {
+    let out = lowered();
+    let mut checked = 0;
+    for program in &out.plan.programs {
+        let source = &out.plan.sources[&program.stem];
+        let used = locals_in_source(source).unwrap_or_else(|e| panic!("{}: {e}", program.stem));
+        // A map script and the global dispatcher run as system scripts:
+        // the engine gives them no slice whatever their row says.
+        let owned = match program.kind {
+            "map" | "dispatcher" => 0,
+            _ => program.local_vars,
+        };
+        for (procedure, index) in &used {
+            assert!(
+                *index >= 0 && (*index as u32) < owned,
+                "{} ({}) procedure {procedure} uses local {index}, but owns {owned}",
+                program.stem,
+                program.kind
+            );
+        }
+        checked += used.len();
+    }
+    assert!(
+        checked > 20,
+        "only {checked} local accesses: the model reads nothing"
+    );
+}
+
+#[test]
+fn the_source_model_sees_a_local_beyond_the_slice() {
+    let source = "start:\n    frame\n    push.i 7\n    push.i 1\n    set_local_var\n    push.i 2\n    local_var\n    pop\n";
+    assert_eq!(
+        locals_in_source(source).unwrap(),
+        [("start".to_owned(), 7), ("start".to_owned(), 2)]
+    );
+}
